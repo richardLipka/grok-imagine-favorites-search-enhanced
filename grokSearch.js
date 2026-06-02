@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.13
+// @version      1.14
 // @description  Search saved Grok media by prompt and date. Tracks child images/videos, shows badges, reindex DB. Results-only panel mode. Clicks open /imagine/post/{id}.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
@@ -25,6 +25,8 @@
   const DB_VERSION = 1;
   const STORE_NAME = 'posts';
   const RESULTS_ONLY_KEY = 'grokSearchResultsOnly';
+  const FILTER_VIDEO_KEY = 'grokSearchFilterVideo';
+  const FILTER_CHILDREN_KEY = 'grokSearchFilterChildren';
 
   let allPosts = [];
   const knownIds = new Set();
@@ -32,6 +34,8 @@
   let dateStart = '';
   let dateEnd = '';
   let resultsOnly = false;
+  let filterOnlyVideo = false;
+  let filterOnlyChildren = false;
   let currentPage = 0;
   let currentSort = 'newest';
   let matchedPosts = [];
@@ -651,6 +655,8 @@
         if (!terms.every(t => p.includes(t))) return false;
       }
       if (!matchesDateFilter(post)) return false;
+      if (filterOnlyVideo && (post.videoCount ?? 0) < 1) return false;
+      if (filterOnlyChildren && (post.childPostCount ?? 0) < 1) return false;
       return true;
     });
 
@@ -709,7 +715,7 @@
     const n = matchedPosts.length.toLocaleString();
     const hasText = Boolean(currentQuery.trim());
     const hasDates = hasDateFilter();
-    if (hasText || hasDates) {
+    if (hasText || hasDates || filterOnlyVideo || filterOnlyChildren) {
       countText = `${n} match${matchedPosts.length !== 1 ? 'es' : ''}`;
     } else {
       countText = `${n} saved`;
@@ -845,7 +851,9 @@
   }
 
   function hasActiveFilter() {
-    return Boolean(currentQuery.trim() || hasDateFilter());
+    return Boolean(
+      currentQuery.trim() || hasDateFilter() || filterOnlyVideo || filterOnlyChildren
+    );
   }
 
   function getDateFilterBounds() {
@@ -1186,14 +1194,14 @@
       }
       #grok-no-results.visible { display: block; }
       #grok-no-results span { display: block; font-size: 36px; margin-bottom: 10px; }
-      #grok-results-only-label {
+      .grok-filter-check-label {
         display: flex; align-items: center; gap: 5px;
         font-size: 11px; color: rgba(255,255,255,0.55);
         white-space: nowrap; flex-shrink: 0; cursor: pointer;
         user-select: none; transition: color 0.15s;
       }
-      #grok-results-only-label:hover { color: rgba(255,255,255,0.85); }
-      #grok-results-only {
+      .grok-filter-check-label:hover { color: rgba(255,255,255,0.85); }
+      .grok-filter-check-label input {
         accent-color: #8b5cf6; cursor: pointer; margin: 0;
       }
     `;
@@ -1201,6 +1209,62 @@
   }
 
   // ─── UI ────────────────────────────────────────────────────────────────────
+  function ensureMediaFilterCheckboxes() {
+    const bar = document.getElementById('grok-search-bar');
+    const anchor = document.getElementById('grok-results-only-label');
+    if (!bar || !anchor) return;
+
+    if (!document.getElementById('grok-filter-video')) {
+      const videoLabel = document.createElement('label');
+      videoLabel.id = 'grok-filter-video-label';
+      videoLabel.className = 'grok-filter-check-label';
+      videoLabel.title = 'Show only items with at least one video';
+      videoLabel.innerHTML = '<input type="checkbox" id="grok-filter-video" /> Only with video';
+      anchor.insertAdjacentElement('afterend', videoLabel);
+    }
+    if (!document.getElementById('grok-filter-children')) {
+      const childLabel = document.createElement('label');
+      childLabel.id = 'grok-filter-children-label';
+      childLabel.className = 'grok-filter-check-label';
+      childLabel.title = 'Show only items with child posts';
+      childLabel.innerHTML = '<input type="checkbox" id="grok-filter-children" /> Only with child posts';
+      const videoLabel = document.getElementById('grok-filter-video-label');
+      (videoLabel || anchor).insertAdjacentElement('afterend', childLabel);
+    }
+
+    bindMediaFilterListeners();
+  }
+
+  function bindMediaFilterListeners() {
+    const filterVideoEl = document.getElementById('grok-filter-video');
+    const filterChildrenEl = document.getElementById('grok-filter-children');
+    if (!filterVideoEl || !filterChildrenEl) return;
+    if (filterVideoEl.dataset.grokFilterBound) return;
+    filterVideoEl.dataset.grokFilterBound = '1';
+    filterChildrenEl.dataset.grokFilterBound = '1';
+
+    try {
+      filterOnlyVideo = localStorage.getItem(FILTER_VIDEO_KEY) === '1';
+      filterOnlyChildren = localStorage.getItem(FILTER_CHILDREN_KEY) === '1';
+    } catch { /* ignore */ }
+    filterVideoEl.checked = filterOnlyVideo;
+    filterChildrenEl.checked = filterOnlyChildren;
+
+    const onMediaFilterChange = () => {
+      filterOnlyVideo = filterVideoEl.checked;
+      filterOnlyChildren = filterChildrenEl.checked;
+      try {
+        localStorage.setItem(FILTER_VIDEO_KEY, filterOnlyVideo ? '1' : '0');
+        localStorage.setItem(FILTER_CHILDREN_KEY, filterOnlyChildren ? '1' : '0');
+      } catch { /* ignore */ }
+      currentPage = 0;
+      updateClearButton();
+      applyFilter();
+    };
+    filterVideoEl.addEventListener('change', onMediaFilterChange);
+    filterChildrenEl.addEventListener('change', onMediaFilterChange);
+  }
+
   function ensureReindexButton() {
     if (document.getElementById('grok-reindex-btn')) return;
     const bar = document.getElementById('grok-search-bar');
@@ -1220,6 +1284,7 @@
     if (document.getElementById('grok-search-wrap')) {
       ensurePageJumpInput();
       ensureReindexButton();
+      ensureMediaFilterCheckboxes();
       return;
     }
     const wrap = document.createElement('div');
@@ -1239,9 +1304,17 @@
           <option value="newest">Newest</option>
           <option value="oldest">Oldest</option>
         </select>
-        <label id="grok-results-only-label" title="Hide Grok saved grid; show only paginated search results">
+        <label id="grok-results-only-label" class="grok-filter-check-label" title="Hide Grok saved grid; show only paginated search results">
           <input type="checkbox" id="grok-results-only" />
           Results only
+        </label>
+        <label id="grok-filter-video-label" class="grok-filter-check-label" title="Show only items with at least one video">
+          <input type="checkbox" id="grok-filter-video" />
+          Only with video
+        </label>
+        <label id="grok-filter-children-label" class="grok-filter-check-label" title="Show only items with child posts">
+          <input type="checkbox" id="grok-filter-children" />
+          Only with child posts
         </label>
         <button id="grok-reindex-btn" class="grok-toolbar-btn" type="button" title="Clear cache and reindex from Grok (refreshes child image/video counts)">Reindex</button>
         <button id="grok-search-clear" title="Clear">
@@ -1287,14 +1360,21 @@
     const reindexBtn = document.getElementById('grok-reindex-btn');
     const sortSel = document.getElementById('grok-sort-select');
     const resultsOnlyEl = document.getElementById('grok-results-only');
+    const filterVideoEl = document.getElementById('grok-filter-video');
+    const filterChildrenEl = document.getElementById('grok-filter-children');
     const firstBtn = document.getElementById('grok-page-first');
     const pageJumpEl = ensurePageJumpInput();
 
     try {
       resultsOnly = localStorage.getItem(RESULTS_ONLY_KEY) === '1';
+      filterOnlyVideo = localStorage.getItem(FILTER_VIDEO_KEY) === '1';
+      filterOnlyChildren = localStorage.getItem(FILTER_CHILDREN_KEY) === '1';
     } catch { /* ignore */ }
     resultsOnlyEl.checked = resultsOnly;
+    if (filterVideoEl) filterVideoEl.checked = filterOnlyVideo;
+    if (filterChildrenEl) filterChildrenEl.checked = filterOnlyChildren;
     updateResultsOnlyLayout();
+    bindMediaFilterListeners();
     const prevBtn = document.getElementById('grok-page-prev');
     const nextBtn = document.getElementById('grok-page-next');
     const lastBtn = document.getElementById('grok-page-last');
@@ -1331,6 +1411,14 @@
       dateEndEl.value = '';
       dateStart = '';
       dateEnd = '';
+      filterOnlyVideo = false;
+      filterOnlyChildren = false;
+      if (filterVideoEl) filterVideoEl.checked = false;
+      if (filterChildrenEl) filterChildrenEl.checked = false;
+      try {
+        localStorage.setItem(FILTER_VIDEO_KEY, '0');
+        localStorage.setItem(FILTER_CHILDREN_KEY, '0');
+      } catch { /* ignore */ }
       currentPage = 0;
       updateClearButton();
       applyFilter();
