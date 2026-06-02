@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.11.2
+// @version      1.11.3
 // @description  Search saved Grok images/videos by prompt and date range. Optional results-only mode hides the native saved grid. Clicks open /imagine/post/{id}. No custom UI on detail pages.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
@@ -245,7 +245,11 @@
     return best || getGrokGrid();
   }
 
-  function shouldUseCustomGrid() {
+  function shouldUseResultsPanel() {
+    return resultsOnly;
+  }
+
+  function shouldShowSearchResults() {
     return resultsOnly || hasActiveFilter();
   }
 
@@ -274,18 +278,38 @@
   }
 
   function applyNativeVisibility() {
-    if (!shouldUseCustomGrid()) {
+    if (!shouldShowSearchResults()) {
       setNativeSavedRootVisible(true);
       setNativeGridVisible(true);
       return;
     }
-    setNativeSavedRootVisible(false);
-    setNativeGridVisible(false);
+    if (resultsOnly) {
+      setNativeSavedRootVisible(false);
+      setNativeGridVisible(false);
+    } else {
+      setNativeSavedRootVisible(true);
+      setNativeGridVisible(false);
+    }
   }
 
   function updateDisplayMode() {
     document.documentElement.classList.toggle('grok-results-only-mode', resultsOnly);
-    document.documentElement.classList.toggle('grok-custom-results-mode', shouldUseCustomGrid());
+    document.documentElement.classList.toggle('grok-custom-results-mode', resultsOnly);
+    document.documentElement.classList.toggle('grok-filtered-inline-mode', hasActiveFilter() && !resultsOnly);
+  }
+
+  function layoutResultsGridPlacement() {
+    let container = document.getElementById('grok-results-grid');
+    if (!container) return null;
+    if (resultsOnly) {
+      const body = ensureResultsPanel().querySelector('.grok-results-panel-body');
+      if (container.parentElement !== body) body.appendChild(container);
+    } else {
+      const nativeGrid = getGrokGrid();
+      const insertTarget = nativeGrid?.parentElement || document.body;
+      if (container.parentElement !== insertTarget) insertTarget.appendChild(container);
+    }
+    return container;
   }
 
   function ensureResultsBackdrop() {
@@ -323,7 +347,7 @@
     const slot = document.getElementById('grok-panel-pager-slot');
     const wrap = document.getElementById('grok-search-wrap');
     if (!pager) return;
-    if (shouldUseCustomGrid() && slot) {
+    if (shouldUseResultsPanel() && slot) {
       slot.appendChild(pager);
     } else if (wrap) {
       wrap.appendChild(pager);
@@ -344,26 +368,30 @@
     if (visible) {
       ensureResultsBackdrop().style.display = 'block';
       ensureResultsPanel().style.display = 'flex';
-      if (grid) grid.style.display = 'grid';
       layoutPagerInPanel();
     } else {
       if (panel) panel.style.display = 'none';
       if (backdrop) backdrop.style.display = 'none';
-      if (grid) grid.style.display = 'none';
       restorePagerToToolbar();
     }
     updateDisplayMode();
   }
 
-  function hideCustomResults() {
+  function hideAllSearchResults() {
     setResultsPanelVisible(false);
+    const grid = document.getElementById('grok-results-grid');
+    if (grid) grid.style.display = 'none';
+  }
+
+  function hideCustomResults() {
+    hideAllSearchResults();
   }
 
   function syncResultsView() {
     updateDisplayMode();
 
-    if (!shouldUseCustomGrid()) {
-      hideCustomResults();
+    if (!shouldShowSearchResults()) {
+      hideAllSearchResults();
       applyNativeVisibility();
       const noResults = document.getElementById('grok-no-results');
       if (noResults) noResults.classList.remove('visible');
@@ -376,7 +404,7 @@
     currentPage = 0;
     const noResults = document.getElementById('grok-no-results');
     if (matchedPosts.length === 0) {
-      hideCustomResults();
+      hideAllSearchResults();
       applyNativeVisibility();
       if (noResults) noResults.classList.add('visible');
     } else {
@@ -401,9 +429,14 @@
     const page = matchedPosts.slice(start, start + PAGE_SIZE);
 
     applyNativeVisibility();
-    setResultsPanelVisible(true);
-    const panel = document.getElementById('grok-results-panel');
-    const container = document.getElementById('grok-results-grid');
+    updateDisplayMode();
+
+    let container = document.getElementById('grok-results-grid');
+    if (!container) {
+      container = document.createElement('div');
+      container.id = 'grok-results-grid';
+    }
+    layoutResultsGridPlacement();
 
     container.innerHTML = page.map(post => `
       <div class="grok-result-card" data-id="${escapeHtml(post.id)}" data-media="${escapeHtml(post.mediaUrl)}" title="${escapeHtml(post.prompt)}">
@@ -428,14 +461,24 @@
       });
     });
 
+    container.style.display = 'grid';
+
+    if (resultsOnly) {
+      setResultsPanelVisible(true);
+      const panel = document.getElementById('grok-results-panel');
+      const body = panel?.querySelector('.grok-results-panel-body');
+      if (body) body.scrollTop = 0;
+    } else {
+      setResultsPanelVisible(false);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
     updatePager();
-    const body = panel.querySelector('.grok-results-panel-body');
-    if (body) body.scrollTop = 0;
     enforceDisplayMode();
   }
 
   function hideResults() {
-    hideCustomResults();
+    hideAllSearchResults();
     applyNativeVisibility();
     updatePager();
   }
@@ -476,20 +519,28 @@
 
   let enforceTimer = null;
   function enforceDisplayMode() {
-    if (!shouldUseCustomGrid()) {
-      hideCustomResults();
+    updateDisplayMode();
+    if (!shouldShowSearchResults()) {
+      hideAllSearchResults();
       applyNativeVisibility();
-      updateDisplayMode();
       return;
     }
     applyNativeVisibility();
-    if (matchedPosts.length > 0) {
-      setResultsPanelVisible(true);
-      layoutPagerInPanel();
-    } else {
-      hideCustomResults();
+    if (matchedPosts.length === 0) {
+      hideAllSearchResults();
+      return;
     }
-    updateDisplayMode();
+    if (resultsOnly) {
+      layoutResultsGridPlacement();
+      setResultsPanelVisible(true);
+      const grid = document.getElementById('grok-results-grid');
+      if (grid) grid.style.display = 'grid';
+    } else {
+      setResultsPanelVisible(false);
+      layoutResultsGridPlacement();
+      const grid = document.getElementById('grok-results-grid');
+      if (grid) grid.style.display = 'grid';
+    }
   }
 
   function scheduleEnforceDisplay() {
@@ -521,7 +572,7 @@
     if (panelCountEl) panelCountEl.textContent = countText;
 
     if (pagerEl) {
-      pagerEl.style.display = (shouldUseCustomGrid() && totalPages > 1) ? 'flex' : 'none';
+      pagerEl.style.display = (shouldShowSearchResults() && totalPages > 1) ? 'flex' : 'none';
     }
 
     if (pageLabel) pageLabel.textContent = `${(currentPage + 1).toLocaleString()} / ${totalPages.toLocaleString()}`;
@@ -756,6 +807,11 @@
         visibility: hidden !important;
         pointer-events: none !important;
       }
+      html.grok-filtered-inline-mode #grok-results-grid {
+        padding: 96px 24px 24px;
+        max-width: 1400px;
+        margin: 0 auto;
+      }
       .grok-result-card {
         position: relative; cursor: pointer; border-radius: 14px;
         overflow: hidden; background: rgba(255,255,255,0.05);
@@ -936,7 +992,7 @@
     document.addEventListener('keydown', e => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'f') { e.preventDefault(); input.focus(); input.select(); }
       if (e.key === 'Escape' && document.activeElement === input) input.blur();
-      if (shouldUseCustomGrid() && document.activeElement !== input) {
+      if (shouldShowSearchResults() && document.activeElement !== input) {
         if (e.key === 'ArrowRight') { e.preventDefault(); currentPage++; showResults(); }
         if (e.key === 'ArrowLeft') { e.preventDefault(); currentPage--; showResults(); }
       }
