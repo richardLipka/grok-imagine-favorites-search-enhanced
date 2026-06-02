@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.11.3
+// @version      1.12.1
 // @description  Search saved Grok images/videos by prompt and date range. Optional results-only mode hides the native saved grid. Clicks open /imagine/post/{id}. No custom UI on detail pages.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
@@ -329,7 +329,10 @@
       panel.id = 'grok-results-panel';
       panel.innerHTML = `
         <div class="grok-results-panel-header">
-          <span class="grok-results-panel-title">Search results</span>
+          <div class="grok-results-panel-title-wrap">
+            <span class="grok-results-panel-title" id="grok-panel-title">Search results</span>
+            <span id="grok-panel-range" class="grok-results-panel-range"></span>
+          </div>
           <span id="grok-panel-count"></span>
         </div>
         <div class="grok-results-panel-body">
@@ -338,6 +341,17 @@
         <div class="grok-results-panel-footer" id="grok-panel-pager-slot"></div>
       `;
       document.body.appendChild(panel);
+    } else if (!document.getElementById('grok-panel-range')) {
+      const header = panel.querySelector('.grok-results-panel-header');
+      if (header) {
+        header.innerHTML = `
+          <div class="grok-results-panel-title-wrap">
+            <span class="grok-results-panel-title" id="grok-panel-title">Search results</span>
+            <span id="grok-panel-range" class="grok-results-panel-range"></span>
+          </div>
+          <span id="grok-panel-count"></span>
+        `;
+      }
     }
     return panel;
   }
@@ -348,10 +362,60 @@
     const wrap = document.getElementById('grok-search-wrap');
     if (!pager) return;
     if (shouldUseResultsPanel() && slot) {
-      slot.appendChild(pager);
-    } else if (wrap) {
+      if (pager.parentElement !== slot) slot.appendChild(pager);
+    } else if (wrap && pager.parentElement !== wrap) {
       wrap.appendChild(pager);
     }
+  }
+
+  function ensurePageJumpInput() {
+    let jump = document.getElementById('grok-page-jump');
+    if (jump) return jump;
+    const pager = document.getElementById('grok-pager');
+    const prev = document.getElementById('grok-page-prev');
+    const label = document.getElementById('grok-page-label');
+    if (!pager || !prev || !label) return null;
+    jump = document.createElement('input');
+    jump.type = 'text';
+    jump.id = 'grok-page-jump';
+    jump.className = 'grok-page-jump';
+    jump.inputMode = 'numeric';
+    jump.maxLength = 6;
+    jump.title = 'Go to page (1–N)';
+    jump.setAttribute('aria-label', 'Page number');
+    prev.insertAdjacentElement('afterend', jump);
+    bindPageJumpListeners(jump);
+    return jump;
+  }
+
+  function bindPageJumpListeners(pageJumpEl) {
+    if (!pageJumpEl || pageJumpEl.dataset.grokJumpBound) return;
+    pageJumpEl.dataset.grokJumpBound = '1';
+
+    const stopKey = e => e.stopPropagation();
+    pageJumpEl.addEventListener('keydown', e => {
+      stopKey(e);
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        applyPageJump();
+      }
+    }, true);
+    pageJumpEl.addEventListener('keyup', stopKey, true);
+    pageJumpEl.addEventListener('keypress', stopKey, true);
+    pageJumpEl.addEventListener('mousedown', e => e.stopPropagation(), true);
+    pageJumpEl.addEventListener('click', e => e.stopPropagation(), true);
+
+    pageJumpEl.addEventListener('change', () => applyPageJump());
+    pageJumpEl.addEventListener('blur', () => {
+      const totalPages = getTotalPages();
+      const result = parsePageJumpInput(pageJumpEl.value, totalPages);
+      if (!result.valid) syncPageJumpInput();
+    });
+    pageJumpEl.addEventListener('input', () => {
+      const totalPages = getTotalPages();
+      const result = parsePageJumpInput(pageJumpEl.value, totalPages);
+      setPageJumpValidity(pageJumpEl.value.trim() === '' || result.valid);
+    });
   }
 
   function restorePagerToToolbar() {
@@ -438,12 +502,15 @@
     }
     layoutResultsGridPlacement();
 
-    container.innerHTML = page.map(post => `
+    container.innerHTML = page.map(post => {
+      const dateStr = formatPostDate(post.createTime);
+      return `
       <div class="grok-result-card" data-id="${escapeHtml(post.id)}" data-media="${escapeHtml(post.mediaUrl)}" title="${escapeHtml(post.prompt)}">
+        ${dateStr ? `<div class="grok-result-date">${escapeHtml(dateStr)}</div>` : ''}
         <img src="${escapeHtml(post.thumbnail)}" alt="${escapeHtml(post.prompt)}" loading="lazy" style="width:100%; display:block; border-radius:14px; aspect-ratio:3/4; object-fit:cover;" />
         <div class="grok-result-prompt">${escapeHtml(post.prompt)}</div>
-      </div>
-    `).join('');
+      </div>`;
+    }).join('');
 
     container.querySelectorAll('.grok-result-card').forEach(card => {
       card.addEventListener('click', e => {
@@ -473,6 +540,7 @@
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
+    updatePanelPageRange(page);
     updatePager();
     enforceDisplayMode();
   }
@@ -519,6 +587,7 @@
 
   let enforceTimer = null;
   function enforceDisplayMode() {
+    if (isPageJumpFocused()) return;
     updateDisplayMode();
     if (!shouldShowSearchResults()) {
       hideAllSearchResults();
@@ -549,7 +618,7 @@
   }
 
   function updatePager() {
-    const totalPages = Math.max(1, Math.ceil(matchedPosts.length / PAGE_SIZE));
+    const totalPages = getTotalPages();
     const countEl = document.getElementById('grok-search-count');
     const pagerEl = document.getElementById('grok-pager');
     const pageLabel = document.getElementById('grok-page-label');
@@ -575,7 +644,8 @@
       pagerEl.style.display = (shouldShowSearchResults() && totalPages > 1) ? 'flex' : 'none';
     }
 
-    if (pageLabel) pageLabel.textContent = `${(currentPage + 1).toLocaleString()} / ${totalPages.toLocaleString()}`;
+    if (pageLabel) pageLabel.textContent = `/ ${totalPages.toLocaleString()}`;
+    syncPageJumpInput();
     if (firstBtn) firstBtn.disabled = currentPage === 0;
     if (prevBtn) prevBtn.disabled = currentPage === 0;
     if (nextBtn) nextBtn.disabled = currentPage >= totalPages - 1;
@@ -584,6 +654,84 @@
 
   function escapeHtml(str) {
     return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function formatPostDate(createTime) {
+    if (!createTime) return '';
+    const d = new Date(createTime);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  }
+
+  function formatPostDateTime(createTime) {
+    if (!createTime) return 'Unknown date';
+    const d = new Date(createTime);
+    if (Number.isNaN(d.getTime())) return 'Unknown date';
+    return d.toLocaleString(undefined, {
+      year: 'numeric', month: 'short', day: 'numeric',
+      hour: 'numeric', minute: '2-digit',
+    });
+  }
+
+  function getTotalPages() {
+    return Math.max(1, Math.ceil(matchedPosts.length / PAGE_SIZE));
+  }
+
+  function updatePanelPageRange(pagePosts) {
+    const rangeEl = document.getElementById('grok-panel-range');
+    if (!rangeEl) return;
+    if (!pagePosts.length) {
+      rangeEl.textContent = '';
+      return;
+    }
+    const first = formatPostDateTime(pagePosts[0].createTime);
+    const last = formatPostDateTime(pagePosts[pagePosts.length - 1].createTime);
+    rangeEl.textContent = first === last ? first : `${first} – ${last}`;
+  }
+
+  function parsePageJumpInput(raw, totalPages) {
+    const s = String(raw || '').trim();
+    if (!s) return { valid: false, page: null };
+    if (!/^\d+$/.test(s)) return { valid: false, page: null };
+    const n = parseInt(s, 10);
+    if (n < 1 || n > totalPages) return { valid: false, page: null };
+    return { valid: true, page: n - 1 };
+  }
+
+  function setPageJumpValidity(valid) {
+    const input = document.getElementById('grok-page-jump');
+    if (input) input.classList.toggle('grok-page-jump-invalid', !valid);
+  }
+
+  function syncPageJumpInput() {
+    const input = document.getElementById('grok-page-jump');
+    if (!input) return;
+    if (document.activeElement === input) return;
+    input.value = String(currentPage + 1);
+    setPageJumpValidity(true);
+  }
+
+  function isPageJumpFocused() {
+    return document.activeElement?.id === 'grok-page-jump';
+  }
+
+  function applyPageJump() {
+    const input = document.getElementById('grok-page-jump');
+    if (!input) return false;
+    const totalPages = getTotalPages();
+    const result = parsePageJumpInput(input.value, totalPages);
+    if (!result.valid) {
+      setPageJumpValidity(input.value.trim() !== '');
+      return false;
+    }
+    setPageJumpValidity(true);
+    if (result.page !== currentPage) {
+      currentPage = result.page;
+      showResults();
+    } else {
+      syncPageJumpInput();
+    }
+    return true;
   }
 
   function postCreatedMs(post) {
@@ -701,6 +849,7 @@
         background: rgba(15,15,20,0.88); border: 1px solid rgba(255,255,255,0.1);
         border-radius: 10px; padding: 5px 10px;
         backdrop-filter: blur(12px); box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+        pointer-events: auto;
       }
       .grok-page-btn {
         background: none; border: 1px solid rgba(255,255,255,0.12);
@@ -717,7 +866,48 @@
       .grok-page-btn.icon-only { padding: 4px 8px; }
       #grok-page-label {
         font-size: 12px; color: rgba(255,255,255,0.45);
-        font-variant-numeric: tabular-nums; min-width: 56px; text-align: center;
+        font-variant-numeric: tabular-nums; min-width: 40px; text-align: center;
+      }
+      .grok-page-jump {
+        width: 44px;
+        background: rgba(255,255,255,0.07);
+        border: 1px solid rgba(255,255,255,0.15);
+        border-radius: 7px;
+        color: rgba(255,255,255,0.85);
+        font-size: 12px;
+        padding: 4px 6px;
+        text-align: center;
+        outline: none;
+        font-variant-numeric: tabular-nums;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        pointer-events: auto;
+        user-select: text;
+        -webkit-user-select: text;
+        position: relative;
+        z-index: 1;
+      }
+      .grok-page-jump:focus {
+        border-color: rgba(139,92,246,0.6);
+        color: #fff;
+      }
+      .grok-page-jump-invalid {
+        border-color: rgba(239,68,68,0.75) !important;
+        color: #fca5a5 !important;
+      }
+      .grok-result-date {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 2;
+        padding: 6px 8px;
+        font-size: 10px;
+        font-weight: 600;
+        color: rgba(255, 255, 255, 0.95);
+        background: linear-gradient(rgba(0,0,0,0.72), transparent);
+        border-radius: 14px 14px 0 0;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        pointer-events: none;
       }
       #grok-results-backdrop {
         display: none;
@@ -749,7 +939,7 @@
       }
       .grok-results-panel-header {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         justify-content: space-between;
         gap: 12px;
         padding: 14px 20px;
@@ -757,10 +947,21 @@
         background: #1a1a24;
         flex-shrink: 0;
       }
+      .grok-results-panel-title-wrap {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        min-width: 0;
+      }
       .grok-results-panel-title {
         font-size: 14px;
         font-weight: 600;
         color: rgba(255, 255, 255, 0.92);
+      }
+      .grok-results-panel-range {
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.5);
+        line-height: 1.35;
       }
       #grok-panel-count {
         font-size: 12px;
@@ -853,7 +1054,10 @@
 
   // ─── UI ────────────────────────────────────────────────────────────────────
   function buildSearchBar() {
-    if (document.getElementById('grok-search-wrap')) return;
+    if (document.getElementById('grok-search-wrap')) {
+      ensurePageJumpInput();
+      return;
+    }
     const wrap = document.createElement('div');
     wrap.id = 'grok-search-wrap';
     wrap.innerHTML = `
@@ -891,7 +1095,8 @@
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2"><polyline points="7,1 3,5 7,9"/></svg>
           Prev
         </button>
-        <span id="grok-page-label">1 / 1</span>
+        <input type="text" id="grok-page-jump" class="grok-page-jump" inputmode="numeric" maxlength="6" title="Go to page (1–N)" aria-label="Page number" />
+        <span id="grok-page-label">/ 1</span>
         <button class="grok-page-btn" id="grok-page-next">
           Next
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3,1 7,5 3,9"/></svg>
@@ -917,6 +1122,7 @@
     const sortSel = document.getElementById('grok-sort-select');
     const resultsOnlyEl = document.getElementById('grok-results-only');
     const firstBtn = document.getElementById('grok-page-first');
+    const pageJumpEl = ensurePageJumpInput();
 
     try {
       resultsOnly = localStorage.getItem(RESULTS_ONLY_KEY) === '1';
@@ -985,14 +1191,19 @@
     prevBtn.addEventListener('click', () => { currentPage--; showResults(); });
     nextBtn.addEventListener('click', () => { currentPage++; showResults(); });
     lastBtn.addEventListener('click', () => {
-      currentPage = Math.max(0, Math.ceil(matchedPosts.length / PAGE_SIZE) - 1);
+      currentPage = getTotalPages() - 1;
       showResults();
     });
+
+    if (pageJumpEl) bindPageJumpListeners(pageJumpEl);
 
     document.addEventListener('keydown', e => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'f') { e.preventDefault(); input.focus(); input.select(); }
       if (e.key === 'Escape' && document.activeElement === input) input.blur();
-      if (shouldShowSearchResults() && document.activeElement !== input) {
+      const active = document.activeElement;
+      const typingInSearch = active === input;
+      const typingInPageJump = active?.id === 'grok-page-jump';
+      if (shouldShowSearchResults() && !typingInSearch && !typingInPageJump) {
         if (e.key === 'ArrowRight') { e.preventDefault(); currentPage++; showResults(); }
         if (e.key === 'ArrowLeft') { e.preventDefault(); currentPage--; showResults(); }
       }
