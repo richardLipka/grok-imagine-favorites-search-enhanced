@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.9
-// @description  Search saved Grok images/videos by prompt and date range on the saved list page. Clicks open saved item detail page (/imagine/post/{id}). No custom UI on detail pages.
+// @version      1.11
+// @description  Search saved Grok images/videos by prompt and date range. Optional results-only mode hides the native saved grid. Clicks open /imagine/post/{id}. No custom UI on detail pages.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
@@ -24,12 +24,14 @@
   const DB_NAME = 'GrokSearchIndex';
   const DB_VERSION = 1;
   const STORE_NAME = 'posts';
+  const RESULTS_ONLY_KEY = 'grokSearchResultsOnly';
 
   let allPosts = [];
   const knownIds = new Set();
   let currentQuery = '';
   let dateStart = '';
   let dateEnd = '';
+  let resultsOnly = false;
   let currentPage = 0;
   let currentSort = 'newest';
   let matchedPosts = [];
@@ -229,6 +231,126 @@
     return card.parentElement;
   }
 
+  function getNativeSavedRoot() {
+    const cards = document.querySelectorAll('[class*="media-post-masonry-card"]');
+    if (!cards.length) return getGrokGrid();
+    let el = cards[0].parentElement;
+    let best = el;
+    for (let i = 0; i < 15 && el && el !== document.body; i++) {
+      const n = el.querySelectorAll('[class*="media-post-masonry-card"]').length;
+      if (n > 0) best = el;
+      if (el.tagName === 'MAIN' || el.getAttribute('role') === 'main') return el;
+      el = el.parentElement;
+    }
+    return best || getGrokGrid();
+  }
+
+  function shouldUseCustomGrid() {
+    return resultsOnly || hasActiveFilter();
+  }
+
+  function setNativeGridVisible(visible) {
+    const nativeGrid = getGrokGrid();
+    if (!nativeGrid) return;
+    if (visible) {
+      nativeGrid.style.removeProperty('display');
+      nativeGrid.style.removeProperty('visibility');
+    } else {
+      nativeGrid.style.setProperty('display', 'none', 'important');
+      nativeGrid.style.setProperty('visibility', 'hidden', 'important');
+    }
+  }
+
+  function setNativeSavedRootVisible(visible) {
+    const root = getNativeSavedRoot();
+    if (!root) return;
+    if (visible) {
+      root.style.removeProperty('display');
+      delete root.dataset.grokNativeSavedRoot;
+    } else {
+      root.dataset.grokNativeSavedRoot = '1';
+      root.style.setProperty('display', 'none', 'important');
+    }
+  }
+
+  function applyNativeVisibility() {
+    if (!shouldUseCustomGrid()) {
+      setNativeSavedRootVisible(true);
+      setNativeGridVisible(true);
+      return;
+    }
+    setNativeSavedRootVisible(false);
+    setNativeGridVisible(false);
+  }
+
+  function updateDisplayMode() {
+    document.documentElement.classList.toggle('grok-results-only-mode', resultsOnly);
+    document.documentElement.classList.toggle('grok-custom-results-mode', shouldUseCustomGrid());
+  }
+
+  function ensureResultsBackdrop() {
+    let backdrop = document.getElementById('grok-results-backdrop');
+    if (!backdrop) {
+      backdrop = document.createElement('div');
+      backdrop.id = 'grok-results-backdrop';
+      document.body.appendChild(backdrop);
+    }
+    return backdrop;
+  }
+
+  function ensureResultsPanel() {
+    let panel = document.getElementById('grok-results-panel');
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'grok-results-panel';
+      panel.innerHTML = `
+        <div class="grok-results-panel-header">
+          <span class="grok-results-panel-title">Search results</span>
+          <span id="grok-panel-count"></span>
+        </div>
+        <div class="grok-results-panel-body">
+          <div id="grok-results-grid"></div>
+        </div>
+        <div class="grok-results-panel-footer" id="grok-panel-pager-slot"></div>
+      `;
+      document.body.appendChild(panel);
+    }
+    return panel;
+  }
+
+  function layoutPagerInPanel() {
+    const pager = document.getElementById('grok-pager');
+    const slot = document.getElementById('grok-panel-pager-slot');
+    const wrap = document.getElementById('grok-search-wrap');
+    if (!pager) return;
+    if (shouldUseCustomGrid() && slot) {
+      slot.appendChild(pager);
+    } else if (wrap) {
+      wrap.appendChild(pager);
+    }
+  }
+
+  function restorePagerToToolbar() {
+    const pager = document.getElementById('grok-pager');
+    const wrap = document.getElementById('grok-search-wrap');
+    if (pager && wrap && pager.parentElement !== wrap) wrap.appendChild(pager);
+  }
+
+  function hideCustomResults() {
+    const panel = document.getElementById('grok-results-panel');
+    const backdrop = document.getElementById('grok-results-backdrop');
+    const grid = document.getElementById('grok-results-grid');
+    if (panel) panel.style.display = 'none';
+    if (backdrop) backdrop.style.display = 'none';
+    if (grid) grid.style.display = 'none';
+    restorePagerToToolbar();
+    updateDisplayMode();
+  }
+
+  function updateResultsOnlyLayout() {
+    updateDisplayMode();
+  }
+
   function showResults() {
     if (rendering) return;
     rendering = true;
@@ -239,19 +361,16 @@
     const start = currentPage * PAGE_SIZE;
     const page = matchedPosts.slice(start, start + PAGE_SIZE);
 
-    const nativeGrid = getGrokGrid();
-    if (nativeGrid) {
-      nativeGrid.style.display = 'none';
-      nativeGrid.style.visibility = 'hidden';
-    }
+    applyNativeVisibility();
+    updateDisplayMode();
 
-    let container = document.getElementById('grok-results-grid');
-    if (!container) {
-      container = document.createElement('div');
-      container.id = 'grok-results-grid';
-      const insertTarget = nativeGrid?.parentElement || document.body;
-      insertTarget.appendChild(container);
-    }
+    const backdrop = ensureResultsBackdrop();
+    const panel = ensureResultsPanel();
+    backdrop.style.display = 'block';
+    panel.style.display = 'flex';
+    layoutPagerInPanel();
+
+    const container = document.getElementById('grok-results-grid');
     container.style.display = 'grid';
 
     container.innerHTML = page.map(post => `
@@ -278,17 +397,14 @@
     });
 
     updatePager();
-    window.scrollTo({ top: 100, behavior: 'smooth' });
+    const body = panel.querySelector('.grok-results-panel-body');
+    if (body) body.scrollTop = 0;
+    enforceDisplayMode();
   }
 
   function hideResults() {
-    const container = document.getElementById('grok-results-grid');
-    if (container) container.style.display = 'none';
-    const nativeGrid = getGrokGrid();
-    if (nativeGrid) {
-      nativeGrid.style.display = '';
-      nativeGrid.style.visibility = '';
-    }
+    hideCustomResults();
+    applyNativeVisibility();
     updatePager();
   }
 
@@ -302,6 +418,8 @@
       }
       return;
     }
+
+    updateDisplayMode();
 
     const queryLower = (currentQuery || '').toLowerCase().trim();
     const terms = queryLower ? queryLower.split(/\s+/).filter(Boolean) : [];
@@ -321,16 +439,46 @@
       return currentSort === 'oldest' ? ta - tb : tb - ta;
     });
 
-    currentPage = 0;
     const noResults = document.getElementById('grok-no-results');
+
+    if (!shouldUseCustomGrid()) {
+      hideCustomResults();
+      applyNativeVisibility();
+      if (noResults) noResults.classList.remove('visible');
+      updatePager();
+      return;
+    }
+
+    currentPage = 0;
     if (matchedPosts.length === 0) {
-      hideResults();
+      hideCustomResults();
+      applyNativeVisibility();
       if (noResults) noResults.classList.add('visible');
     } else {
       if (noResults) noResults.classList.remove('visible');
       showResults();
     }
     updatePager();
+  }
+
+  let enforceTimer = null;
+  function enforceDisplayMode() {
+    updateDisplayMode();
+    if (!shouldUseCustomGrid()) {
+      applyNativeVisibility();
+      return;
+    }
+    applyNativeVisibility();
+    const backdrop = document.getElementById('grok-results-backdrop');
+    const panel = document.getElementById('grok-results-panel');
+    if (backdrop) backdrop.style.display = 'block';
+    if (panel) panel.style.display = 'flex';
+    layoutPagerInPanel();
+  }
+
+  function scheduleEnforceDisplay() {
+    clearTimeout(enforceTimer);
+    enforceTimer = setTimeout(enforceDisplayMode, 200);
   }
 
   function updatePager() {
@@ -343,19 +491,21 @@
     const nextBtn = document.getElementById('grok-page-next');
     const lastBtn = document.getElementById('grok-page-last');
 
-    if (countEl) {
-      const n = matchedPosts.length.toLocaleString();
-      const hasText = Boolean(currentQuery.trim());
-      const hasDates = hasDateFilter();
-      if (hasText || hasDates) {
-        countEl.textContent = `${n} match${matchedPosts.length !== 1 ? 'es' : ''}`;
-      } else {
-        countEl.textContent = `${n} saved`;
-      }
+    let countText = '';
+    const n = matchedPosts.length.toLocaleString();
+    const hasText = Boolean(currentQuery.trim());
+    const hasDates = hasDateFilter();
+    if (hasText || hasDates) {
+      countText = `${n} match${matchedPosts.length !== 1 ? 'es' : ''}`;
+    } else {
+      countText = `${n} saved`;
     }
+    if (countEl) countEl.textContent = countText;
+    const panelCountEl = document.getElementById('grok-panel-count');
+    if (panelCountEl) panelCountEl.textContent = countText;
 
     if (pagerEl) {
-      pagerEl.style.display = (totalPages > 1) ? 'flex' : 'none';
+      pagerEl.style.display = (shouldUseCustomGrid() && totalPages > 1) ? 'flex' : 'none';
     }
 
     if (pageLabel) pageLabel.textContent = `${(currentPage + 1).toLocaleString()} / ${totalPages.toLocaleString()}`;
@@ -424,7 +574,7 @@
     s.textContent = `
       #grok-search-wrap {
         position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
-        z-index: 99999; display: flex; flex-direction: column; align-items: center;
+        z-index: 99990; display: flex; flex-direction: column; align-items: center;
         gap: 8px; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
       }
       #grok-search-bar {
@@ -502,12 +652,93 @@
         font-size: 12px; color: rgba(255,255,255,0.45);
         font-variant-numeric: tabular-nums; min-width: 56px; text-align: center;
       }
+      #grok-results-backdrop {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 99970;
+        background: rgba(0, 0, 0, 0.72);
+        pointer-events: auto;
+      }
+      #grok-results-panel {
+        display: none;
+        position: fixed;
+        z-index: 99980;
+        flex-direction: column;
+        background: #14141c;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 16px;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.75);
+        overflow: hidden;
+        box-sizing: border-box;
+      }
+      html.grok-custom-results-mode #grok-results-panel {
+        top: max(88px, 10vh);
+        left: 2.5vw;
+        right: 2.5vw;
+        bottom: 2.5vh;
+        width: auto;
+        height: auto;
+      }
+      .grok-results-panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 20px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        background: #1a1a24;
+        flex-shrink: 0;
+      }
+      .grok-results-panel-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: rgba(255, 255, 255, 0.92);
+      }
+      #grok-panel-count {
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.45);
+        font-variant-numeric: tabular-nums;
+      }
+      .grok-results-panel-body {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 16px 20px;
+        -webkit-overflow-scrolling: touch;
+      }
+      .grok-results-panel-footer {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 10px 16px 14px;
+        border-top: 1px solid rgba(255, 255, 255, 0.1);
+        background: #1a1a24;
+        flex-shrink: 0;
+      }
+      .grok-results-panel-footer #grok-pager {
+        display: flex;
+        box-shadow: none;
+        border: none;
+        background: transparent;
+        padding: 0;
+      }
       #grok-results-grid {
         display: none;
-        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-        gap: 12px; padding: 96px 24px 24px;
-        width: 100%; box-sizing: border-box;
-        max-width: 1400px; margin: 0 auto;
+        position: static;
+        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+        gap: 14px;
+        padding: 0;
+        width: 100%;
+        box-sizing: border-box;
+        max-width: none;
+        margin: 0;
+      }
+      html.grok-custom-results-mode [data-grok-native-saved-root="1"],
+      html.grok-custom-results-mode [class*="media-post-masonry-card"] {
+        display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
       }
       .grok-result-card {
         position: relative; cursor: pointer; border-radius: 12px;
@@ -534,6 +765,16 @@
       }
       #grok-no-results.visible { display: block; }
       #grok-no-results span { display: block; font-size: 36px; margin-bottom: 10px; }
+      #grok-results-only-label {
+        display: flex; align-items: center; gap: 5px;
+        font-size: 11px; color: rgba(255,255,255,0.55);
+        white-space: nowrap; flex-shrink: 0; cursor: pointer;
+        user-select: none; transition: color 0.15s;
+      }
+      #grok-results-only-label:hover { color: rgba(255,255,255,0.85); }
+      #grok-results-only {
+        accent-color: #8b5cf6; cursor: pointer; margin: 0;
+      }
     `;
     document.head.appendChild(s);
   }
@@ -558,6 +799,10 @@
           <option value="newest">Newest</option>
           <option value="oldest">Oldest</option>
         </select>
+        <label id="grok-results-only-label" title="Hide Grok saved grid; show only paginated search results">
+          <input type="checkbox" id="grok-results-only" />
+          Results only
+        </label>
         <button id="grok-search-clear" title="Clear">
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="1" y1="1" x2="11" y2="11"/><line x1="11" y1="1" x2="1" y2="11"/>
@@ -598,7 +843,14 @@
     const dateEndEl = document.getElementById('grok-date-end');
     const clearBtn = document.getElementById('grok-search-clear');
     const sortSel = document.getElementById('grok-sort-select');
+    const resultsOnlyEl = document.getElementById('grok-results-only');
     const firstBtn = document.getElementById('grok-page-first');
+
+    try {
+      resultsOnly = localStorage.getItem(RESULTS_ONLY_KEY) === '1';
+    } catch { /* ignore */ }
+    resultsOnlyEl.checked = resultsOnly;
+    updateResultsOnlyLayout();
     const prevBtn = document.getElementById('grok-page-prev');
     const nextBtn = document.getElementById('grok-page-next');
     const lastBtn = document.getElementById('grok-page-last');
@@ -644,6 +896,17 @@
       applyFilter();
     });
 
+    resultsOnlyEl.addEventListener('change', () => {
+      resultsOnly = resultsOnlyEl.checked;
+      updateResultsOnlyLayout();
+      try {
+        localStorage.setItem(RESULTS_ONLY_KEY, resultsOnly ? '1' : '0');
+      } catch { /* ignore */ }
+      currentPage = 0;
+      applyFilter();
+      scheduleEnforceDisplay();
+    });
+
     firstBtn.addEventListener('click', () => { currentPage = 0; showResults(); });
     prevBtn.addEventListener('click', () => { currentPage--; showResults(); });
     nextBtn.addEventListener('click', () => { currentPage++; showResults(); });
@@ -655,7 +918,7 @@
     document.addEventListener('keydown', e => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'f') { e.preventDefault(); input.focus(); input.select(); }
       if (e.key === 'Escape' && document.activeElement === input) input.blur();
-      if (hasActiveFilter() && document.activeElement !== input) {
+      if (shouldUseCustomGrid() && document.activeElement !== input) {
         if (e.key === 'ArrowRight') { e.preventDefault(); currentPage++; showResults(); }
         if (e.key === 'ArrowLeft') { e.preventDefault(); currentPage--; showResults(); }
       }
@@ -673,11 +936,16 @@
   }
 
   let lastUrl = location.href;
+  let domEnforceTimer = null;
   new MutationObserver(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       setTimeout(init, 800);
+      return;
     }
+    if (!resultsOnly && !hasActiveFilter()) return;
+    clearTimeout(domEnforceTimer);
+    domEnforceTimer = setTimeout(scheduleEnforceDisplay, 350);
   }).observe(document.body, { childList: true, subtree: true });
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
