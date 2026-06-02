@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.8
-// @description  Search saved Grok images/videos on the saved list page. Clicks open saved item detail page (/imagine/post/{id}). No custom UI on detail pages.
+// @version      1.9
+// @description  Search saved Grok images/videos by prompt and date range on the saved list page. Clicks open saved item detail page (/imagine/post/{id}). No custom UI on detail pages.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
@@ -28,6 +28,8 @@
   let allPosts = [];
   const knownIds = new Set();
   let currentQuery = '';
+  let dateStart = '';
+  let dateEnd = '';
   let currentPage = 0;
   let currentSort = 'newest';
   let matchedPosts = [];
@@ -301,17 +303,17 @@
       return;
     }
 
-    let queryLower = (currentQuery || '').toLowerCase().trim();
+    const queryLower = (currentQuery || '').toLowerCase().trim();
+    const terms = queryLower ? queryLower.split(/\s+/).filter(Boolean) : [];
 
-    if (!queryLower) {
-      matchedPosts = [...allPosts];
-    } else {
-      const terms = queryLower.split(/\s+/).filter(Boolean);
-      matchedPosts = allPosts.filter(post => {
-        const p = post.prompt.toLowerCase();
-        return terms.every(t => p.includes(t));
-      });
-    }
+    matchedPosts = allPosts.filter(post => {
+      if (terms.length > 0) {
+        const p = (post.prompt || '').toLowerCase();
+        if (!terms.every(t => p.includes(t))) return false;
+      }
+      if (!matchesDateFilter(post)) return false;
+      return true;
+    });
 
     matchedPosts.sort((a, b) => {
       const ta = a.createTime ? new Date(a.createTime).getTime() : 0;
@@ -342,9 +344,14 @@
     const lastBtn = document.getElementById('grok-page-last');
 
     if (countEl) {
-      countEl.textContent = currentQuery.trim()
-        ? `${matchedPosts.length.toLocaleString()} match${matchedPosts.length !== 1 ? 'es' : ''}`
-        : `${matchedPosts.length.toLocaleString()} saved`;
+      const n = matchedPosts.length.toLocaleString();
+      const hasText = Boolean(currentQuery.trim());
+      const hasDates = hasDateFilter();
+      if (hasText || hasDates) {
+        countEl.textContent = `${n} match${matchedPosts.length !== 1 ? 'es' : ''}`;
+      } else {
+        countEl.textContent = `${n} saved`;
+      }
     }
 
     if (pagerEl) {
@@ -360,6 +367,53 @@
 
   function escapeHtml(str) {
     return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function postCreatedMs(post) {
+    if (!post.createTime) return null;
+    const t = new Date(post.createTime).getTime();
+    return Number.isNaN(t) ? null : t;
+  }
+
+  function hasDateFilter() {
+    return Boolean(dateStart || dateEnd);
+  }
+
+  function hasActiveFilter() {
+    return Boolean(currentQuery.trim() || hasDateFilter());
+  }
+
+  function getDateFilterBounds() {
+    let start = dateStart;
+    let end = dateEnd;
+    if (start && end && start > end) [start, end] = [end, start];
+
+    let startMs = null;
+    let endMs = null;
+    if (start) {
+      const d = new Date(`${start}T00:00:00`);
+      if (!Number.isNaN(d.getTime())) startMs = d.getTime();
+    }
+    if (end) {
+      const d = new Date(`${end}T23:59:59.999`);
+      if (!Number.isNaN(d.getTime())) endMs = d.getTime();
+    }
+    return { startMs, endMs };
+  }
+
+  function matchesDateFilter(post) {
+    if (!hasDateFilter()) return true;
+    const { startMs, endMs } = getDateFilterBounds();
+    const ms = postCreatedMs(post);
+    if (ms === null) return false;
+    if (startMs !== null && ms < startMs) return false;
+    if (endMs !== null && ms > endMs) return false;
+    return true;
+  }
+
+  function updateClearButton() {
+    const clearBtn = document.getElementById('grok-search-clear');
+    if (clearBtn) clearBtn.classList.toggle('visible', hasActiveFilter());
   }
 
   // ─── Styles ────────────────────────────────────────────────────────────────
@@ -379,9 +433,21 @@
         border-radius: 14px; padding: 10px 16px;
         box-shadow: 0 8px 32px rgba(0,0,0,0.5);
         backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-        min-width: 340px; max-width: 600px; width: 44vw;
+        min-width: 420px; max-width: 720px; width: 52vw;
+        flex-wrap: wrap;
         transition: box-shadow 0.2s, border-color 0.2s;
       }
+      .grok-date-input {
+        background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.15);
+        border-radius: 8px; color: rgba(255,255,255,0.85); font-size: 11px;
+        padding: 3px 6px; outline: none; cursor: pointer; flex-shrink: 0;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        transition: border-color 0.15s, color 0.15s;
+        color-scheme: dark;
+      }
+      .grok-date-input:hover { border-color: rgba(139,92,246,0.5); }
+      .grok-date-input:focus { border-color: rgba(139,92,246,0.6); color: #fff; }
+      .grok-date-sep { color: rgba(255,255,255,0.35); font-size: 11px; flex-shrink: 0; }
       #grok-search-bar:focus-within {
         border-color: rgba(139,92,246,0.6);
         box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 0 3px rgba(139,92,246,0.15);
@@ -439,7 +505,7 @@
       #grok-results-grid {
         display: none;
         grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-        gap: 12px; padding: 80px 24px 24px;
+        gap: 12px; padding: 96px 24px 24px;
         width: 100%; box-sizing: border-box;
         max-width: 1400px; margin: 0 auto;
       }
@@ -483,6 +549,9 @@
           <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
         </svg>
         <input id="grok-search-input" type="text" placeholder="Search saved images by prompt…" autocomplete="off" spellcheck="false" />
+        <input id="grok-date-start" class="grok-date-input" type="date" title="From date" aria-label="From date" />
+        <span class="grok-date-sep">–</span>
+        <input id="grok-date-end" class="grok-date-input" type="date" title="To date" aria-label="To date" />
         <span id="grok-stamp-status"></span>
         <span id="grok-search-count"></span>
         <select id="grok-sort-select" title="Sort order">
@@ -525,6 +594,8 @@
     document.body.appendChild(noResults);
 
     const input = document.getElementById('grok-search-input');
+    const dateStartEl = document.getElementById('grok-date-start');
+    const dateEndEl = document.getElementById('grok-date-end');
     const clearBtn = document.getElementById('grok-search-clear');
     const sortSel = document.getElementById('grok-sort-select');
     const firstBtn = document.getElementById('grok-page-first');
@@ -532,18 +603,40 @@
     const nextBtn = document.getElementById('grok-page-next');
     const lastBtn = document.getElementById('grok-page-last');
 
-    input.addEventListener('input', () => {
-      currentQuery = input.value.trim();
+    const onFilterInput = () => {
       currentPage = 0;
-      clearBtn.classList.toggle('visible', currentQuery.length > 0);
       document.getElementById('grok-no-results').classList.remove('visible');
       applyFilter();
+    };
+
+    input.addEventListener('input', () => {
+      currentQuery = input.value.trim();
+      updateClearButton();
+      onFilterInput();
     });
 
+    const onDateChange = () => {
+      dateStart = dateStartEl.value;
+      dateEnd = dateEndEl.value;
+      updateClearButton();
+      onFilterInput();
+    };
+    dateStartEl.addEventListener('change', onDateChange);
+    dateEndEl.addEventListener('change', onDateChange);
+    dateStartEl.addEventListener('input', onDateChange);
+    dateEndEl.addEventListener('input', onDateChange);
+
     clearBtn.addEventListener('click', () => {
-      input.value = ''; currentQuery = ''; currentPage = 0;
-      clearBtn.classList.remove('visible');
-      applyFilter(); input.focus();
+      input.value = '';
+      currentQuery = '';
+      dateStartEl.value = '';
+      dateEndEl.value = '';
+      dateStart = '';
+      dateEnd = '';
+      currentPage = 0;
+      updateClearButton();
+      applyFilter();
+      input.focus();
     });
 
     sortSel.addEventListener('change', () => {
@@ -562,7 +655,7 @@
     document.addEventListener('keydown', e => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'f') { e.preventDefault(); input.focus(); input.select(); }
       if (e.key === 'Escape' && document.activeElement === input) input.blur();
-      if (currentQuery && document.activeElement !== input) {
+      if (hasActiveFilter() && document.activeElement !== input) {
         if (e.key === 'ArrowRight') { e.preventDefault(); currentPage++; showResults(); }
         if (e.key === 'ArrowLeft') { e.preventDefault(); currentPage--; showResults(); }
       }
