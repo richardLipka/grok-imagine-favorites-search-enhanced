@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.11
+// @version      1.11.2
 // @description  Search saved Grok images/videos by prompt and date range. Optional results-only mode hides the native saved grid. Clicks open /imagine/post/{id}. No custom UI on detail pages.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
@@ -19,7 +19,7 @@
     return;
   }
 
-  const PAGE_SIZE = 20;
+  const PAGE_SIZE = 32;
   const ENDPOINT = 'https://grok.com/rest/media/post/list';
   const DB_NAME = 'GrokSearchIndex';
   const DB_VERSION = 1;
@@ -336,15 +336,54 @@
     if (pager && wrap && pager.parentElement !== wrap) wrap.appendChild(pager);
   }
 
-  function hideCustomResults() {
+  function setResultsPanelVisible(visible) {
     const panel = document.getElementById('grok-results-panel');
     const backdrop = document.getElementById('grok-results-backdrop');
     const grid = document.getElementById('grok-results-grid');
-    if (panel) panel.style.display = 'none';
-    if (backdrop) backdrop.style.display = 'none';
-    if (grid) grid.style.display = 'none';
-    restorePagerToToolbar();
+
+    if (visible) {
+      ensureResultsBackdrop().style.display = 'block';
+      ensureResultsPanel().style.display = 'flex';
+      if (grid) grid.style.display = 'grid';
+      layoutPagerInPanel();
+    } else {
+      if (panel) panel.style.display = 'none';
+      if (backdrop) backdrop.style.display = 'none';
+      if (grid) grid.style.display = 'none';
+      restorePagerToToolbar();
+    }
     updateDisplayMode();
+  }
+
+  function hideCustomResults() {
+    setResultsPanelVisible(false);
+  }
+
+  function syncResultsView() {
+    updateDisplayMode();
+
+    if (!shouldUseCustomGrid()) {
+      hideCustomResults();
+      applyNativeVisibility();
+      const noResults = document.getElementById('grok-no-results');
+      if (noResults) noResults.classList.remove('visible');
+      updatePager();
+      return;
+    }
+
+    if (!loaded) return;
+
+    currentPage = 0;
+    const noResults = document.getElementById('grok-no-results');
+    if (matchedPosts.length === 0) {
+      hideCustomResults();
+      applyNativeVisibility();
+      if (noResults) noResults.classList.add('visible');
+    } else {
+      if (noResults) noResults.classList.remove('visible');
+      showResults();
+    }
+    updatePager();
   }
 
   function updateResultsOnlyLayout() {
@@ -362,20 +401,13 @@
     const page = matchedPosts.slice(start, start + PAGE_SIZE);
 
     applyNativeVisibility();
-    updateDisplayMode();
-
-    const backdrop = ensureResultsBackdrop();
-    const panel = ensureResultsPanel();
-    backdrop.style.display = 'block';
-    panel.style.display = 'flex';
-    layoutPagerInPanel();
-
+    setResultsPanelVisible(true);
+    const panel = document.getElementById('grok-results-panel');
     const container = document.getElementById('grok-results-grid');
-    container.style.display = 'grid';
 
     container.innerHTML = page.map(post => `
       <div class="grok-result-card" data-id="${escapeHtml(post.id)}" data-media="${escapeHtml(post.mediaUrl)}" title="${escapeHtml(post.prompt)}">
-        <img src="${escapeHtml(post.thumbnail)}" alt="${escapeHtml(post.prompt)}" loading="lazy" style="width:100%; display:block; border-radius:12px; aspect-ratio:3/4; object-fit:cover;" />
+        <img src="${escapeHtml(post.thumbnail)}" alt="${escapeHtml(post.prompt)}" loading="lazy" style="width:100%; display:block; border-radius:14px; aspect-ratio:3/4; object-fit:cover;" />
         <div class="grok-result-prompt">${escapeHtml(post.prompt)}</div>
       </div>
     `).join('');
@@ -439,41 +471,25 @@
       return currentSort === 'oldest' ? ta - tb : tb - ta;
     });
 
-    const noResults = document.getElementById('grok-no-results');
-
-    if (!shouldUseCustomGrid()) {
-      hideCustomResults();
-      applyNativeVisibility();
-      if (noResults) noResults.classList.remove('visible');
-      updatePager();
-      return;
-    }
-
-    currentPage = 0;
-    if (matchedPosts.length === 0) {
-      hideCustomResults();
-      applyNativeVisibility();
-      if (noResults) noResults.classList.add('visible');
-    } else {
-      if (noResults) noResults.classList.remove('visible');
-      showResults();
-    }
-    updatePager();
+    syncResultsView();
   }
 
   let enforceTimer = null;
   function enforceDisplayMode() {
-    updateDisplayMode();
     if (!shouldUseCustomGrid()) {
+      hideCustomResults();
       applyNativeVisibility();
+      updateDisplayMode();
       return;
     }
     applyNativeVisibility();
-    const backdrop = document.getElementById('grok-results-backdrop');
-    const panel = document.getElementById('grok-results-panel');
-    if (backdrop) backdrop.style.display = 'block';
-    if (panel) panel.style.display = 'flex';
-    layoutPagerInPanel();
+    if (matchedPosts.length > 0) {
+      setResultsPanelVisible(true);
+      layoutPagerInPanel();
+    } else {
+      hideCustomResults();
+    }
+    updateDisplayMode();
   }
 
   function scheduleEnforceDisplay() {
@@ -726,8 +742,8 @@
       #grok-results-grid {
         display: none;
         position: static;
-        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-        gap: 14px;
+        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+        gap: 17px;
         padding: 0;
         width: 100%;
         box-sizing: border-box;
@@ -741,12 +757,12 @@
         pointer-events: none !important;
       }
       .grok-result-card {
-        position: relative; cursor: pointer; border-radius: 12px;
+        position: relative; cursor: pointer; border-radius: 14px;
         overflow: hidden; background: rgba(255,255,255,0.05);
         transition: transform 0.2s, box-shadow 0.2s;
       }
       .grok-result-card:hover { transform: scale(1.03); box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
-      .grok-result-card img { width: 100%; display: block; border-radius: 12px; aspect-ratio: 3/4; object-fit: cover; }
+      .grok-result-card img { width: 100%; display: block; border-radius: 14px; aspect-ratio: 3/4; object-fit: cover; }
       .grok-result-prompt {
         position: absolute; bottom: 0; left: 0; right: 0;
         background: linear-gradient(transparent, rgba(0,0,0,0.85));
@@ -896,7 +912,7 @@
       applyFilter();
     });
 
-    resultsOnlyEl.addEventListener('change', () => {
+    const onResultsOnlyToggle = () => {
       resultsOnly = resultsOnlyEl.checked;
       updateResultsOnlyLayout();
       try {
@@ -905,7 +921,9 @@
       currentPage = 0;
       applyFilter();
       scheduleEnforceDisplay();
-    });
+    };
+    resultsOnlyEl.addEventListener('change', onResultsOnlyToggle);
+    resultsOnlyEl.addEventListener('input', onResultsOnlyToggle);
 
     firstBtn.addEventListener('click', () => { currentPage = 0; showResults(); });
     prevBtn.addEventListener('click', () => { currentPage--; showResults(); });
