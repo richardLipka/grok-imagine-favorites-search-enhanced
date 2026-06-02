@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.12.1
-// @description  Search saved Grok images/videos by prompt and date range. Optional results-only mode hides the native saved grid. Clicks open /imagine/post/{id}. No custom UI on detail pages.
+// @version      1.13
+// @description  Search saved Grok media by prompt and date. Tracks child images/videos, shows badges, reindex DB. Results-only panel mode. Clicks open /imagine/post/{id}.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
@@ -78,6 +78,16 @@
     });
   }
 
+  function dbClear() {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const req = tx.objectStore(STORE_NAME).clear();
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   // ─── API & fetch ───────────────────────────────────────────────────────────
   function fetchPage(cursor) {
     return new Promise(resolve => {
@@ -94,16 +104,83 @@
     });
   }
 
+  function isVideoMediaType(mediaType) {
+    const t = String(mediaType || '');
+    return t === 'MEDIA_POST_TYPE_VIDEO' || t.includes('VIDEO');
+  }
+
+  function extractChildMediaCounts(post) {
+    const children = post.childPosts || [];
+    let childImageCount = 0;
+    let childVideoCount = 0;
+    for (const child of children) {
+      if (isVideoMediaType(child.mediaType)) childVideoCount++;
+      else childImageCount++;
+    }
+    const parentIsVideo = isVideoMediaType(post.mediaType);
+    const videoCount = (parentIsVideo ? 1 : 0) + childVideoCount;
+    return {
+      childPostCount: children.length,
+      childImageCount,
+      childVideoCount,
+      videoCount,
+    };
+  }
+
+  function normalizePost(post) {
+    return {
+      ...post,
+      childPostCount: post.childPostCount ?? 0,
+      childImageCount: post.childImageCount ?? 0,
+      childVideoCount: post.childVideoCount ?? 0,
+      videoCount: post.videoCount ?? 0,
+    };
+  }
+
   function parsePost(post) {
     if (!post.id) return null;
     const prompt = post.prompt || post.originalPrompt || '';
+    const counts = extractChildMediaCounts(post);
     return {
       id: post.id,
       prompt,
       thumbnail: post.thumbnailImageUrl || post.mediaUrl || '',
       mediaUrl: post.mediaUrl || '',
       createTime: post.createTime || '',
+      ...counts,
     };
+  }
+
+  async function reindexDatabase() {
+    if (indexing) return;
+    const statusEl = document.getElementById('grok-stamp-status');
+    const reindexBtn = document.getElementById('grok-reindex-btn');
+    indexing = true;
+    loaded = false;
+    allPosts = [];
+    knownIds.clear();
+    matchedPosts = [];
+    currentPage = 0;
+    if (reindexBtn) reindexBtn.disabled = true;
+    try {
+      if (!db) db = await openDB();
+      await dbClear();
+      if (statusEl) statusEl.textContent = 'reindexing…';
+      const count = await fetchFullIndex(statusEl);
+      loaded = true;
+      console.log(`[GrokSearch] Reindex done: ${count} posts`);
+      if (statusEl) {
+        statusEl.textContent = `${count.toLocaleString()} reindexed`;
+        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
+      }
+      applyFilter();
+    } catch (e) {
+      console.error('[GrokSearch] Reindex failed:', e);
+      if (statusEl) statusEl.textContent = 'reindex failed';
+    } finally {
+      indexing = false;
+      if (reindexBtn) reindexBtn.disabled = false;
+    }
   }
 
   async function fetchNewPosts(statusEl) {
@@ -183,7 +260,7 @@
         if (seen.has(p.id)) continue;
         seen.add(p.id);
         knownIds.add(p.id);
-        allPosts.push(p);
+        allPosts.push(normalizePost(p));
       }
       allPosts.sort((a, b) => {
         const ta = a.createTime ? new Date(a.createTime).getTime() : 0;
@@ -509,6 +586,7 @@
         ${dateStr ? `<div class="grok-result-date">${escapeHtml(dateStr)}</div>` : ''}
         <img src="${escapeHtml(post.thumbnail)}" alt="${escapeHtml(post.prompt)}" loading="lazy" style="width:100%; display:block; border-radius:14px; aspect-ratio:3/4; object-fit:cover;" />
         <div class="grok-result-prompt">${escapeHtml(post.prompt)}</div>
+        ${renderResultBadges(post)}
       </div>`;
     }).join('');
 
@@ -654,6 +732,28 @@
 
   function escapeHtml(str) {
     return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function renderResultBadges(post) {
+    const videos = post.videoCount ?? 0;
+    const childImages = post.childImageCount ?? 0;
+    const parts = [];
+    if (videos > 0) {
+      parts.push(`<span class="grok-badge grok-badge-video" title="${videos} video${videos !== 1 ? 's' : ''}">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+        <span>${videos}</span>
+      </span>`);
+    }
+    if (childImages > 0) {
+      parts.push(`<span class="grok-badge grok-badge-images" title="${childImages} child image${childImages !== 1 ? 's' : ''}">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="11" r="1.5"/><path d="m21 15-5-5L5 19"/>
+        </svg>
+        <span>${childImages}</span>
+      </span>`);
+    }
+    if (!parts.length) return '';
+    return `<div class="grok-result-badges">${parts.join('')}</div>`;
   }
 
   function formatPostDate(createTime) {
@@ -1030,6 +1130,54 @@
         opacity: 0; transition: opacity 0.2s;
       }
       .grok-result-card:hover .grok-result-prompt { opacity: 1; }
+      .grok-result-badges {
+        position: absolute;
+        bottom: 8px;
+        right: 8px;
+        z-index: 3;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 4px;
+        pointer-events: none;
+      }
+      .grok-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        padding: 3px 6px;
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.78);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        font-size: 10px;
+        font-weight: 600;
+        color: #fff;
+        line-height: 1;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+      .grok-badge-video svg { flex-shrink: 0; }
+      .grok-badge-images svg { flex-shrink: 0; }
+      .grok-toolbar-btn {
+        background: rgba(255,255,255,0.07);
+        border: 1px solid rgba(255,255,255,0.15);
+        border-radius: 8px;
+        color: rgba(255,255,255,0.75);
+        font-size: 11px;
+        padding: 4px 8px;
+        cursor: pointer;
+        flex-shrink: 0;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        transition: border-color 0.15s, color 0.15s, background 0.15s;
+      }
+      .grok-toolbar-btn:hover:not(:disabled) {
+        border-color: rgba(139,92,246,0.5);
+        color: #fff;
+        background: rgba(139,92,246,0.15);
+      }
+      .grok-toolbar-btn:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
       #grok-no-results {
         display: none; position: fixed; top: 50%; left: 50%;
         transform: translate(-50%,-50%); z-index: 99998; text-align: center;
@@ -1053,9 +1201,25 @@
   }
 
   // ─── UI ────────────────────────────────────────────────────────────────────
+  function ensureReindexButton() {
+    if (document.getElementById('grok-reindex-btn')) return;
+    const bar = document.getElementById('grok-search-bar');
+    const clearBtn = document.getElementById('grok-search-clear');
+    if (!bar || !clearBtn) return;
+    const btn = document.createElement('button');
+    btn.id = 'grok-reindex-btn';
+    btn.className = 'grok-toolbar-btn';
+    btn.type = 'button';
+    btn.textContent = 'Reindex';
+    btn.title = 'Clear cache and reindex from Grok (refreshes child image/video counts)';
+    btn.addEventListener('click', () => reindexDatabase());
+    clearBtn.insertAdjacentElement('beforebegin', btn);
+  }
+
   function buildSearchBar() {
     if (document.getElementById('grok-search-wrap')) {
       ensurePageJumpInput();
+      ensureReindexButton();
       return;
     }
     const wrap = document.createElement('div');
@@ -1079,6 +1243,7 @@
           <input type="checkbox" id="grok-results-only" />
           Results only
         </label>
+        <button id="grok-reindex-btn" class="grok-toolbar-btn" type="button" title="Clear cache and reindex from Grok (refreshes child image/video counts)">Reindex</button>
         <button id="grok-search-clear" title="Clear">
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="1" y1="1" x2="11" y2="11"/><line x1="11" y1="1" x2="1" y2="11"/>
@@ -1119,6 +1284,7 @@
     const dateStartEl = document.getElementById('grok-date-start');
     const dateEndEl = document.getElementById('grok-date-end');
     const clearBtn = document.getElementById('grok-search-clear');
+    const reindexBtn = document.getElementById('grok-reindex-btn');
     const sortSel = document.getElementById('grok-sort-select');
     const resultsOnlyEl = document.getElementById('grok-results-only');
     const firstBtn = document.getElementById('grok-page-first');
@@ -1155,6 +1321,8 @@
     dateEndEl.addEventListener('change', onDateChange);
     dateStartEl.addEventListener('input', onDateChange);
     dateEndEl.addEventListener('input', onDateChange);
+
+    if (reindexBtn) reindexBtn.addEventListener('click', () => reindexDatabase());
 
     clearBtn.addEventListener('click', () => {
       input.value = '';
