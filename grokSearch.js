@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.14
+// @version      1.17
 // @description  Search saved Grok media by prompt and date. Tracks child images/videos, shows badges, reindex DB. Results-only panel mode. Clicks open /imagine/post/{id}.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
@@ -184,6 +184,47 @@
     } finally {
       indexing = false;
       if (reindexBtn) reindexBtn.disabled = false;
+    }
+  }
+
+  async function downloadDatabaseJson() {
+    const statusEl = document.getElementById('grok-stamp-status');
+    const exportBtn = document.getElementById('grok-export-json-btn');
+    if (exportBtn) exportBtn.disabled = true;
+    try {
+      let posts = allPosts.map(normalizePost);
+      if (!posts.length) {
+        if (!db) db = await openDB();
+        posts = (await dbGetAll()).map(normalizePost);
+      }
+      const payload = {
+        exportedAt: new Date().toISOString(),
+        schemaVersion: 1,
+        source: DB_NAME,
+        count: posts.length,
+        posts,
+      };
+      const json = JSON.stringify(payload, null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const stamp = new Date().toISOString().slice(0, 10);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `grok-search-index-${stamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      if (statusEl) {
+        statusEl.textContent = `exported ${posts.length.toLocaleString()}`;
+        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
+      }
+      console.log(`[GrokSearch] Exported ${posts.length} posts`);
+    } catch (e) {
+      console.error('[GrokSearch] Export failed:', e);
+      if (statusEl) statusEl.textContent = 'export failed';
+    } finally {
+      if (exportBtn) exportBtn.disabled = false;
     }
   }
 
@@ -584,18 +625,29 @@
     layoutResultsGridPlacement();
 
     container.innerHTML = page.map(post => {
+      const dateKey = formatPostDateKey(post.createTime);
       const dateStr = formatPostDate(post.createTime);
+      const dateActive = dateKey && isFilteredToSingleDay(dateKey) ? ' grok-result-date-active' : '';
       return `
       <div class="grok-result-card" data-id="${escapeHtml(post.id)}" data-media="${escapeHtml(post.mediaUrl)}" title="${escapeHtml(post.prompt)}">
-        ${dateStr ? `<div class="grok-result-date">${escapeHtml(dateStr)}</div>` : ''}
+        ${dateStr ? `<div class="grok-result-date${dateActive}" data-date="${escapeHtml(dateKey)}" title="Filter to ${escapeHtml(dateStr)} (click again to clear)">${escapeHtml(dateStr)}</div>` : ''}
         <img src="${escapeHtml(post.thumbnail)}" alt="${escapeHtml(post.prompt)}" loading="lazy" style="width:100%; display:block; border-radius:14px; aspect-ratio:3/4; object-fit:cover;" />
         <div class="grok-result-prompt">${escapeHtml(post.prompt)}</div>
         ${renderResultBadges(post)}
       </div>`;
     }).join('');
 
+    container.querySelectorAll('.grok-result-date').forEach(dateEl => {
+      dateEl.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        applyDateFilterForDay(dateEl.dataset.date);
+      });
+    });
+
     container.querySelectorAll('.grok-result-card').forEach(card => {
       card.addEventListener('click', e => {
+        if (e.target.closest('.grok-result-date')) return;
         e.preventDefault();
         e.stopPropagation();
 
@@ -762,11 +814,43 @@
     return `<div class="grok-result-badges">${parts.join('')}</div>`;
   }
 
+  function formatPostDateKey(createTime) {
+    if (!createTime) return '';
+    const d = new Date(createTime);
+    if (Number.isNaN(d.getTime())) return '';
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
   function formatPostDate(createTime) {
     if (!createTime) return '';
     const d = new Date(createTime);
     if (Number.isNaN(d.getTime())) return '';
     return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  }
+
+  function isFilteredToSingleDay(dateKey) {
+    return Boolean(dateKey && dateStart === dateKey && dateEnd === dateKey);
+  }
+
+  function applyDateFilterForDay(dateKey) {
+    if (!dateKey) return;
+    if (isFilteredToSingleDay(dateKey)) {
+      dateStart = '';
+      dateEnd = '';
+    } else {
+      dateStart = dateKey;
+      dateEnd = dateKey;
+    }
+    const dateStartEl = document.getElementById('grok-date-start');
+    const dateEndEl = document.getElementById('grok-date-end');
+    if (dateStartEl) dateStartEl.value = dateStart;
+    if (dateEndEl) dateEndEl.value = dateEnd;
+    currentPage = 0;
+    updateClearButton();
+    applyFilter();
   }
 
   function formatPostDateTime(createTime) {
@@ -897,18 +981,59 @@
     s.textContent = `
       #grok-search-wrap {
         position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
-        z-index: 99990; display: flex; flex-direction: column; align-items: center;
+        z-index: 99990; display: flex; flex-direction: column; align-items: stretch;
         gap: 8px; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        width: min(900px, 92vw);
+      }
+      #grok-results-only-row {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        padding: 8px 14px;
+        background: rgba(15,15,20,0.9);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 12px;
+        backdrop-filter: blur(12px);
+        box-shadow: 0 4px 20px rgba(0,0,0,0.35);
       }
       #grok-search-bar {
-        display: flex; align-items: center; gap: 8px;
-        background: rgba(15,15,20,0.93); border: 1px solid rgba(255,255,255,0.12);
-        border-radius: 14px; padding: 10px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        background: rgba(15,15,20,0.93);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 14px;
+        padding: 12px 16px;
         box-shadow: 0 8px 32px rgba(0,0,0,0.5);
-        backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-        min-width: 420px; max-width: 720px; width: 52vw;
-        flex-wrap: wrap;
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
         transition: box-shadow 0.2s, border-color 0.2s;
+      }
+      .grok-bar-top {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+      }
+      .grok-bar-bottom {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        width: 100%;
+      }
+      .grok-bar-filters {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: nowrap;
+        min-width: 0;
+      }
+      .grok-bar-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
       }
       .grok-date-input {
         background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.15);
@@ -928,7 +1053,8 @@
       #grok-search-icon { color: rgba(255,255,255,0.4); flex-shrink: 0; }
       #grok-search-input {
         background: transparent; border: none; outline: none;
-        color: #fff; font-size: 14px; width: 100%; caret-color: #8b5cf6;
+        color: #fff; font-size: 14px; flex: 1; min-width: 100px; width: auto;
+        caret-color: #8b5cf6;
       }
       #grok-search-input::placeholder { color: rgba(255,255,255,0.28); }
       #grok-search-count {
@@ -936,13 +1062,15 @@
         white-space: nowrap; font-variant-numeric: tabular-nums; flex-shrink: 0;
       }
       #grok-stamp-status { font-size: 10px; color: rgba(255,255,255,0.22); white-space: nowrap; flex-shrink: 0; }
-      #grok-search-clear {
-        background: none; border: none; cursor: pointer; color: rgba(255,255,255,0.3);
-        padding: 2px; border-radius: 4px; display: none; align-items: center;
-        justify-content: center; flex-shrink: 0; transition: color 0.15s;
+      #grok-search-clear,
+      .grok-clear-filters-btn {
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0; min-width: 32px; padding: 4px 8px;
       }
-      #grok-search-clear:hover { color: rgba(255,255,255,0.7); }
-      #grok-search-clear.visible { display: flex; }
+      #grok-search-clear:not(.visible) {
+        opacity: 0.35; pointer-events: none;
+      }
+      #grok-search-clear.visible { opacity: 1; pointer-events: auto; }
       #grok-sort-select {
         background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.15);
         border-radius: 8px; color: rgba(255,255,255,0.7); font-size: 11px;
@@ -1015,7 +1143,17 @@
         background: linear-gradient(rgba(0,0,0,0.72), transparent);
         border-radius: 14px 14px 0 0;
         font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-        pointer-events: none;
+        pointer-events: auto;
+        cursor: pointer;
+        transition: background 0.15s, color 0.15s;
+      }
+      .grok-result-date:hover {
+        background: linear-gradient(rgba(139,92,246,0.55), transparent);
+        color: #fff;
+      }
+      .grok-result-date-active {
+        background: linear-gradient(rgba(139,92,246,0.75), rgba(139,92,246,0.2));
+        color: #fff;
       }
       #grok-results-backdrop {
         display: none;
@@ -1038,7 +1176,7 @@
         box-sizing: border-box;
       }
       html.grok-custom-results-mode #grok-results-panel {
-        top: max(88px, 10vh);
+        top: max(120px, 12vh);
         left: 2.5vw;
         right: 2.5vw;
         bottom: 2.5vh;
@@ -1117,7 +1255,7 @@
         pointer-events: none !important;
       }
       html.grok-filtered-inline-mode #grok-results-grid {
-        padding: 96px 24px 24px;
+        padding: 120px 24px 24px;
         max-width: 1400px;
         margin: 0 auto;
       }
@@ -1209,10 +1347,79 @@
   }
 
   // ─── UI ────────────────────────────────────────────────────────────────────
-  function ensureMediaFilterCheckboxes() {
+  function getFiltersRow() {
+    return document.getElementById('grok-bar-filters');
+  }
+
+  function getActionsRow() {
+    return document.getElementById('grok-bar-actions');
+  }
+
+  function migrateSearchBarLayout() {
+    if (document.getElementById('grok-results-only-row')) return;
+    const wrap = document.getElementById('grok-search-wrap');
     const bar = document.getElementById('grok-search-bar');
-    const anchor = document.getElementById('grok-results-only-label');
-    if (!bar || !anchor) return;
+    if (!wrap || !bar) return;
+
+    const ids = [
+      'grok-results-only-label', 'grok-search-icon', 'grok-search-input',
+      'grok-stamp-status', 'grok-search-count', 'grok-sort-select',
+      'grok-date-start', 'grok-date-end', 'grok-filter-video-label',
+      'grok-filter-children-label', 'grok-search-clear',
+      'grok-export-json-btn', 'grok-reindex-btn',
+    ];
+    const nodes = {};
+    ids.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) nodes[id] = el;
+    });
+    const dateSep = bar.querySelector('.grok-date-sep');
+
+    const resultsRow = document.createElement('div');
+    resultsRow.id = 'grok-results-only-row';
+    if (nodes['grok-results-only-label']) resultsRow.appendChild(nodes['grok-results-only-label']);
+
+    bar.innerHTML = '';
+    const top = document.createElement('div');
+    top.className = 'grok-bar-top';
+    ['grok-search-icon', 'grok-search-input', 'grok-stamp-status', 'grok-search-count', 'grok-sort-select']
+      .forEach(id => { if (nodes[id]) top.appendChild(nodes[id]); });
+
+    const bottom = document.createElement('div');
+    bottom.className = 'grok-bar-bottom';
+    const filters = document.createElement('div');
+    filters.id = 'grok-bar-filters';
+    filters.className = 'grok-bar-filters';
+    ['grok-date-start'].forEach(id => { if (nodes[id]) filters.appendChild(nodes[id]); });
+    if (dateSep) filters.appendChild(dateSep);
+    else {
+      const sep = document.createElement('span');
+      sep.className = 'grok-date-sep';
+      sep.textContent = '–';
+      filters.appendChild(sep);
+    }
+    if (nodes['grok-date-end']) filters.appendChild(nodes['grok-date-end']);
+    ['grok-filter-video-label', 'grok-filter-children-label', 'grok-search-clear']
+      .forEach(id => { if (nodes[id]) filters.appendChild(nodes[id]); });
+
+    const actions = document.createElement('div');
+    actions.id = 'grok-bar-actions';
+    actions.className = 'grok-bar-actions';
+    ['grok-export-json-btn', 'grok-reindex-btn'].forEach(id => { if (nodes[id]) actions.appendChild(nodes[id]); });
+
+    bottom.appendChild(filters);
+    bottom.appendChild(actions);
+    bar.appendChild(top);
+    bar.appendChild(bottom);
+
+    if (resultsRow.childElementCount > 0) wrap.insertBefore(resultsRow, bar);
+    bindMediaFilterListeners();
+  }
+
+  function ensureMediaFilterCheckboxes() {
+    const filters = getFiltersRow();
+    const dateEnd = document.getElementById('grok-date-end');
+    if (!filters) return;
 
     if (!document.getElementById('grok-filter-video')) {
       const videoLabel = document.createElement('label');
@@ -1220,7 +1427,8 @@
       videoLabel.className = 'grok-filter-check-label';
       videoLabel.title = 'Show only items with at least one video';
       videoLabel.innerHTML = '<input type="checkbox" id="grok-filter-video" /> Only with video';
-      anchor.insertAdjacentElement('afterend', videoLabel);
+      if (dateEnd) dateEnd.insertAdjacentElement('afterend', videoLabel);
+      else filters.appendChild(videoLabel);
     }
     if (!document.getElementById('grok-filter-children')) {
       const childLabel = document.createElement('label');
@@ -1229,7 +1437,7 @@
       childLabel.title = 'Show only items with child posts';
       childLabel.innerHTML = '<input type="checkbox" id="grok-filter-children" /> Only with child posts';
       const videoLabel = document.getElementById('grok-filter-video-label');
-      (videoLabel || anchor).insertAdjacentElement('afterend', childLabel);
+      (videoLabel || dateEnd || filters).insertAdjacentElement('afterend', childLabel);
     }
 
     bindMediaFilterListeners();
@@ -1265,11 +1473,24 @@
     filterChildrenEl.addEventListener('change', onMediaFilterChange);
   }
 
+  function ensureExportJsonButton() {
+    if (document.getElementById('grok-export-json-btn')) return;
+    const actions = getActionsRow();
+    if (!actions) return;
+    const btn = document.createElement('button');
+    btn.id = 'grok-export-json-btn';
+    btn.className = 'grok-toolbar-btn';
+    btn.type = 'button';
+    btn.textContent = 'Export JSON';
+    btn.title = 'Download full indexed database as JSON';
+    btn.addEventListener('click', () => downloadDatabaseJson());
+    actions.prepend(btn);
+  }
+
   function ensureReindexButton() {
     if (document.getElementById('grok-reindex-btn')) return;
-    const bar = document.getElementById('grok-search-bar');
-    const clearBtn = document.getElementById('grok-search-clear');
-    if (!bar || !clearBtn) return;
+    const actions = getActionsRow();
+    if (!actions) return;
     const btn = document.createElement('button');
     btn.id = 'grok-reindex-btn';
     btn.className = 'grok-toolbar-btn';
@@ -1277,12 +1498,14 @@
     btn.textContent = 'Reindex';
     btn.title = 'Clear cache and reindex from Grok (refreshes child image/video counts)';
     btn.addEventListener('click', () => reindexDatabase());
-    clearBtn.insertAdjacentElement('beforebegin', btn);
+    actions.appendChild(btn);
   }
 
   function buildSearchBar() {
     if (document.getElementById('grok-search-wrap')) {
+      migrateSearchBarLayout();
       ensurePageJumpInput();
+      ensureExportJsonButton();
       ensureReindexButton();
       ensureMediaFilterCheckboxes();
       return;
@@ -1290,38 +1513,49 @@
     const wrap = document.createElement('div');
     wrap.id = 'grok-search-wrap';
     wrap.innerHTML = `
-      <div id="grok-search-bar">
-        <svg id="grok-search-icon" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
-          <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
-        </svg>
-        <input id="grok-search-input" type="text" placeholder="Search saved images by prompt…" autocomplete="off" spellcheck="false" />
-        <input id="grok-date-start" class="grok-date-input" type="date" title="From date" aria-label="From date" />
-        <span class="grok-date-sep">–</span>
-        <input id="grok-date-end" class="grok-date-input" type="date" title="To date" aria-label="To date" />
-        <span id="grok-stamp-status"></span>
-        <span id="grok-search-count"></span>
-        <select id="grok-sort-select" title="Sort order">
-          <option value="newest">Newest</option>
-          <option value="oldest">Oldest</option>
-        </select>
+      <div id="grok-results-only-row">
         <label id="grok-results-only-label" class="grok-filter-check-label" title="Hide Grok saved grid; show only paginated search results">
           <input type="checkbox" id="grok-results-only" />
           Results only
         </label>
-        <label id="grok-filter-video-label" class="grok-filter-check-label" title="Show only items with at least one video">
-          <input type="checkbox" id="grok-filter-video" />
-          Only with video
-        </label>
-        <label id="grok-filter-children-label" class="grok-filter-check-label" title="Show only items with child posts">
-          <input type="checkbox" id="grok-filter-children" />
-          Only with child posts
-        </label>
-        <button id="grok-reindex-btn" class="grok-toolbar-btn" type="button" title="Clear cache and reindex from Grok (refreshes child image/video counts)">Reindex</button>
-        <button id="grok-search-clear" title="Clear">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="1" y1="1" x2="11" y2="11"/><line x1="11" y1="1" x2="1" y2="11"/>
+      </div>
+      <div id="grok-search-bar">
+        <div class="grok-bar-top">
+          <svg id="grok-search-icon" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
+            <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
           </svg>
-        </button>
+          <input id="grok-search-input" type="text" placeholder="Search saved images by prompt…" autocomplete="off" spellcheck="false" />
+          <span id="grok-stamp-status"></span>
+          <span id="grok-search-count"></span>
+          <select id="grok-sort-select" title="Sort order">
+            <option value="newest">Newest</option>
+            <option value="oldest">Oldest</option>
+          </select>
+        </div>
+        <div class="grok-bar-bottom">
+          <div id="grok-bar-filters" class="grok-bar-filters">
+            <input id="grok-date-start" class="grok-date-input" type="date" title="From date" aria-label="From date" />
+            <span class="grok-date-sep">–</span>
+            <input id="grok-date-end" class="grok-date-input" type="date" title="To date" aria-label="To date" />
+            <label id="grok-filter-video-label" class="grok-filter-check-label" title="Show only items with at least one video">
+              <input type="checkbox" id="grok-filter-video" />
+              Only with video
+            </label>
+            <label id="grok-filter-children-label" class="grok-filter-check-label" title="Show only items with child posts">
+              <input type="checkbox" id="grok-filter-children" />
+              Only with child posts
+            </label>
+            <button id="grok-search-clear" class="grok-toolbar-btn grok-clear-filters-btn" type="button" title="Clear all filters">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="1" y1="1" x2="11" y2="11"/><line x1="11" y1="1" x2="1" y2="11"/>
+              </svg>
+            </button>
+          </div>
+          <div id="grok-bar-actions" class="grok-bar-actions">
+            <button id="grok-export-json-btn" class="grok-toolbar-btn" type="button" title="Download full indexed database as JSON">Export JSON</button>
+            <button id="grok-reindex-btn" class="grok-toolbar-btn" type="button" title="Clear cache and reindex from Grok (refreshes child image/video counts)">Reindex</button>
+          </div>
+        </div>
       </div>
       <div id="grok-pager">
         <button class="grok-page-btn icon-only" id="grok-page-first" title="First page">
@@ -1358,6 +1592,7 @@
     const dateEndEl = document.getElementById('grok-date-end');
     const clearBtn = document.getElementById('grok-search-clear');
     const reindexBtn = document.getElementById('grok-reindex-btn');
+    const exportJsonBtn = document.getElementById('grok-export-json-btn');
     const sortSel = document.getElementById('grok-sort-select');
     const resultsOnlyEl = document.getElementById('grok-results-only');
     const filterVideoEl = document.getElementById('grok-filter-video');
@@ -1375,6 +1610,7 @@
     if (filterChildrenEl) filterChildrenEl.checked = filterOnlyChildren;
     updateResultsOnlyLayout();
     bindMediaFilterListeners();
+    updateClearButton();
     const prevBtn = document.getElementById('grok-page-prev');
     const nextBtn = document.getElementById('grok-page-next');
     const lastBtn = document.getElementById('grok-page-last');
@@ -1403,6 +1639,7 @@
     dateEndEl.addEventListener('input', onDateChange);
 
     if (reindexBtn) reindexBtn.addEventListener('click', () => reindexDatabase());
+    if (exportJsonBtn) exportJsonBtn.addEventListener('click', () => downloadDatabaseJson());
 
     clearBtn.addEventListener('click', () => {
       input.value = '';
