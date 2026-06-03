@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.22
+// @version      1.23
 // @description  Search saved Grok media by prompt and date. Per-page count and thumbnail size sliders. Min video/child filters. Results-only panel with scrollable viewport.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
@@ -47,7 +47,7 @@
   let currentQuery = '';
   let dateStart = '';
   let dateEnd = '';
-  let resultsOnly = false;
+  let resultsOnly = true;
   let filterOnlyVideo = false;
   let filterOnlyChildren = false;
   let filterMinVideos = 1;
@@ -631,6 +631,20 @@
       showResults();
     }
     updatePager();
+  }
+
+  function loadResultsOnlyPreference() {
+    try {
+      const stored = localStorage.getItem(RESULTS_ONLY_KEY);
+      resultsOnly = stored === null ? true : stored === '1';
+    } catch {
+      resultsOnly = true;
+    }
+  }
+
+  function syncResultsOnlyCheckbox() {
+    const el = document.getElementById('grok-results-only');
+    if (el) el.checked = resultsOnly;
   }
 
   function updateResultsOnlyLayout() {
@@ -1928,7 +1942,7 @@
     wrap.innerHTML = `
       <div id="grok-results-only-row">
         <label id="grok-results-only-label" class="grok-filter-check-label" title="Hide Grok saved grid; show only paginated search results">
-          <input type="checkbox" id="grok-results-only" />
+          <input type="checkbox" id="grok-results-only" checked />
           Results only
         </label>
         <label class="grok-display-control" title="Images per page (1–300)">
@@ -2030,7 +2044,7 @@
     const pageJumpEl = ensurePageJumpInput();
 
     try {
-      resultsOnly = localStorage.getItem(RESULTS_ONLY_KEY) === '1';
+      loadResultsOnlyPreference();
       filterOnlyVideo = localStorage.getItem(FILTER_VIDEO_KEY) === '1';
       filterOnlyChildren = localStorage.getItem(FILTER_CHILDREN_KEY) === '1';
       filterMinVideos = parseMediaMin(localStorage.getItem(FILTER_VIDEO_MIN_KEY));
@@ -2038,7 +2052,7 @@
       pageSize = clampPageSize(localStorage.getItem(PAGE_SIZE_KEY));
       gridSizePercent = clampGridSizePercent(localStorage.getItem(GRID_SIZE_PCT_KEY));
     } catch { /* ignore */ }
-    resultsOnlyEl.checked = resultsOnly;
+    syncResultsOnlyCheckbox();
     syncMediaMinSelects();
     bindDisplayControlListeners();
     updateResultsOnlyLayout();
