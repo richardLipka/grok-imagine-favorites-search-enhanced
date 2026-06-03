@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Post Sidebar (prompt)
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
-// @description  Sidebar on /imagine/post/{id}: prompt and metadata from GrokSearch IndexedDB and Grok API.
+// @version      1.3.0
+// @description  Collapsible sidebar on /imagine/post/{id}: metadata and prompt from IndexedDB and Grok API.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine/post/*
 // @grant        GM_xmlhttpRequest
@@ -18,8 +18,10 @@
   const STORE_NAME = 'posts';
   const POST_GET = 'https://grok.com/rest/media/post/get';
   const POST_ID_RE = /\/imagine\/post\/([0-9a-f-]{36})/i;
+  const COLLAPSED_KEY = 'grokPostSidebarCollapsed';
 
   let db = null;
+  let sidebarExpanded = true;
   let lastLoadedPostId = null;
   let refreshSeq = 0;
   let refreshTimer = null;
@@ -203,6 +205,43 @@
         color: rgba(255, 255, 255, 0.88);
         box-sizing: border-box;
         pointer-events: auto;
+        transition: transform 0.28s ease, opacity 0.22s ease, visibility 0.28s;
+      }
+      #grok-post-sidebar.collapsed {
+        transform: translateX(100%);
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+      }
+      #grok-post-sidebar-toggle {
+        position: fixed;
+        right: 16px;
+        bottom: 16px;
+        z-index: 99996;
+        width: 44px;
+        height: 44px;
+        border-radius: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        background: rgba(12, 12, 18, 0.94);
+        color: rgba(255, 255, 255, 0.9);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+        backdrop-filter: blur(12px);
+        transition: background 0.15s, border-color 0.15s, transform 0.15s;
+        padding: 0;
+      }
+      #grok-post-sidebar-toggle:hover {
+        border-color: rgba(139, 92, 246, 0.55);
+        background: rgba(139, 92, 246, 0.22);
+        color: #fff;
+      }
+      #grok-post-sidebar-toggle svg {
+        width: 20px;
+        height: 20px;
+        flex-shrink: 0;
       }
       #grok-post-sidebar-header {
         padding: 14px 16px 10px;
@@ -313,6 +352,46 @@
       </div>
     `;
     document.body.appendChild(aside);
+    ensureToggleButton();
+  }
+
+  function ensureToggleButton() {
+    if (document.getElementById('grok-post-sidebar-toggle')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'grok-post-sidebar-toggle';
+    btn.setAttribute('aria-label', 'Toggle post info panel');
+    btn.addEventListener('click', () => setSidebarExpanded(!sidebarExpanded));
+    document.body.appendChild(btn);
+    try {
+      sidebarExpanded = localStorage.getItem(COLLAPSED_KEY) !== '1';
+    } catch {
+      sidebarExpanded = true;
+    }
+    setSidebarExpanded(sidebarExpanded);
+  }
+
+  function setSidebarExpanded(expanded) {
+    sidebarExpanded = expanded;
+    const panel = document.getElementById('grok-post-sidebar');
+    const btn = document.getElementById('grok-post-sidebar-toggle');
+    if (panel) panel.classList.toggle('collapsed', !expanded);
+    if (btn) {
+      btn.title = expanded ? 'Hide post info' : 'Show post info';
+      btn.setAttribute('aria-expanded', String(expanded));
+      btn.innerHTML = expanded
+        ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <polyline points="15 6 9 12 15 18"/>
+           </svg>`
+        : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M13 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7"/>
+            <path d="M17 8l4 4-4 4"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+           </svg>`;
+    }
+    try {
+      localStorage.setItem(COLLAPSED_KEY, expanded ? '0' : '1');
+    } catch { /* ignore */ }
   }
 
   function copyText(text) {
