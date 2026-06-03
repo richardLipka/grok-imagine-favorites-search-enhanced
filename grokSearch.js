@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.25
+// @version      1.26
 // @description  Search saved Grok media by prompt and date. Per-page count and thumbnail size sliders. Min video/child filters. Results-only panel with scrollable viewport.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
@@ -634,6 +634,16 @@
     updatePager();
   }
 
+  function getStoredResultsOnly() {
+    try {
+      const v = localStorage.getItem(RESULTS_ONLY_KEY);
+      if (v === null || v === '') return true;
+      return v === '1';
+    } catch {
+      return true;
+    }
+  }
+
   function syncResultsOnlyCheckbox() {
     const el = document.getElementById('grok-results-only');
     if (el) el.checked = resultsOnly;
@@ -745,12 +755,6 @@
   }
 
   function applyFilter() {
-    if (searchBarExpanded && !resultsOnly) {
-      resultsOnly = true;
-      syncResultsOnlyCheckbox();
-      updateDisplayMode();
-    }
-
     if (!loaded) {
       const noResults = document.getElementById('grok-no-results');
       if (noResults) {
@@ -1877,11 +1881,14 @@
   function setSearchBarExpanded(expanded) {
     searchBarExpanded = expanded;
     if (!expanded) {
+      try {
+        localStorage.setItem(RESULTS_ONLY_KEY, resultsOnly ? '1' : '0');
+      } catch { /* ignore */ }
       setResultsOnlyEnabled(false);
       hideAllSearchResults();
       applyNativeVisibility();
     } else {
-      setResultsOnlyEnabled(true);
+      setResultsOnlyEnabled(getStoredResultsOnly());
     }
     const wrap = document.getElementById('grok-search-wrap');
     const btn = document.getElementById('grok-search-toggle');
@@ -2049,6 +2056,8 @@
       </div>
     `;
     document.body.appendChild(wrap);
+    resultsOnly = getStoredResultsOnly();
+    syncResultsOnlyCheckbox();
     ensureSearchBarToggle();
 
     const noResults = document.createElement('div');
@@ -2146,14 +2155,9 @@
         resultsOnly = false;
         return;
       }
-      if (!resultsOnlyEl.checked) {
-        resultsOnlyEl.checked = true;
-        setResultsOnlyEnabled(true);
-        return;
-      }
-      setResultsOnlyEnabled(true);
+      setResultsOnlyEnabled(resultsOnlyEl.checked);
       try {
-        localStorage.setItem(RESULTS_ONLY_KEY, '1');
+        localStorage.setItem(RESULTS_ONLY_KEY, resultsOnly ? '1' : '0');
       } catch { /* ignore */ }
     };
     resultsOnlyEl.addEventListener('change', onResultsOnlyToggle);
