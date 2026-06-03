@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.23
+// @version      1.25
 // @description  Search saved Grok media by prompt and date. Per-page count and thumbnail size sliders. Min video/child filters. Results-only panel with scrollable viewport.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
@@ -390,6 +390,7 @@
   }
 
   function shouldShowSearchResults() {
+    if (!searchBarExpanded) return false;
     return resultsOnly || hasActiveFilter();
   }
 
@@ -633,18 +634,24 @@
     updatePager();
   }
 
-  function loadResultsOnlyPreference() {
-    try {
-      const stored = localStorage.getItem(RESULTS_ONLY_KEY);
-      resultsOnly = stored === null ? true : stored === '1';
-    } catch {
-      resultsOnly = true;
-    }
-  }
-
   function syncResultsOnlyCheckbox() {
     const el = document.getElementById('grok-results-only');
     if (el) el.checked = resultsOnly;
+  }
+
+  function setResultsOnlyEnabled(enabled) {
+    const next = Boolean(enabled);
+    resultsOnly = next;
+    syncResultsOnlyCheckbox();
+    updateResultsOnlyLayout();
+    currentPage = 0;
+    if (!loaded) {
+      hideAllSearchResults();
+      applyNativeVisibility();
+      return;
+    }
+    applyFilter();
+    scheduleEnforceDisplay();
   }
 
   function updateResultsOnlyLayout() {
@@ -738,6 +745,12 @@
   }
 
   function applyFilter() {
+    if (searchBarExpanded && !resultsOnly) {
+      resultsOnly = true;
+      syncResultsOnlyCheckbox();
+      updateDisplayMode();
+    }
+
     if (!loaded) {
       const noResults = document.getElementById('grok-no-results');
       if (noResults) {
@@ -1863,6 +1876,13 @@
 
   function setSearchBarExpanded(expanded) {
     searchBarExpanded = expanded;
+    if (!expanded) {
+      setResultsOnlyEnabled(false);
+      hideAllSearchResults();
+      applyNativeVisibility();
+    } else {
+      setResultsOnlyEnabled(true);
+    }
     const wrap = document.getElementById('grok-search-wrap');
     const btn = document.getElementById('grok-search-toggle');
     if (wrap) wrap.classList.toggle('collapsed', !expanded);
@@ -1909,20 +1929,26 @@
     document.head.appendChild(s);
   }
 
+  function readSearchBarExpandedFromStorage() {
+    try {
+      return localStorage.getItem(SEARCH_BAR_COLLAPSED_KEY) !== '1';
+    } catch {
+      return true;
+    }
+  }
+
   function ensureSearchBarToggle() {
     patchSearchBarCollapseStyles();
-    if (document.getElementById('grok-search-toggle')) return;
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.id = 'grok-search-toggle';
-    btn.setAttribute('aria-label', 'Toggle search bar');
-    btn.addEventListener('click', () => setSearchBarExpanded(!searchBarExpanded));
-    document.body.appendChild(btn);
-    try {
-      searchBarExpanded = localStorage.getItem(SEARCH_BAR_COLLAPSED_KEY) !== '1';
-    } catch {
-      searchBarExpanded = true;
+    let btn = document.getElementById('grok-search-toggle');
+    if (!btn) {
+      btn = document.createElement('button');
+      btn.type = 'button';
+      btn.id = 'grok-search-toggle';
+      btn.setAttribute('aria-label', 'Toggle search bar');
+      btn.addEventListener('click', () => setSearchBarExpanded(!searchBarExpanded));
+      document.body.appendChild(btn);
     }
+    searchBarExpanded = readSearchBarExpandedFromStorage();
     setSearchBarExpanded(searchBarExpanded);
   }
 
@@ -2044,7 +2070,6 @@
     const pageJumpEl = ensurePageJumpInput();
 
     try {
-      loadResultsOnlyPreference();
       filterOnlyVideo = localStorage.getItem(FILTER_VIDEO_KEY) === '1';
       filterOnlyChildren = localStorage.getItem(FILTER_CHILDREN_KEY) === '1';
       filterMinVideos = parseMediaMin(localStorage.getItem(FILTER_VIDEO_MIN_KEY));
@@ -2052,10 +2077,8 @@
       pageSize = clampPageSize(localStorage.getItem(PAGE_SIZE_KEY));
       gridSizePercent = clampGridSizePercent(localStorage.getItem(GRID_SIZE_PCT_KEY));
     } catch { /* ignore */ }
-    syncResultsOnlyCheckbox();
     syncMediaMinSelects();
     bindDisplayControlListeners();
-    updateResultsOnlyLayout();
     bindMediaFilterListeners();
     updateClearButton();
     const prevBtn = document.getElementById('grok-page-prev');
@@ -2118,14 +2141,20 @@
     });
 
     const onResultsOnlyToggle = () => {
-      resultsOnly = resultsOnlyEl.checked;
-      updateResultsOnlyLayout();
+      if (!searchBarExpanded) {
+        resultsOnlyEl.checked = false;
+        resultsOnly = false;
+        return;
+      }
+      if (!resultsOnlyEl.checked) {
+        resultsOnlyEl.checked = true;
+        setResultsOnlyEnabled(true);
+        return;
+      }
+      setResultsOnlyEnabled(true);
       try {
-        localStorage.setItem(RESULTS_ONLY_KEY, resultsOnly ? '1' : '0');
+        localStorage.setItem(RESULTS_ONLY_KEY, '1');
       } catch { /* ignore */ }
-      currentPage = 0;
-      applyFilter();
-      scheduleEnforceDisplay();
     };
     resultsOnlyEl.addEventListener('change', onResultsOnlyToggle);
     resultsOnlyEl.addEventListener('input', onResultsOnlyToggle);
@@ -2174,6 +2203,14 @@
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       setTimeout(init, 800);
+      return;
+    }
+    if (!searchBarExpanded) {
+      clearTimeout(domEnforceTimer);
+      domEnforceTimer = setTimeout(() => {
+        hideAllSearchResults();
+        applyNativeVisibility();
+      }, 350);
       return;
     }
     if (!resultsOnly && !hasActiveFilter()) return;
