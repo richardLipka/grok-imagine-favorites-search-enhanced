@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.18
-// @description  Search saved Grok media by prompt and date. Min video/child-post count filters. Tracks child images/videos, badges, reindex, export. Results-only panel mode.
+// @version      1.19
+// @description  Search saved Grok media by prompt and date. Per-page count and thumbnail size sliders. Min video/child filters. Results-only panel with scrollable viewport.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
@@ -19,7 +19,13 @@
     return;
   }
 
-  const PAGE_SIZE = 32;
+  const DEFAULT_PAGE_SIZE = 32;
+  const BASE_GRID_MIN_PX = 180;
+  const BASE_GRID_GAP_PX = 17;
+  const PAGE_SIZE_MIN = 1;
+  const PAGE_SIZE_MAX = 300;
+  const GRID_SIZE_MIN_PCT = 10;
+  const GRID_SIZE_MAX_PCT = 200;
   const ENDPOINT = 'https://grok.com/rest/media/post/list';
   const DB_NAME = 'GrokSearchIndex';
   const DB_VERSION = 1;
@@ -29,6 +35,8 @@
   const FILTER_CHILDREN_KEY = 'grokSearchFilterChildren';
   const FILTER_VIDEO_MIN_KEY = 'grokSearchFilterVideoMin';
   const FILTER_CHILDREN_MIN_KEY = 'grokSearchFilterChildrenMin';
+  const PAGE_SIZE_KEY = 'grokSearchPageSize';
+  const GRID_SIZE_PCT_KEY = 'grokSearchGridSizePct';
   const MEDIA_MIN_OPTIONS = [1, 3, 5, 7, 10];
 
   let allPosts = [];
@@ -41,6 +49,8 @@
   let filterOnlyChildren = false;
   let filterMinVideos = 1;
   let filterMinChildren = 1;
+  let pageSize = DEFAULT_PAGE_SIZE;
+  let gridSizePercent = 100;
   let currentPage = 0;
   let currentSort = 'newest';
   let matchedPosts = [];
@@ -425,6 +435,21 @@
     document.documentElement.classList.toggle('grok-filtered-inline-mode', hasActiveFilter() && !resultsOnly);
   }
 
+  function ensureInlineResultsViewport() {
+    let vp = document.getElementById('grok-inline-results-viewport');
+    if (!vp) {
+      vp = document.createElement('div');
+      vp.id = 'grok-inline-results-viewport';
+      document.body.appendChild(vp);
+    }
+    return vp;
+  }
+
+  function setInlineResultsViewportVisible(visible) {
+    const vp = document.getElementById('grok-inline-results-viewport');
+    if (vp) vp.style.display = visible ? 'block' : 'none';
+  }
+
   function layoutResultsGridPlacement() {
     let container = document.getElementById('grok-results-grid');
     if (!container) return null;
@@ -432,9 +457,8 @@
       const body = ensureResultsPanel().querySelector('.grok-results-panel-body');
       if (container.parentElement !== body) body.appendChild(container);
     } else {
-      const nativeGrid = getGrokGrid();
-      const insertTarget = nativeGrid?.parentElement || document.body;
-      if (container.parentElement !== insertTarget) insertTarget.appendChild(container);
+      const vp = ensureInlineResultsViewport();
+      if (container.parentElement !== vp) vp.appendChild(container);
     }
     return container;
   }
@@ -570,6 +594,7 @@
 
   function hideAllSearchResults() {
     setResultsPanelVisible(false);
+    setInlineResultsViewportVisible(false);
     const grid = document.getElementById('grok-results-grid');
     if (grid) grid.style.display = 'none';
   }
@@ -614,10 +639,11 @@
     rendering = true;
     setTimeout(() => { rendering = false; }, 50);
 
-    const totalPages = Math.max(1, Math.ceil(matchedPosts.length / PAGE_SIZE));
+    const size = getPageSize();
+    const totalPages = Math.max(1, Math.ceil(matchedPosts.length / size));
     currentPage = Math.max(0, Math.min(currentPage, totalPages - 1));
-    const start = currentPage * PAGE_SIZE;
-    const page = matchedPosts.slice(start, start + PAGE_SIZE);
+    const start = currentPage * size;
+    const page = matchedPosts.slice(start, start + size);
 
     applyNativeVisibility();
     updateDisplayMode();
@@ -668,15 +694,19 @@
     });
 
     container.style.display = 'grid';
+    applyGridLayoutStyles();
 
     if (resultsOnly) {
       setResultsPanelVisible(true);
+      setInlineResultsViewportVisible(false);
       const panel = document.getElementById('grok-results-panel');
       const body = panel?.querySelector('.grok-results-panel-body');
       if (body) body.scrollTop = 0;
     } else {
       setResultsPanelVisible(false);
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+      setInlineResultsViewportVisible(true);
+      const vp = document.getElementById('grok-inline-results-viewport');
+      if (vp) vp.scrollTop = 0;
     }
 
     updatePanelPageRange(page);
@@ -869,7 +899,40 @@
   }
 
   function getTotalPages() {
-    return Math.max(1, Math.ceil(matchedPosts.length / PAGE_SIZE));
+    return Math.max(1, Math.ceil(matchedPosts.length / getPageSize()));
+  }
+
+  function getPageSize() {
+    return pageSize;
+  }
+
+  function clampPageSize(n) {
+    return Math.min(PAGE_SIZE_MAX, Math.max(PAGE_SIZE_MIN, Math.round(Number(n)) || DEFAULT_PAGE_SIZE));
+  }
+
+  function clampGridSizePercent(n) {
+    return Math.min(GRID_SIZE_MAX_PCT, Math.max(GRID_SIZE_MIN_PCT, Math.round(Number(n)) || 100));
+  }
+
+  function applyGridLayoutStyles() {
+    const minPx = Math.round(BASE_GRID_MIN_PX * gridSizePercent / 100);
+    const gapPx = Math.round(BASE_GRID_GAP_PX * gridSizePercent / 100);
+    const grid = document.getElementById('grok-results-grid');
+    if (grid) {
+      grid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${minPx}px, 1fr))`;
+      grid.style.gap = `${gapPx}px`;
+    }
+  }
+
+  function syncDisplayControlLabels() {
+    const pageVal = document.getElementById('grok-page-size-val');
+    const gridVal = document.getElementById('grok-grid-size-val');
+    const pageSlider = document.getElementById('grok-page-size-slider');
+    const gridSlider = document.getElementById('grok-grid-size-slider');
+    if (pageVal) pageVal.textContent = String(pageSize);
+    if (gridVal) gridVal.textContent = String(gridSizePercent);
+    if (pageSlider) pageSlider.value = String(pageSize);
+    if (gridSlider) gridSlider.value = String(gridSizePercent);
   }
 
   function updatePanelPageRange(pagePosts) {
@@ -1024,14 +1087,50 @@
       }
       #grok-results-only-row {
         display: flex;
+        flex-wrap: wrap;
         justify-content: center;
         align-items: center;
+        gap: 10px 20px;
         padding: 8px 14px;
         background: rgba(15,15,20,0.9);
         border: 1px solid rgba(255,255,255,0.12);
         border-radius: 12px;
         backdrop-filter: blur(12px);
         box-shadow: 0 4px 20px rgba(0,0,0,0.35);
+      }
+      .grok-display-control {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        color: rgba(255,255,255,0.55);
+        white-space: nowrap;
+        user-select: none;
+      }
+      .grok-display-control span.grok-display-val {
+        min-width: 2.2em;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+        color: rgba(255,255,255,0.8);
+      }
+      .grok-display-control input[type="range"] {
+        width: 88px;
+        margin: 0;
+        accent-color: #8b5cf6;
+        cursor: pointer;
+      }
+      #grok-inline-results-viewport {
+        display: none;
+        position: fixed;
+        top: max(132px, 13vh);
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 99950;
+        overflow: auto;
+        padding: 12px 20px 24px;
+        box-sizing: border-box;
+        -webkit-overflow-scrolling: touch;
       }
       #grok-search-bar {
         display: flex;
@@ -1254,7 +1353,7 @@
       .grok-results-panel-body {
         flex: 1;
         min-height: 0;
-        overflow-y: auto;
+        overflow: auto;
         padding: 16px 20px;
         -webkit-overflow-scrolling: touch;
       }
@@ -1291,8 +1390,8 @@
         visibility: hidden !important;
         pointer-events: none !important;
       }
-      html.grok-filtered-inline-mode #grok-results-grid {
-        padding: 120px 24px 24px;
+      html.grok-filtered-inline-mode #grok-inline-results-viewport #grok-results-grid {
+        padding: 0;
         max-width: 1400px;
         margin: 0 auto;
       }
@@ -1399,6 +1498,78 @@
 
   function getActionsRow() {
     return document.getElementById('grok-bar-actions');
+  }
+
+  function ensureDisplayControls() {
+    const row = document.getElementById('grok-results-only-row');
+    if (!row) return;
+
+    if (!document.getElementById('grok-page-size-slider')) {
+      const perPage = document.createElement('label');
+      perPage.className = 'grok-display-control';
+      perPage.title = 'Images per page (1–300)';
+      perPage.innerHTML = `
+        Per page <span class="grok-display-val" id="grok-page-size-val">32</span>
+        <input type="range" id="grok-page-size-slider" min="${PAGE_SIZE_MIN}" max="${PAGE_SIZE_MAX}" value="${DEFAULT_PAGE_SIZE}" />
+      `;
+      row.appendChild(perPage);
+    }
+    if (!document.getElementById('grok-grid-size-slider')) {
+      const sizeCtrl = document.createElement('label');
+      sizeCtrl.className = 'grok-display-control';
+      sizeCtrl.title = 'Thumbnail size (% of default, 10–200)';
+      sizeCtrl.innerHTML = `
+        Size <span class="grok-display-val" id="grok-grid-size-val">100</span>%
+        <input type="range" id="grok-grid-size-slider" min="${GRID_SIZE_MIN_PCT}" max="${GRID_SIZE_MAX_PCT}" value="100" />
+      `;
+      row.appendChild(sizeCtrl);
+    }
+
+    bindDisplayControlListeners();
+  }
+
+  function bindDisplayControlListeners() {
+    const pageSlider = document.getElementById('grok-page-size-slider');
+    const gridSlider = document.getElementById('grok-grid-size-slider');
+    if (!pageSlider || !gridSlider) return;
+    if (pageSlider.dataset.grokDisplayBound) return;
+    pageSlider.dataset.grokDisplayBound = '1';
+    gridSlider.dataset.grokDisplayBound = '1';
+
+    try {
+      pageSize = clampPageSize(localStorage.getItem(PAGE_SIZE_KEY));
+      gridSizePercent = clampGridSizePercent(localStorage.getItem(GRID_SIZE_PCT_KEY));
+    } catch { /* ignore */ }
+    syncDisplayControlLabels();
+    applyGridLayoutStyles();
+
+    const persistDisplaySettings = () => {
+      try {
+        localStorage.setItem(PAGE_SIZE_KEY, String(pageSize));
+        localStorage.setItem(GRID_SIZE_PCT_KEY, String(gridSizePercent));
+      } catch { /* ignore */ }
+    };
+
+    const onPageSizeChange = () => {
+      pageSize = clampPageSize(pageSlider.value);
+      syncDisplayControlLabels();
+      persistDisplaySettings();
+      currentPage = 0;
+      if (shouldShowSearchResults() && matchedPosts.length > 0) showResults();
+      else updatePager();
+    };
+
+    const onGridSizeChange = () => {
+      gridSizePercent = clampGridSizePercent(gridSlider.value);
+      syncDisplayControlLabels();
+      persistDisplaySettings();
+      applyGridLayoutStyles();
+    };
+
+    pageSlider.addEventListener('input', onPageSizeChange);
+    pageSlider.addEventListener('change', onPageSizeChange);
+    gridSlider.addEventListener('input', onGridSizeChange);
+    gridSlider.addEventListener('change', onGridSizeChange);
   }
 
   function migrateSearchBarLayout() {
@@ -1582,6 +1753,7 @@
       ensureExportJsonButton();
       ensureReindexButton();
       ensureMediaFilterCheckboxes();
+      ensureDisplayControls();
       return;
     }
     const wrap = document.createElement('div');
@@ -1591,6 +1763,14 @@
         <label id="grok-results-only-label" class="grok-filter-check-label" title="Hide Grok saved grid; show only paginated search results">
           <input type="checkbox" id="grok-results-only" />
           Results only
+        </label>
+        <label class="grok-display-control" title="Images per page (1–300)">
+          Per page <span class="grok-display-val" id="grok-page-size-val">32</span>
+          <input type="range" id="grok-page-size-slider" min="1" max="300" value="32" />
+        </label>
+        <label class="grok-display-control" title="Thumbnail size (% of default, 10–200)">
+          Size <span class="grok-display-val" id="grok-grid-size-val">100</span>%
+          <input type="range" id="grok-grid-size-slider" min="10" max="200" value="100" />
         </label>
       </div>
       <div id="grok-search-bar">
@@ -1686,9 +1866,12 @@
       filterOnlyChildren = localStorage.getItem(FILTER_CHILDREN_KEY) === '1';
       filterMinVideos = parseMediaMin(localStorage.getItem(FILTER_VIDEO_MIN_KEY));
       filterMinChildren = parseMediaMin(localStorage.getItem(FILTER_CHILDREN_MIN_KEY));
+      pageSize = clampPageSize(localStorage.getItem(PAGE_SIZE_KEY));
+      gridSizePercent = clampGridSizePercent(localStorage.getItem(GRID_SIZE_PCT_KEY));
     } catch { /* ignore */ }
     resultsOnlyEl.checked = resultsOnly;
     syncMediaMinSelects();
+    bindDisplayControlListeners();
     updateResultsOnlyLayout();
     bindMediaFilterListeners();
     updateClearButton();
