@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.3.0
 // @description  Collapsible sidebar on /imagine/post/{id}: metadata and prompt from IndexedDB and Grok API.
-// @author       AnnaLynn (with fixes)
+// @author       Richard Lipka
 // @match        https://grok.com/imagine/post/*
 // @grant        GM_xmlhttpRequest
 // @connect      grok.com

@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.26
 // @description  Search saved Grok media by prompt and date. Per-page count and thumbnail size sliders. Min video/child filters. Results-only panel with scrollable viewport.
-// @author       AnnaLynn (with fixes)
+// @author       AnnaLynn (with fixes), Richard Lipka (modifications)
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
 // @connect      grok.com
