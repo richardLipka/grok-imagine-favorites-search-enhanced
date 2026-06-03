@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Post Sidebar (prompt + tags)
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  Sidebar on /imagine/post/{id}: prompt from GrokSearch IndexedDB, Grok tags (folders) with create/add/remove via grok.com API.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine/post/*
@@ -29,8 +29,14 @@
   let postFolderIds = [];
   let remotePost = null;
   let busy = false;
+  let lastLoadedPostId = null;
+  let refreshSeq = 0;
+  let refreshDebounce = null;
+  let watchersInstalled = false;
+  let urlPollTimer = null;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const REFRESH_DEBOUNCE_MS = 280;
 
   function getPostIdFromUrl() {
     const m = location.pathname.match(/\/imagine\/post\/([0-9a-f-]{36})/i);
@@ -645,14 +651,58 @@
     if (select?.value) onAddExisting();
   }
 
+  function isStaleRefresh(seq) {
+    return seq !== refreshSeq || getPostIdFromUrl() !== postId;
+  }
+
+  function scheduleRefresh(forceRemote) {
+    clearTimeout(refreshDebounce);
+    refreshDebounce = setTimeout(() => {
+      refreshDebounce = null;
+      if (busy) {
+        scheduleRefresh(forceRemote);
+        return;
+      }
+      onPostContextChange(forceRemote);
+    }, REFRESH_DEBOUNCE_MS);
+  }
+
+  function onPostContextChange(forceRemote) {
+    const id = getPostIdFromUrl();
+    if (!id) {
+      document.getElementById('grok-post-sidebar')?.remove();
+      lastLoadedPostId = null;
+      postId = null;
+      remotePost = null;
+      postFolderIds = [];
+      return;
+    }
+    if (!document.getElementById('grok-post-sidebar')) {
+      injectStyles();
+      installNetworkSniffer();
+      buildSidebar();
+    }
+    const postChanged = id !== lastLoadedPostId;
+    refreshAll(Boolean(forceRemote || postChanged));
+  }
+
   async function refreshAll(forceRemote) {
     postId = getPostIdFromUrl();
     if (!postId) return;
+
+    const seq = ++refreshSeq;
+    const postChanged = postId !== lastLoadedPostId;
+    if (postChanged) {
+      remotePost = null;
+      postFolderIds = [];
+      forceRemote = true;
+    }
 
     const idEl = document.getElementById('grok-post-sidebar-post-id');
     if (idEl) idEl.textContent = postId;
 
     setStatus('Loading…');
+    renderTags();
 
     let cached = null;
     try {
@@ -661,53 +711,112 @@
     } catch (e) {
       console.warn('[GrokPostSidebar] IndexedDB:', e);
     }
+    if (isStaleRefresh(seq)) return;
 
-    if (forceRemote || !remotePost) {
+    if (forceRemote || !remotePost || String(remotePost.id) !== postId) {
       remotePost = await fetchRemotePost(postId);
     }
+    if (isStaleRefresh(seq)) return;
 
     const prompt = getPromptText(remotePost, cached);
     renderPrompt(prompt, Boolean(cached?.prompt && !remotePost?.prompt));
+    if (isStaleRefresh(seq)) return;
 
     allFolders = await fetchAllFolders();
+    if (isStaleRefresh(seq)) return;
+
     postFolderIds = parsePostFolderIds(remotePost);
 
     if (!postFolderIds.length && allFolders.length) {
-      setStatus('Resolving tags (may take a moment)…');
+      setStatus('Resolving tags…');
       postFolderIds = await findPostFoldersByScan(postId, allFolders);
+      if (isStaleRefresh(seq)) return;
       setStatus('');
     }
 
+    lastLoadedPostId = postId;
     renderTags();
     if (!allFolders.length) {
       setStatus('No tags on account yet — create one above.');
+    } else if (!postFolderIds.length) {
+      setStatus('');
     }
+  }
+
+  function hookHistoryNavigation() {
+    if (window.__grokPostSidebarHistoryHook) return;
+    window.__grokPostSidebarHistoryHook = true;
+    const wrap = fn => function (...args) {
+      const result = fn.apply(this, args);
+      scheduleRefresh(true);
+      return result;
+    };
+    history.pushState = wrap(history.pushState);
+    history.replaceState = wrap(history.replaceState);
+    window.addEventListener('popstate', () => scheduleRefresh(true));
+  }
+
+  function watchDomAndMedia() {
+    if (window.__grokPostSidebarDomWatch) return;
+    window.__grokPostSidebarDomWatch = true;
+
+    const root = document.querySelector('main') || document.body;
+    const mo = new MutationObserver(() => scheduleRefresh(true));
+    mo.observe(root, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['src', 'href', 'data-id', 'data-post-id'],
+    });
+
+    document.addEventListener('load', e => {
+      const t = e.target;
+      if (!t || (t.tagName !== 'IMG' && t.tagName !== 'VIDEO')) return;
+      if (!root.contains(t)) return;
+      scheduleRefresh(true);
+    }, true);
+
+    document.addEventListener('loadeddata', e => {
+      const t = e.target;
+      if (t?.tagName === 'VIDEO' && root.contains(t)) scheduleRefresh(true);
+    }, true);
+  }
+
+  function startUrlPolling() {
+    if (urlPollTimer) return;
+    urlPollTimer = setInterval(() => {
+      const id = getPostIdFromUrl();
+      if (!id) {
+        if (document.getElementById('grok-post-sidebar')) onPostContextChange(false);
+        return;
+      }
+      if (id !== lastLoadedPostId) scheduleRefresh(true);
+    }, 450);
+  }
+
+  function installWatchers() {
+    if (watchersInstalled) return;
+    watchersInstalled = true;
+    hookHistoryNavigation();
+    watchDomAndMedia();
+    startUrlPolling();
+    new MutationObserver(() => scheduleRefresh(true)).observe(document.body, {
+      childList: true,
+      subtree: false,
+    });
   }
 
   function init() {
-    postId = getPostIdFromUrl();
-    if (!postId) return;
+    if (!getPostIdFromUrl()) return;
     injectStyles();
     installNetworkSniffer();
     buildSidebar();
-    refreshAll(false);
+    installWatchers();
+    lastLoadedPostId = null;
+    scheduleRefresh(true);
+    setTimeout(() => scheduleRefresh(true), 900);
+    setTimeout(() => scheduleRefresh(true), 2200);
   }
-
-  let lastPath = location.pathname;
-  const onNav = () => {
-    if (location.pathname === lastPath) return;
-    lastPath = location.pathname;
-    remotePost = null;
-    postFolderIds = [];
-    if (getPostIdFromUrl()) {
-      init();
-    } else {
-      document.getElementById('grok-post-sidebar')?.remove();
-    }
-  };
-
-  new MutationObserver(onNav).observe(document.body, { childList: true, subtree: true });
-  window.addEventListener('popstate', onNav);
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
