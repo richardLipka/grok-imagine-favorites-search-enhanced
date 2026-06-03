@@ -449,6 +449,7 @@
     const postId = getPostIdFromUrl();
     if (!postId) {
       document.getElementById('grok-post-sidebar')?.remove();
+      document.getElementById('grok-post-sidebar-toggle')?.remove();
       lastLoadedPostId = null;
       return;
     }
@@ -515,6 +516,7 @@
     if (!getPostIdFromUrl()) return;
     injectStyles();
     buildSidebar();
+    ensureToggleButton();
     hookHistory();
     refreshContent();
     setInterval(() => {
