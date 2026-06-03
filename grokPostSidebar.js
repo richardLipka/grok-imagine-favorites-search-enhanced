@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Post Sidebar (prompt + tags)
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1
+// @version      1.0.2
 // @description  Sidebar on /imagine/post/{id}: prompt from GrokSearch IndexedDB, Grok tags (folders) with create/add/remove via grok.com API.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine/post/*
@@ -34,13 +34,112 @@
   let refreshDebounce = null;
   let watchersInstalled = false;
   let urlPollTimer = null;
+  let activePostCache = null;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const REFRESH_DEBOUNCE_MS = 280;
+  const UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+  const POST_ID_RE = /\/imagine\/post\/([0-9a-f-]{36})/i;
 
   function getPostIdFromUrl() {
-    const m = location.pathname.match(/\/imagine\/post\/([0-9a-f-]{36})/i);
+    const m = location.href.match(POST_ID_RE);
     return m ? m[1] : null;
+  }
+
+  function getPostIdFromHistoryState() {
+    const st = history.state;
+    if (!st || typeof st !== 'object') return null;
+    const raw = st.postId ?? st.id ?? st.mediaPostId ?? st.post?.id;
+    if (!raw) return null;
+    const s = String(raw);
+    return UUID_RE.test(s) ? s.match(UUID_RE)[1] : null;
+  }
+
+  function extractPostIdFromHref(href) {
+    if (!href) return null;
+    const m = String(href).match(POST_ID_RE);
+    return m ? m[1] : null;
+  }
+
+  function getPostIdFromDom() {
+    const root = document.querySelector('main') || document.body;
+
+    const selectedSelectors = [
+      'a[aria-selected="true"][href*="/imagine/post/"]',
+      'a[aria-current="page"][href*="/imagine/post/"]',
+      '[data-state="active"] a[href*="/imagine/post/"]',
+      '[data-active="true"] a[href*="/imagine/post/"]',
+      '[data-selected="true"] a[href*="/imagine/post/"]',
+    ];
+    for (const sel of selectedSelectors) {
+      const el = root.querySelector(sel);
+      const id = extractPostIdFromHref(el?.href || el?.getAttribute?.('href'));
+      if (id) return id;
+    }
+
+    const thumbs = root.querySelectorAll('a[href*="/imagine/post/"]');
+    for (const a of thumbs) {
+      const hop = [a, a.parentElement, a.parentElement?.parentElement].filter(Boolean);
+      for (const el of hop) {
+        const cls = `${el.className || ''}`;
+        if (/ring-2|ring-primary|border-2|border-white|outline-white|selected|active|current/i.test(cls)) {
+          const id = extractPostIdFromHref(a.href);
+          if (id) return id;
+        }
+        if (el.getAttribute?.('aria-selected') === 'true' || el.getAttribute?.('data-state') === 'active') {
+          const id = extractPostIdFromHref(a.href);
+          if (id) return id;
+        }
+      }
+    }
+
+    const media = root.querySelector('video[src], img[src*="grok"], img[src*="x.ai"]');
+    if (media) {
+      let el = media;
+      for (let i = 0; i < 10 && el; i++) {
+        for (const attr of ['data-post-id', 'data-id', 'data-media-post-id']) {
+          const v = el.getAttribute?.(attr);
+          if (v && UUID_RE.test(v)) return v.match(UUID_RE)[1];
+        }
+        el = el.parentElement;
+      }
+    }
+
+    return null;
+  }
+
+  function getActivePostId() {
+    const urlId = getPostIdFromUrl();
+    const domId = getPostIdFromDom();
+    const stateId = getPostIdFromHistoryState();
+    const cacheId = activePostCache?.id ? String(activePostCache.id) : null;
+
+    if (domId && urlId && domId !== urlId) return domId;
+    if (domId) return domId;
+    if (cacheId && urlId && cacheId !== urlId) return cacheId;
+    if (stateId && stateId !== urlId) return stateId;
+    return cacheId || stateId || urlId;
+  }
+
+  function clearTagsForPostSwitch(nextId) {
+    postId = nextId;
+    activePostCache = null;
+    remotePost = null;
+    postFolderIds = [];
+    const idEl = document.getElementById('grok-post-sidebar-post-id');
+    if (idEl) idEl.textContent = nextId;
+    setStatus('Loading…');
+    renderTags();
+  }
+
+  function applyActivePostFromApi(post) {
+    if (!post?.id) return;
+    const id = String(post.id);
+    const changed = id !== lastLoadedPostId;
+    activePostCache = post;
+    postId = id;
+    if (changed) clearTagsForPostSwitch(id);
+    scheduleRefresh(false);
   }
 
   function escapeHtml(str) {
@@ -275,36 +374,57 @@
     postFolderIds = postFolderIds.filter(f => f !== folderId);
   }
 
-  // ─── Sniff native Grok tag API calls ───────────────────────────────────────
+  function handlePostGetResponse(url, responseText) {
+    if (!url?.includes('/rest/media/post/get')) return;
+    try {
+      const data = JSON.parse(responseText);
+      const post = parsePostObject(data);
+      if (post?.id) applyActivePostFromApi(post);
+    } catch { /* ignore */ }
+  }
+
+  // ─── Sniff native Grok API (tags + post/get for active image) ─────────────
   function installNetworkSniffer() {
     if (window.__grokPostSidebarSniffer) return;
     window.__grokPostSidebarSniffer = true;
 
-    const note = (url, bodyStr) => {
+    const noteTagRequest = (url, bodyStr) => {
       if (!url || !url.includes('/rest/media/')) return;
       if (!/folder|tag/i.test(url)) return;
-      console.log('[GrokPostSidebar] saw', url, bodyStr || '');
       if (/create|save/i.test(url)) saveEndpointCache('folderCreate', url.split('?')[0]);
       if (/add/i.test(url)) saveEndpointCache('folderAdd', url.split('?')[0]);
       if (/remove|delete/i.test(url) && /folder|tag/i.test(url)) saveEndpointCache('folderRemove', url.split('?')[0]);
     };
 
     const origFetch = window.fetch;
-    window.fetch = function (input, init) {
+    window.fetch = async function (input, init) {
       const url = typeof input === 'string' ? input : input?.url;
-      note(url, init?.body);
-      return origFetch.apply(this, arguments);
+      noteTagRequest(url, init?.body);
+      const res = await origFetch.apply(this, arguments);
+      if (url?.includes('/rest/media/post/get')) {
+        try {
+          const clone = res.clone();
+          const text = await clone.text();
+          handlePostGetResponse(url, text);
+        } catch { /* ignore */ }
+      }
+      return res;
     };
 
     const origOpen = XMLHttpRequest.prototype.open;
     const origSend = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function (method, url) {
       this.__grokSidebarUrl = url;
-      this.__grokSidebarMethod = method;
       return origOpen.apply(this, arguments);
     };
     XMLHttpRequest.prototype.send = function (body) {
-      note(this.__grokSidebarUrl, body);
+      const reqUrl = this.__grokSidebarUrl;
+      noteTagRequest(reqUrl, body);
+      this.addEventListener('load', function () {
+        if (reqUrl?.includes('/rest/media/post/get') && this.responseText) {
+          handlePostGetResponse(reqUrl, this.responseText);
+        }
+      });
       return origSend.apply(this, arguments);
     };
   }
@@ -652,10 +772,20 @@
   }
 
   function isStaleRefresh(seq) {
-    return seq !== refreshSeq || getPostIdFromUrl() !== postId;
+    return seq !== refreshSeq || getActivePostId() !== postId;
+  }
+
+  function notePossiblePostSwitch() {
+    const domId = getPostIdFromDom();
+    const urlId = getPostIdFromUrl();
+    const id = domId || (activePostCache?.id && String(activePostCache.id) !== urlId ? String(activePostCache.id) : null) || urlId;
+    if (!id || id === lastLoadedPostId) return;
+    if (activePostCache && String(activePostCache.id) !== id) activePostCache = null;
+    clearTagsForPostSwitch(id);
   }
 
   function scheduleRefresh(forceRemote) {
+    notePossiblePostSwitch();
     clearTimeout(refreshDebounce);
     refreshDebounce = setTimeout(() => {
       refreshDebounce = null;
@@ -668,13 +798,14 @@
   }
 
   function onPostContextChange(forceRemote) {
-    const id = getPostIdFromUrl();
+    const id = getActivePostId();
     if (!id) {
       document.getElementById('grok-post-sidebar')?.remove();
       lastLoadedPostId = null;
       postId = null;
       remotePost = null;
       postFolderIds = [];
+      activePostCache = null;
       return;
     }
     if (!document.getElementById('grok-post-sidebar')) {
@@ -683,26 +814,28 @@
       buildSidebar();
     }
     const postChanged = id !== lastLoadedPostId;
+    if (postChanged) clearTagsForPostSwitch(id);
     refreshAll(Boolean(forceRemote || postChanged));
   }
 
   async function refreshAll(forceRemote) {
-    postId = getPostIdFromUrl();
+    postId = getActivePostId();
     if (!postId) return;
 
     const seq = ++refreshSeq;
     const postChanged = postId !== lastLoadedPostId;
     if (postChanged) {
+      activePostCache = null;
       remotePost = null;
       postFolderIds = [];
       forceRemote = true;
+      renderTags();
     }
 
     const idEl = document.getElementById('grok-post-sidebar-post-id');
     if (idEl) idEl.textContent = postId;
 
     setStatus('Loading…');
-    renderTags();
 
     let cached = null;
     try {
@@ -713,8 +846,11 @@
     }
     if (isStaleRefresh(seq)) return;
 
-    if (forceRemote || !remotePost || String(remotePost.id) !== postId) {
+    if (activePostCache && String(activePostCache.id) === postId) {
+      remotePost = activePostCache;
+    } else if (forceRemote || !remotePost || String(remotePost.id) !== postId) {
       remotePost = await fetchRemotePost(postId);
+      if (remotePost?.id) activePostCache = remotePost;
     }
     if (isStaleRefresh(seq)) return;
 
@@ -766,32 +902,34 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['src', 'href', 'data-id', 'data-post-id'],
+      attributeFilter: ['src', 'href', 'data-id', 'data-post-id', 'aria-selected', 'aria-current', 'data-state', 'class'],
     });
+
+    const onMediaReady = () => scheduleRefresh(true);
 
     document.addEventListener('load', e => {
       const t = e.target;
       if (!t || (t.tagName !== 'IMG' && t.tagName !== 'VIDEO')) return;
       if (!root.contains(t)) return;
-      scheduleRefresh(true);
+      onMediaReady();
     }, true);
 
     document.addEventListener('loadeddata', e => {
       const t = e.target;
-      if (t?.tagName === 'VIDEO' && root.contains(t)) scheduleRefresh(true);
+      if (t?.tagName === 'VIDEO' && root.contains(t)) onMediaReady();
     }, true);
   }
 
   function startUrlPolling() {
     if (urlPollTimer) return;
     urlPollTimer = setInterval(() => {
-      const id = getPostIdFromUrl();
+      const id = getActivePostId();
       if (!id) {
         if (document.getElementById('grok-post-sidebar')) onPostContextChange(false);
         return;
       }
       if (id !== lastLoadedPostId) scheduleRefresh(true);
-    }, 450);
+    }, 400);
   }
 
   function installWatchers() {
@@ -807,7 +945,7 @@
   }
 
   function init() {
-    if (!getPostIdFromUrl()) return;
+    if (!getPostIdFromUrl() && !getPostIdFromDom()) return;
     injectStyles();
     installNetworkSniffer();
     buildSidebar();
