@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Post Sidebar (prompt)
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
-// @description  Sidebar on /imagine/post/{id} showing prompt from GrokSearch IndexedDB or Grok API.
+// @version      1.2.0
+// @description  Sidebar on /imagine/post/{id}: prompt and metadata from GrokSearch IndexedDB and Grok API.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine/post/*
 // @grant        GM_xmlhttpRequest
@@ -35,6 +35,108 @@
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
+  }
+
+  function isVideoMediaType(mediaType) {
+    const t = String(mediaType || '');
+    return t === 'MEDIA_POST_TYPE_VIDEO' || t.includes('VIDEO');
+  }
+
+  function extractChildMediaCounts(post) {
+    const children = post?.childPosts || [];
+    let childImageCount = 0;
+    let childVideoCount = 0;
+    for (const child of children) {
+      if (isVideoMediaType(child.mediaType)) childVideoCount++;
+      else childImageCount++;
+    }
+    const parentIsVideo = isVideoMediaType(post?.mediaType);
+    const videoCount = (parentIsVideo ? 1 : 0) + childVideoCount;
+    return {
+      childPostCount: children.length,
+      childImageCount,
+      childVideoCount,
+      videoCount,
+    };
+  }
+
+  function mergePostData(cached, remote) {
+    const r = remote || {};
+    const c = cached || {};
+    const fromChildren = remote ? extractChildMediaCounts(remote) : null;
+    const childPostCount = fromChildren?.childPostCount ?? c.childPostCount;
+    const hasChildFields = childPostCount != null;
+
+    return {
+      id: String(r.id || c.id || getPostIdFromUrl() || ''),
+      prompt: String(r.prompt || r.originalPrompt || c.prompt || '').trim(),
+      createTime: r.createTime || r.createdAt || r.create_time || c.createTime || '',
+      model: r.modelName || r.model || r.modelId || '',
+      mediaType: r.mediaType || '',
+      mediaUrl: r.mediaUrl || r.hdMediaUrl || c.mediaUrl || '',
+      thumbnail: r.thumbnailImageUrl || r.thumbnail || c.thumbnail || '',
+      childPostCount: hasChildFields ? (childPostCount ?? 0) : null,
+      childImageCount: fromChildren?.childImageCount ?? c.childImageCount ?? null,
+      childVideoCount: fromChildren?.childVideoCount ?? c.childVideoCount ?? null,
+      videoCount: fromChildren?.videoCount ?? c.videoCount ?? null,
+      fromIndex: Boolean(c.id),
+      fromApi: Boolean(r.id),
+    };
+  }
+
+  function formatDate(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toLocaleString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  }
+
+  function formatMediaType(mediaType) {
+    if (!mediaType) return '';
+    if (isVideoMediaType(mediaType)) return 'Video';
+    if (String(mediaType).includes('IMAGE')) return 'Image';
+    return String(mediaType).replace(/^MEDIA_POST_TYPE_/i, '').replace(/_/g, ' ').toLowerCase()
+      || mediaType;
+  }
+
+  function formatDataSource(meta) {
+    if (meta.fromIndex && meta.fromApi) return 'Index + API';
+    if (meta.fromIndex) return 'Index';
+    if (meta.fromApi) return 'API';
+    return '';
+  }
+
+  function formatCount(n) {
+    return n == null ? '' : String(n);
+  }
+
+  function buildMetadataRows(meta) {
+    const rows = [];
+    const push = (label, value, extra = {}) => {
+      const v = value == null ? '' : String(value).trim();
+      if (!v && !extra.showZero) return;
+      rows.push({ label, value: v || '0', ...extra });
+    };
+
+    push('Post ID', meta.id, { mono: true, copyValue: meta.id });
+    push('Date', formatDate(meta.createTime));
+    push('Model', meta.model);
+    push('Type', formatMediaType(meta.mediaType));
+    if (meta.childPostCount != null) {
+      push('Child posts', formatCount(meta.childPostCount), { showZero: true });
+      push('Child images', formatCount(meta.childImageCount), { showZero: true });
+      push('Child videos', formatCount(meta.childVideoCount), { showZero: true });
+      push('Videos total', formatCount(meta.videoCount), { showZero: true });
+    }
+    push('Data', formatDataSource(meta));
+
+    return rows;
   }
 
   function openDB() {
@@ -79,10 +181,6 @@
     });
   }
 
-  function getPromptText(post, cached) {
-    return String(post?.prompt || post?.originalPrompt || cached?.prompt || '').trim();
-  }
-
   function injectStyles() {
     if (document.getElementById('grok-post-sidebar-styles')) return;
     const s = document.createElement('style');
@@ -117,18 +215,64 @@
         font-weight: 600;
         color: rgba(255, 255, 255, 0.92);
       }
-      #grok-post-sidebar-post-id {
-        margin: 6px 0 0;
-        font-size: 10px;
-        color: rgba(255, 255, 255, 0.4);
-        word-break: break-all;
-        font-variant-numeric: tabular-nums;
-      }
       #grok-post-sidebar-body {
         flex: 1;
         overflow-y: auto;
         padding: 14px 16px 20px;
         -webkit-overflow-scrolling: touch;
+      }
+      .grok-post-sidebar-section {
+        margin-bottom: 16px;
+      }
+      .grok-post-sidebar-section h3 {
+        margin: 0 0 8px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: rgba(255, 255, 255, 0.45);
+      }
+      .grok-post-meta-list {
+        margin: 0;
+        display: grid;
+        grid-template-columns: minmax(72px, 38%) 1fr;
+        gap: 6px 10px;
+        font-size: 11px;
+      }
+      .grok-post-meta-list dt {
+        margin: 0;
+        color: rgba(255, 255, 255, 0.45);
+        font-weight: 500;
+      }
+      .grok-post-meta-list dd {
+        margin: 0;
+        color: rgba(255, 255, 255, 0.88);
+        word-break: break-word;
+      }
+      .grok-post-meta-list dd.mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 10px;
+        line-height: 1.4;
+      }
+      .grok-post-meta-copy {
+        margin-left: 6px;
+        padding: 1px 6px;
+        font-size: 10px;
+        border-radius: 4px;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        background: rgba(255, 255, 255, 0.06);
+        color: rgba(255, 255, 255, 0.7);
+        cursor: pointer;
+        vertical-align: baseline;
+      }
+      .grok-post-meta-copy:hover {
+        border-color: rgba(139, 92, 246, 0.5);
+        color: #fff;
+      }
+      .grok-post-meta-empty {
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.35);
+        font-style: italic;
       }
       #grok-post-sidebar-prompt {
         font-size: 12px;
@@ -155,14 +299,57 @@
     aside.id = 'grok-post-sidebar';
     aside.innerHTML = `
       <div id="grok-post-sidebar-header">
-        <h2>Prompt</h2>
-        <p id="grok-post-sidebar-post-id"></p>
+        <h2>Saved post</h2>
       </div>
       <div id="grok-post-sidebar-body">
-        <div id="grok-post-sidebar-prompt" class="empty">Loading…</div>
+        <section class="grok-post-sidebar-section">
+          <h3>Metadata</h3>
+          <div id="grok-post-sidebar-meta" class="grok-post-meta-empty">Loading…</div>
+        </section>
+        <section class="grok-post-sidebar-section">
+          <h3>Prompt</h3>
+          <div id="grok-post-sidebar-prompt" class="empty">Loading…</div>
+        </section>
       </div>
     `;
     document.body.appendChild(aside);
+  }
+
+  function copyText(text) {
+    if (!text) return;
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {});
+      return;
+    }
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch { /* ignore */ }
+    ta.remove();
+  }
+
+  function renderMetadata(rows) {
+    const el = document.getElementById('grok-post-sidebar-meta');
+    if (!el) return;
+    if (!rows.length) {
+      el.className = 'grok-post-meta-empty';
+      el.textContent = 'No metadata in index or API. Run Grok Search reindex on the saved list.';
+      return;
+    }
+    el.className = '';
+    el.innerHTML = `<dl class="grok-post-meta-list">${rows.map(row => {
+      const ddClass = row.mono ? ' class="mono"' : '';
+      const copyBtn = row.copyValue
+        ? `<button type="button" class="grok-post-meta-copy" data-copy="${escapeHtml(row.copyValue)}" title="Copy">Copy</button>`
+        : '';
+      return `<dt>${escapeHtml(row.label)}</dt><dd${ddClass}>${escapeHtml(row.value)}${copyBtn}</dd>`;
+    }).join('')}</dl>`;
+    el.querySelectorAll('.grok-post-meta-copy').forEach(btn => {
+      btn.addEventListener('click', () => copyText(btn.dataset.copy));
+    });
   }
 
   function renderPrompt(text, sourceHint) {
@@ -179,7 +366,7 @@
     el.title = sourceHint || '';
   }
 
-  async function refreshPrompt() {
+  async function refreshContent() {
     const postId = getPostIdFromUrl();
     if (!postId) {
       document.getElementById('grok-post-sidebar')?.remove();
@@ -188,13 +375,17 @@
     }
 
     const seq = ++refreshSeq;
-    const idEl = document.getElementById('grok-post-sidebar-post-id');
-    if (idEl) idEl.textContent = postId;
-
+    const metaEl = document.getElementById('grok-post-sidebar-meta');
     const promptEl = document.getElementById('grok-post-sidebar-prompt');
-    if (postId !== lastLoadedPostId && promptEl) {
-      promptEl.textContent = 'Loading…';
-      promptEl.classList.add('empty');
+    if (postId !== lastLoadedPostId) {
+      if (metaEl) {
+        metaEl.className = 'grok-post-meta-empty';
+        metaEl.textContent = 'Loading…';
+      }
+      if (promptEl) {
+        promptEl.textContent = 'Loading…';
+        promptEl.classList.add('empty');
+      }
     }
 
     let cached = null;
@@ -206,23 +397,26 @@
     }
     if (seq !== refreshSeq || getPostIdFromUrl() !== postId) return;
 
-    let prompt = getPromptText(null, cached);
-    let source = cached?.prompt ? 'From GrokSearch IndexedDB' : '';
+    const remote = await fetchRemotePost(postId);
+    if (seq !== refreshSeq || getPostIdFromUrl() !== postId) return;
 
-    if (!prompt) {
-      const remote = await fetchRemotePost(postId);
-      if (seq !== refreshSeq || getPostIdFromUrl() !== postId) return;
-      prompt = getPromptText(remote, null);
-      if (prompt) source = 'From Grok API';
+    const meta = mergePostData(cached, remote);
+    renderMetadata(buildMetadataRows(meta));
+
+    let promptSource = '';
+    if (meta.prompt) {
+      if (meta.fromIndex && meta.fromApi) promptSource = 'Index + API';
+      else if (meta.fromIndex) promptSource = 'From GrokSearch IndexedDB';
+      else promptSource = 'From Grok API';
     }
+    renderPrompt(meta.prompt, promptSource);
 
     lastLoadedPostId = postId;
-    renderPrompt(prompt, source);
   }
 
   function scheduleRefresh() {
     clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(refreshPrompt, 400);
+    refreshTimer = setTimeout(refreshContent, 400);
   }
 
   function hookHistory() {
@@ -243,7 +437,7 @@
     injectStyles();
     buildSidebar();
     hookHistory();
-    refreshPrompt();
+    refreshContent();
     setInterval(() => {
       const id = getPostIdFromUrl();
       if (id && id !== lastLoadedPostId) scheduleRefresh();
