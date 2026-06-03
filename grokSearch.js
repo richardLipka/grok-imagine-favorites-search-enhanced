@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.21
+// @version      1.22
 // @description  Search saved Grok media by prompt and date. Per-page count and thumbnail size sliders. Min video/child filters. Results-only panel with scrollable viewport.
 // @author       AnnaLynn (with fixes)
 // @match        https://grok.com/imagine*
@@ -38,9 +38,11 @@
   const FILTER_CHILDREN_MIN_KEY = 'grokSearchFilterChildrenMin';
   const PAGE_SIZE_KEY = 'grokSearchPageSize';
   const GRID_SIZE_PCT_KEY = 'grokSearchGridSizePct';
+  const SEARCH_BAR_COLLAPSED_KEY = 'grokSearchBarCollapsed';
   const MEDIA_MIN_OPTIONS = [1, 3, 5, 7, 10];
 
   let allPosts = [];
+  let searchBarExpanded = true;
   const knownIds = new Set();
   let currentQuery = '';
   let dateStart = '';
@@ -1120,6 +1122,43 @@
         z-index: 99990; display: flex; flex-direction: column; align-items: stretch;
         gap: 8px; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
         width: min(900px, 92vw);
+        transition: transform 0.28s ease, opacity 0.22s ease, visibility 0.28s;
+      }
+      #grok-search-wrap.collapsed {
+        transform: translateX(-50%) translateY(calc(-100% - 24px));
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+      }
+      #grok-search-toggle {
+        position: fixed;
+        right: 16px;
+        bottom: 16px;
+        z-index: 99991;
+        width: 44px;
+        height: 44px;
+        border-radius: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        background: rgba(15, 15, 20, 0.94);
+        color: rgba(255, 255, 255, 0.9);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+        backdrop-filter: blur(12px);
+        transition: background 0.15s, border-color 0.15s;
+        padding: 0;
+      }
+      #grok-search-toggle:hover {
+        border-color: rgba(139, 92, 246, 0.55);
+        background: rgba(139, 92, 246, 0.22);
+        color: #fff;
+      }
+      #grok-search-toggle svg {
+        width: 20px;
+        height: 20px;
+        flex-shrink: 0;
       }
       #grok-results-only-row {
         display: flex;
@@ -1808,6 +1847,71 @@
     actions.appendChild(btn);
   }
 
+  function setSearchBarExpanded(expanded) {
+    searchBarExpanded = expanded;
+    const wrap = document.getElementById('grok-search-wrap');
+    const btn = document.getElementById('grok-search-toggle');
+    if (wrap) wrap.classList.toggle('collapsed', !expanded);
+    if (btn) {
+      btn.title = expanded ? 'Hide search bar' : 'Show search bar';
+      btn.setAttribute('aria-expanded', String(expanded));
+      btn.innerHTML = expanded
+        ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <polyline points="6 15 12 9 18 15"/>
+           </svg>`
+        : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <circle cx="10" cy="10" r="6"/>
+            <line x1="14.5" y1="14.5" x2="20" y2="20"/>
+           </svg>`;
+    }
+    try {
+      localStorage.setItem(SEARCH_BAR_COLLAPSED_KEY, expanded ? '0' : '1');
+    } catch { /* ignore */ }
+  }
+
+  function patchSearchBarCollapseStyles() {
+    if (document.getElementById('grok-search-collapse-styles')) return;
+    const s = document.createElement('style');
+    s.id = 'grok-search-collapse-styles';
+    s.textContent = `
+      #grok-search-wrap { transition: transform 0.28s ease, opacity 0.22s ease, visibility 0.28s; }
+      #grok-search-wrap.collapsed {
+        transform: translateX(-50%) translateY(calc(-100% - 24px));
+        opacity: 0; visibility: hidden; pointer-events: none;
+      }
+      #grok-search-toggle {
+        position: fixed; right: 16px; bottom: 16px; z-index: 99991;
+        width: 44px; height: 44px; border-radius: 12px;
+        border: 1px solid rgba(255,255,255,0.18);
+        background: rgba(15,15,20,0.94); color: rgba(255,255,255,0.9);
+        cursor: pointer; display: flex; align-items: center; justify-content: center;
+        box-shadow: 0 6px 24px rgba(0,0,0,0.45); backdrop-filter: blur(12px); padding: 0;
+      }
+      #grok-search-toggle:hover {
+        border-color: rgba(139,92,246,0.55); background: rgba(139,92,246,0.22); color: #fff;
+      }
+      #grok-search-toggle svg { width: 20px; height: 20px; }
+    `;
+    document.head.appendChild(s);
+  }
+
+  function ensureSearchBarToggle() {
+    patchSearchBarCollapseStyles();
+    if (document.getElementById('grok-search-toggle')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'grok-search-toggle';
+    btn.setAttribute('aria-label', 'Toggle search bar');
+    btn.addEventListener('click', () => setSearchBarExpanded(!searchBarExpanded));
+    document.body.appendChild(btn);
+    try {
+      searchBarExpanded = localStorage.getItem(SEARCH_BAR_COLLAPSED_KEY) !== '1';
+    } catch {
+      searchBarExpanded = true;
+    }
+    setSearchBarExpanded(searchBarExpanded);
+  }
+
   function buildSearchBar() {
     if (document.getElementById('grok-search-wrap')) {
       migrateSearchBarLayout();
@@ -1816,6 +1920,7 @@
       ensureReindexButton();
       ensureMediaFilterCheckboxes();
       ensureDisplayControls();
+      ensureSearchBarToggle();
       return;
     }
     const wrap = document.createElement('div');
@@ -1904,6 +2009,7 @@
       </div>
     `;
     document.body.appendChild(wrap);
+    ensureSearchBarToggle();
 
     const noResults = document.createElement('div');
     noResults.id = 'grok-no-results';
@@ -2021,7 +2127,12 @@
     if (pageJumpEl) bindPageJumpListeners(pageJumpEl);
 
     document.addEventListener('keydown', e => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'f') { e.preventDefault(); input.focus(); input.select(); }
+      if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
+        e.preventDefault();
+        setSearchBarExpanded(true);
+        input.focus();
+        input.select();
+      }
       if (e.key === 'Escape' && document.activeElement === input) input.blur();
       const active = document.activeElement;
       const typingInSearch = active === input;
