@@ -1593,21 +1593,11 @@
       sizeCtrl.innerHTML = `
         Size <span class="grok-display-val" id="grok-grid-size-val">${DEFAULT_GRID_SIZE_PCT}</span>%
         <input type="range" id="grok-grid-size-slider" min="${GRID_SIZE_MIN_PCT}" max="${GRID_SIZE_MAX_PCT}" value="${DEFAULT_GRID_SIZE_PCT}" />
-        <button type="button" id="grok-grid-size-default" class="grok-display-default-btn" title="Reset to ${DEFAULT_GRID_SIZE_PCT}% size">Default</button>
       `;
       row.appendChild(sizeCtrl);
     }
 
-    ensureDisplayDefaultButton(
-      'grok-page-size-default',
-      'grok-page-size-slider',
-      `Reset to ${DEFAULT_PAGE_SIZE} per page`
-    );
-    ensureDisplayDefaultButton(
-      'grok-grid-size-default',
-      'grok-grid-size-slider',
-      `Reset to ${DEFAULT_GRID_SIZE_PCT}% size`
-    );
+    ensureDisplayDefaultButton();
 
     bindDisplayControlListeners();
   }
@@ -1615,29 +1605,33 @@
   function bindDisplayControlListeners() {
     const pageSlider = document.getElementById('grok-page-size-slider');
     const gridSlider = document.getElementById('grok-grid-size-slider');
-    const pageDefaultBtn = document.getElementById('grok-page-size-default');
-    const gridDefaultBtn = document.getElementById('grok-grid-size-default');
-    if (!pageSlider || !gridSlider || !pageDefaultBtn || !gridDefaultBtn) return;
-    if (pageSlider.dataset.grokDisplayBound) return;
-    pageSlider.dataset.grokDisplayBound = '1';
-    gridSlider.dataset.grokDisplayBound = '1';
+    const defaultBtn = document.getElementById('grok-display-default');
+    if (!pageSlider || !gridSlider) return;
 
-    try {
-      pageSize = clampPageSize(localStorage.getItem(PAGE_SIZE_KEY));
-      gridSizePercent = clampGridSizePercent(localStorage.getItem(GRID_SIZE_PCT_KEY));
-    } catch { /* ignore */ }
-    syncDisplayControlLabels();
-    applyGridLayoutStyles();
+    if (!pageSlider.dataset.grokDisplayBound) {
+      pageSlider.dataset.grokDisplayBound = '1';
+      gridSlider.dataset.grokDisplayBound = '1';
 
-    const onPageSizeChange = () => applyPageSizeSetting(pageSlider.value, true);
-    const onGridSizeChange = () => applyGridSizeSetting(gridSlider.value);
+      try {
+        pageSize = clampPageSize(localStorage.getItem(PAGE_SIZE_KEY));
+        gridSizePercent = clampGridSizePercent(localStorage.getItem(GRID_SIZE_PCT_KEY));
+      } catch { /* ignore */ }
+      syncDisplayControlLabels();
+      applyGridLayoutStyles();
 
-    pageSlider.addEventListener('input', onPageSizeChange);
-    pageSlider.addEventListener('change', onPageSizeChange);
-    gridSlider.addEventListener('input', onGridSizeChange);
-    gridSlider.addEventListener('change', onGridSizeChange);
-    pageDefaultBtn.addEventListener('click', () => applyPageSizeSetting(DEFAULT_PAGE_SIZE, true));
-    gridDefaultBtn.addEventListener('click', () => applyGridSizeSetting(DEFAULT_GRID_SIZE_PCT));
+      const onPageSizeChange = () => applyPageSizeSetting(pageSlider.value, true);
+      const onGridSizeChange = () => applyGridSizeSetting(gridSlider.value);
+
+      pageSlider.addEventListener('input', onPageSizeChange);
+      pageSlider.addEventListener('change', onPageSizeChange);
+      gridSlider.addEventListener('input', onGridSizeChange);
+      gridSlider.addEventListener('change', onGridSizeChange);
+    }
+
+    if (defaultBtn && !defaultBtn.dataset.grokDisplayBound) {
+      defaultBtn.dataset.grokDisplayBound = '1';
+      defaultBtn.addEventListener('click', applyDisplayDefaults);
+    }
   }
 
   function migrateSearchBarLayout() {
@@ -1835,13 +1829,12 @@
         <label class="grok-display-control" title="Images per page (1–300)">
           Per page <span class="grok-display-val" id="grok-page-size-val">44</span>
           <input type="range" id="grok-page-size-slider" min="1" max="300" value="44" />
-          <button type="button" id="grok-page-size-default" class="grok-display-default-btn" title="Reset to 44 per page">Default</button>
         </label>
         <label class="grok-display-control" title="Thumbnail size (% of default, 10–200)">
           Size <span class="grok-display-val" id="grok-grid-size-val">100</span>%
           <input type="range" id="grok-grid-size-slider" min="10" max="200" value="100" />
-          <button type="button" id="grok-grid-size-default" class="grok-display-default-btn" title="Reset to 100% size">Default</button>
         </label>
+        <button type="button" id="grok-display-default" class="grok-display-default-btn" title="Reset to 44 per page and 100% size">Default</button>
       </div>
       <div id="grok-search-bar">
         <div class="grok-bar-top">
