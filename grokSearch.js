@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.27
-// @description  Search saved Grok media by prompt and date. Per-page count and thumbnail size sliders. Min video/child filters. Results-only panel with scrollable viewport.
+// @version      1.28
+// @description  Search saved Grok media by prompt and date. Sync on focus and navigation; refresh recent metadata. Per-page count, thumbnail sliders, video/child filters, results panel.
 // @author       AnnaLynn (with fixes), Richard Lipka (modifications)
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
@@ -28,6 +28,10 @@
   const GRID_SIZE_MIN_PCT = 10;
   const GRID_SIZE_MAX_PCT = 200;
   const ENDPOINT = 'https://grok.com/rest/media/post/list';
+  const POST_GET = 'https://grok.com/rest/media/post/get';
+  const RECENT_REFRESH_COUNT = 50;
+  const RECENT_REFRESH_DELAY_MS = 120;
+  const SYNC_FOCUS_MIN_INTERVAL_MS = 60 * 1000;
   const DB_NAME = 'GrokSearchIndex';
   const DB_VERSION = 1;
   const STORE_NAME = 'posts';
@@ -60,7 +64,10 @@
   let loaded = false;
   let db = null;
   let indexing = false;
+  let syncInProgress = false;
   let rendering = false;
+  let lastIncrementalSyncAt = 0;
+  let syncDebounceTimer = null;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -166,11 +173,138 @@
     return {
       id: post.id,
       prompt,
-      thumbnail: post.thumbnailImageUrl || post.mediaUrl || '',
-      mediaUrl: post.mediaUrl || '',
-      createTime: post.createTime || '',
+      thumbnail: post.thumbnailImageUrl || post.thumbnail || post.mediaUrl || '',
+      mediaUrl: post.mediaUrl || post.hdMediaUrl || '',
+      createTime: post.createTime || post.createdAt || post.create_time || '',
+      model: post.modelName || post.model || post.modelId || '',
+      mediaType: post.mediaType || '',
       ...counts,
     };
+  }
+
+  function isImagineListPage() {
+    return location.href.includes('/imagine') && !location.href.includes('/imagine/post/');
+  }
+
+  function fetchRemotePost(id) {
+    return new Promise(resolve => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: POST_GET,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ id }),
+        withCredentials: true,
+        onload: res => {
+          if (res.status < 200 || res.status >= 300) {
+            resolve(null);
+            return;
+          }
+          try {
+            const data = JSON.parse(res.responseText);
+            resolve(data?.post ?? data?.mediaPost ?? data?.item ?? data);
+          } catch {
+            resolve(null);
+          }
+        },
+        onerror: () => resolve(null),
+      });
+    });
+  }
+
+  function mergePostFromRemote(cached, remote) {
+    const parsed = parsePost(remote);
+    if (!parsed) return cached;
+    return normalizePost({ ...cached, ...parsed });
+  }
+
+  function postMetadataChanged(before, after) {
+    return before.prompt !== after.prompt
+      || before.thumbnail !== after.thumbnail
+      || before.mediaUrl !== after.mediaUrl
+      || before.createTime !== after.createTime
+      || (before.videoCount ?? 0) !== (after.videoCount ?? 0)
+      || (before.childPostCount ?? 0) !== (after.childPostCount ?? 0)
+      || (before.childImageCount ?? 0) !== (after.childImageCount ?? 0)
+      || (before.childVideoCount ?? 0) !== (after.childVideoCount ?? 0)
+      || (before.model || '') !== (after.model || '')
+      || (before.mediaType || '') !== (after.mediaType || '');
+  }
+
+  /** Refresh child/video counts and prompts for the N newest cached posts. */
+  async function refreshRecentPostsMetadata(statusEl) {
+    const n = Math.min(RECENT_REFRESH_COUNT, allPosts.length);
+    if (n === 0) return 0;
+
+    const updated = [];
+    for (let i = 0; i < n; i++) {
+      const cached = allPosts[i];
+      const remote = await fetchRemotePost(cached.id);
+      if (remote) {
+        const merged = mergePostFromRemote(cached, remote);
+        if (postMetadataChanged(cached, merged)) {
+          allPosts[i] = merged;
+          updated.push(merged);
+        }
+      }
+      if (statusEl && (i + 1) % 10 === 0) {
+        statusEl.textContent = `refreshing… ${i + 1}/${n}`;
+      }
+      await sleep(RECENT_REFRESH_DELAY_MS);
+    }
+
+    if (updated.length > 0) {
+      await dbPutMany(updated);
+      console.log(`[GrokSearch] Refreshed metadata for ${updated.length} recent post(s)`);
+    }
+    return updated.length;
+  }
+
+  function formatSyncStatusMessage(newCount, refreshedCount) {
+    const parts = [];
+    if (newCount > 0) parts.push(`+${newCount} new`);
+    if (refreshedCount > 0) parts.push(`${refreshedCount} updated`);
+    if (!parts.length) return 'up to date';
+    return `${parts.join(', ')} (${allPosts.length.toLocaleString()} total)`;
+  }
+
+  async function runIncrementalSync(reason, options = {}) {
+    const { refreshRecent = true, quiet = false } = options;
+    if (!isImagineListPage()) return;
+    if (indexing || syncInProgress || !loaded) return;
+
+    const now = Date.now();
+    if (reason === 'focus' && now - lastIncrementalSyncAt < SYNC_FOCUS_MIN_INTERVAL_MS) return;
+
+    syncInProgress = true;
+    const statusEl = document.getElementById('grok-stamp-status');
+    try {
+      if (!db) db = await openDB();
+      if (!quiet && statusEl) statusEl.textContent = 'checking for new…';
+      const newCount = await fetchNewPosts(statusEl);
+      let refreshedCount = 0;
+      if (refreshRecent) {
+        if (!quiet && statusEl) statusEl.textContent = 'refreshing recent…';
+        refreshedCount = await refreshRecentPostsMetadata(statusEl);
+      }
+      lastIncrementalSyncAt = Date.now();
+      if (!quiet && statusEl) {
+        statusEl.textContent = formatSyncStatusMessage(newCount, refreshedCount);
+        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
+      }
+      if (newCount > 0 || refreshedCount > 0) applyFilter();
+      console.log(`[GrokSearch] Sync (${reason}): +${newCount} new, ${refreshedCount} metadata updated`);
+    } catch (e) {
+      console.error(`[GrokSearch] Sync failed (${reason}):`, e);
+      if (!quiet && statusEl) statusEl.textContent = 'sync failed';
+    } finally {
+      syncInProgress = false;
+    }
+  }
+
+  function scheduleIncrementalSync(reason, options = {}) {
+    clearTimeout(syncDebounceTimer);
+    const delay = reason === 'navigation' ? 400 : 600;
+    syncDebounceTimer = setTimeout(() => runIncrementalSync(reason, options), delay);
   }
 
   async function reindexDatabase() {
@@ -348,10 +482,11 @@
         }
         if (statusEl) statusEl.textContent = 'checking for new…';
         const newCount = await fetchNewPosts(statusEl);
+        if (statusEl) statusEl.textContent = 'refreshing recent…';
+        const refreshedCount = await refreshRecentPostsMetadata(statusEl);
+        lastIncrementalSyncAt = Date.now();
         if (statusEl) {
-          statusEl.textContent = newCount > 0
-            ? `+${newCount} new (${allPosts.length.toLocaleString()} total)`
-            : 'up to date';
+          statusEl.textContent = formatSyncStatusMessage(newCount, refreshedCount);
           setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
         }
       } else {
@@ -2208,7 +2343,7 @@
 
   let initiated = false;
   function init() {
-    if (!location.href.includes('/imagine')) return;
+    if (!isImagineListPage()) return;
     if (initiated) return;
     initiated = true;
     injectStyles();
@@ -2216,12 +2351,19 @@
     setTimeout(loadAllPosts, 1000);
   }
 
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      scheduleIncrementalSync('focus');
+    }
+  });
+
   let lastUrl = location.href;
   let domEnforceTimer = null;
   new MutationObserver(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       setTimeout(init, 800);
+      if (isImagineListPage()) scheduleIncrementalSync('navigation');
       return;
     }
     if (!searchBarExpanded) {
@@ -2238,5 +2380,5 @@
   }).observe(document.body, { childList: true, subtree: true });
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-  else init();
+  else if (isImagineListPage()) init();
 })();
