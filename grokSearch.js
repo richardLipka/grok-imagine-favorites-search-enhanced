@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.30
+// @version      1.31
 // @description  Search saved Grok media; child posts in DB with own dates in results. Fast list/deep sync. Per-page count, sliders, filters, results panel.
 // @author       AnnaLynn (with fixes), Richard Lipka (modifications)
 // @match        https://grok.com/imagine*
@@ -174,10 +174,12 @@
   }
 
   function normalizePost(post) {
+    const isChild = Boolean(post.isChild);
     return {
       ...post,
-      isChild: Boolean(post.isChild),
+      isChild,
       parentId: post.parentId || null,
+      parentPrompt: isChild ? String(post.parentPrompt || '') : null,
       childPostCount: post.childPostCount ?? 0,
       childImageCount: post.childImageCount ?? 0,
       childVideoCount: post.childVideoCount ?? 0,
@@ -203,20 +205,40 @@
       mediaType: post.mediaType || '',
       isChild: false,
       parentId: null,
+      parentPrompt: null,
       ...counts,
     };
   }
 
+  function getParentPrompt(parentRaw, parentParsed) {
+    return String(
+      parentParsed?.prompt || parentRaw?.prompt || parentRaw?.originalPrompt || ''
+    ).trim();
+  }
+
+  /** Text used for prompt search (child rows include parentPrompt). */
+  function getSearchablePromptText(post) {
+    const own = String(post.prompt || '').trim();
+    if (!isChildPost(post)) return own.toLowerCase();
+    const parent = String(post.parentPrompt || '').trim();
+    const parts = [];
+    if (own) parts.push(own);
+    if (parent && parent !== own) parts.push(parent);
+    return parts.join(' ').toLowerCase();
+  }
+
   function parseChildPost(parentRaw, childRaw, parentParsed) {
     if (!childRaw?.id || !parentParsed?.id) return null;
-    const parentPrompt = parentParsed.prompt || parentRaw.prompt || parentRaw.originalPrompt || '';
-    const prompt = (childRaw.prompt || childRaw.originalPrompt || parentPrompt || '').trim();
+    const parentPrompt = getParentPrompt(parentRaw, parentParsed);
+    const ownPrompt = String(childRaw.prompt || childRaw.originalPrompt || '').trim();
+    const prompt = ownPrompt || parentPrompt;
     const isVideo = isVideoMediaType(childRaw.mediaType);
     return normalizePost({
       id: String(childRaw.id),
       parentId: String(parentParsed.id),
       isChild: true,
       prompt,
+      parentPrompt,
       thumbnail: childRaw.thumbnailImageUrl || childRaw.thumbnail || childRaw.mediaUrl || '',
       mediaUrl: childRaw.mediaUrl || childRaw.hdMediaUrl || '',
       createTime: childRaw.createTime || childRaw.createdAt || childRaw.create_time
@@ -330,7 +352,26 @@
       || (before.model || '') !== (after.model || '')
       || (before.mediaType || '') !== (after.mediaType || '')
       || Boolean(before.isChild) !== Boolean(after.isChild)
-      || (before.parentId || '') !== (after.parentId || '');
+      || (before.parentId || '') !== (after.parentId || '')
+      || (before.parentPrompt || '') !== (after.parentPrompt || '');
+  }
+
+  function backfillChildParentPrompts() {
+    const parentPromptById = new Map();
+    for (const p of allPosts) {
+      if (!isChildPost(p)) parentPromptById.set(p.id, p.prompt || '');
+    }
+    const updated = [];
+    for (let i = 0; i < allPosts.length; i++) {
+      const p = allPosts[i];
+      if (!isChildPost(p) || !p.parentId) continue;
+      const nextParentPrompt = parentPromptById.get(p.parentId) || '';
+      if ((p.parentPrompt || '') === nextParentPrompt) continue;
+      const row = normalizePost({ ...p, parentPrompt: nextParentPrompt });
+      allPosts[i] = row;
+      updated.push(row);
+    }
+    return updated;
   }
 
   function postNeedsDeepRefresh(post) {
@@ -584,7 +625,7 @@
       }
       const payload = {
         exportedAt: new Date().toISOString(),
-        schemaVersion: 2,
+        schemaVersion: 3,
         source: DB_NAME,
         count: posts.length,
         posts,
@@ -710,6 +751,8 @@
           allPosts.push(normalizePost(p));
         }
         sortAllPostsNewestFirst();
+        const backfilled = backfillChildParentPrompts();
+        if (backfilled.length) await dbPutMany(backfilled);
         loaded = true;
         console.log(`[GrokSearch] ${allPosts.length} posts loaded from IndexedDB`);
         if (statusEl) {
@@ -1166,7 +1209,7 @@
 
     matchedPosts = allPosts.filter(post => {
       if (terms.length > 0) {
-        const p = (post.prompt || '').toLowerCase();
+        const p = getSearchablePromptText(post);
         if (!terms.every(t => p.includes(t))) return false;
       }
       if (!matchesDateFilter(post)) return false;
