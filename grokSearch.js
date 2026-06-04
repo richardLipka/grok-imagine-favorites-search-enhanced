@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.26
+// @version      1.27
 // @description  Search saved Grok media by prompt and date. Per-page count and thumbnail size sliders. Min video/child filters. Results-only panel with scrollable viewport.
 // @author       AnnaLynn (with fixes), Richard Lipka (modifications)
 // @match        https://grok.com/imagine*
@@ -246,6 +246,15 @@
     }
   }
 
+  function sortAllPostsNewestFirst() {
+    allPosts.sort((a, b) => {
+      const ta = a.createTime ? new Date(a.createTime).getTime() : 0;
+      const tb = b.createTime ? new Date(b.createTime).getTime() : 0;
+      return tb - ta;
+    });
+  }
+
+  /** Incremental sync: walk liked feed from newest until a page has no new IDs. */
   async function fetchNewPosts(statusEl) {
     let cursor = null;
     let newCount = 0;
@@ -254,23 +263,33 @@
       const data = await fetchPage(cursor);
       if (!data) break;
       const posts = data.posts || [];
-      let hitKnown = false;
+      if (posts.length === 0) break;
+
+      let pageNew = 0;
       for (const post of posts) {
-        if (knownIds.has(post.id)) { hitKnown = true; break; }
+        if (knownIds.has(post.id)) continue;
         const parsed = parsePost(post);
-        if (parsed) { newPosts.push(parsed); newCount++; }
+        if (!parsed) continue;
+        newPosts.push(parsed);
+        newCount++;
+        pageNew++;
       }
-      if (hitKnown || !data.nextCursor || posts.length === 0) break;
+
+      if (pageNew === 0) break;
+      if (!data.nextCursor) break;
       cursor = data.nextCursor;
       if (statusEl) statusEl.textContent = `checking new… +${newCount}`;
       await sleep(100);
     }
+
     if (newPosts.length > 0) {
-      for (const p of newPosts) {
-        allPosts.unshift(p);
-        knownIds.add(p.id);
-      }
+      for (const p of newPosts) knownIds.add(p.id);
+      allPosts = [...newPosts, ...allPosts];
+      sortAllPostsNewestFirst();
       await dbPutMany(newPosts);
+      console.log(`[GrokSearch] Incremental sync: +${newCount} new post(s)`);
+    } else {
+      console.log('[GrokSearch] Incremental sync: up to date');
     }
     return newCount;
   }
@@ -311,51 +330,47 @@
     const statusEl = document.getElementById('grok-stamp-status');
     try {
       db = await openDB();
+      const cached = await dbGetAll();
+      if (cached.length > 0) {
+        const seen = new Set();
+        for (const p of cached) {
+          if (seen.has(p.id)) continue;
+          seen.add(p.id);
+          knownIds.add(p.id);
+          allPosts.push(normalizePost(p));
+        }
+        sortAllPostsNewestFirst();
+        loaded = true;
+        console.log(`[GrokSearch] ${allPosts.length} posts loaded from IndexedDB`);
+        if (statusEl) {
+          statusEl.textContent = `${allPosts.length.toLocaleString()} cached`;
+          setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2000);
+        }
+        if (statusEl) statusEl.textContent = 'checking for new…';
+        const newCount = await fetchNewPosts(statusEl);
+        if (statusEl) {
+          statusEl.textContent = newCount > 0
+            ? `+${newCount} new (${allPosts.length.toLocaleString()} total)`
+            : 'up to date';
+          setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
+        }
+      } else {
+        if (statusEl) statusEl.textContent = 'first-time indexing…';
+        const count = await fetchFullIndex(statusEl);
+        loaded = true;
+        console.log(`[GrokSearch] Full index done: ${count} posts`);
+        if (statusEl) {
+          statusEl.textContent = `${count.toLocaleString()} indexed`;
+          setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
+        }
+      }
     } catch (e) {
-      console.error('[GrokSearch] IndexedDB failed:', e);
-      if (statusEl) statusEl.textContent = 'DB error';
-      return;
+      console.error('[GrokSearch] loadAllPosts failed:', e);
+      if (statusEl) statusEl.textContent = 'load failed';
+    } finally {
+      indexing = false;
+      if (loaded) applyFilter();
     }
-    const cached = await dbGetAll();
-    if (cached.length > 0) {
-      const seen = new Set();
-      for (const p of cached) {
-        if (seen.has(p.id)) continue;
-        seen.add(p.id);
-        knownIds.add(p.id);
-        allPosts.push(normalizePost(p));
-      }
-      allPosts.sort((a, b) => {
-        const ta = a.createTime ? new Date(a.createTime).getTime() : 0;
-        const tb = b.createTime ? new Date(b.createTime).getTime() : 0;
-        return tb - ta;
-      });
-      loaded = true;
-      console.log(`[GrokSearch] ${allPosts.length} posts loaded from IndexedDB`);
-      if (statusEl) {
-        statusEl.textContent = `${allPosts.length.toLocaleString()} cached`;
-        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2000);
-      }
-      if (statusEl) statusEl.textContent = 'checking for new…';
-      const newCount = await fetchNewPosts(statusEl);
-      if (statusEl) {
-        statusEl.textContent = newCount > 0
-          ? `+${newCount} new (${allPosts.length.toLocaleString()} total)`
-          : 'up to date';
-        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
-      }
-    } else {
-      if (statusEl) statusEl.textContent = 'first-time indexing…';
-      const count = await fetchFullIndex(statusEl);
-      loaded = true;
-      console.log(`[GrokSearch] Full index done: ${count} posts`);
-      if (statusEl) {
-        statusEl.textContent = `${count.toLocaleString()} indexed`;
-        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
-      }
-    }
-    indexing = false;
-    applyFilter();
   }
 
   // ─── Results ───────────────────────────────────────────────────────────────
