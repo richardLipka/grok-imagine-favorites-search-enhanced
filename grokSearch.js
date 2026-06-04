@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.33
+// @version      1.34
 // @description  Search saved Grok media; child posts in DB with own dates in results. Fast list/deep sync. Per-page count, sliders, filters, results panel.
 // @author       AnnaLynn (with fixes), Richard Lipka (modifications)
 // @match        https://grok.com/imagine*
@@ -156,18 +156,29 @@
     return t === 'MEDIA_POST_TYPE_VIDEO' || t.includes('VIDEO');
   }
 
+  /** Walk entire childPosts tree (all generations). */
+  function walkDescendantPosts(node, visitor) {
+    const children = node?.childPosts || [];
+    for (const child of children) {
+      visitor(child);
+      walkDescendantPosts(child, visitor);
+    }
+  }
+
+  /** Aggregate counts for root/parent over full descendant tree. */
   function extractChildMediaCounts(post) {
-    const children = post.childPosts || [];
+    let childPostCount = 0;
     let childImageCount = 0;
     let childVideoCount = 0;
-    for (const child of children) {
+    walkDescendantPosts(post, child => {
+      childPostCount++;
       if (isVideoMediaType(child.mediaType)) childVideoCount++;
       else childImageCount++;
-    }
+    });
     const parentIsVideo = isVideoMediaType(post.mediaType);
     const videoCount = (parentIsVideo ? 1 : 0) + childVideoCount;
     return {
-      childPostCount: children.length,
+      childPostCount,
       childImageCount,
       childVideoCount,
       videoCount,
@@ -280,10 +291,13 @@
 
   function collectChildRecords(parentRaw, parentParsed) {
     const records = [];
-    for (const child of parentRaw.childPosts || []) {
+    const seen = new Set();
+    walkDescendantPosts(parentRaw, child => {
+      if (!child?.id || seen.has(child.id)) return;
+      seen.add(child.id);
       const parsed = parseChildPost(parentRaw, child, parentParsed);
       if (parsed) records.push(stampMetadataRefreshed(parsed));
-    }
+    });
     return records;
   }
 
@@ -1405,13 +1419,13 @@
     const childImages = post.childImageCount ?? 0;
     const parts = [];
     if (videos > 0) {
-      parts.push(`<span class="grok-badge grok-badge-video" title="${videos} video${videos !== 1 ? 's' : ''}">
+      parts.push(`<span class="grok-badge grok-badge-video" title="${videos} video${videos !== 1 ? 's' : ''} (incl. all descendants)">
         <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
         <span>${videos}</span>
       </span>`);
     }
     if (childImages > 0) {
-      parts.push(`<span class="grok-badge grok-badge-images" title="${childImages} child image${childImages !== 1 ? 's' : ''}">
+      parts.push(`<span class="grok-badge grok-badge-images" title="${childImages} descendant image${childImages !== 1 ? 's' : ''} (all generations)">
         <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
           <rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="11" r="1.5"/><path d="m21 15-5-5L5 19"/>
         </svg>
