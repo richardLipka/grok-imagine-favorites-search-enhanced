@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.32
+// @version      1.33
 // @description  Search saved Grok media; child posts in DB with own dates in results. Fast list/deep sync. Per-page count, sliders, filters, results panel.
 // @author       AnnaLynn (with fixes), Richard Lipka (modifications)
 // @match        https://grok.com/imagine*
@@ -1443,6 +1443,42 @@
     return Boolean(dateKey && dateStart === dateKey && dateEnd === dateKey);
   }
 
+  function hasSingleDayFilter() {
+    return Boolean(dateStart && dateEnd && dateStart === dateEnd);
+  }
+
+  function addDaysToDateKey(dateKey, deltaDays) {
+    const d = new Date(`${dateKey}T12:00:00`);
+    if (Number.isNaN(d.getTime())) return dateKey;
+    d.setDate(d.getDate() + deltaDays);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  function shiftSingleDayFilter(deltaDays) {
+    if (!hasSingleDayFilter()) return;
+    const nextKey = addDaysToDateKey(dateStart, deltaDays);
+    dateStart = nextKey;
+    dateEnd = nextKey;
+    const dateStartEl = document.getElementById('grok-date-start');
+    const dateEndEl = document.getElementById('grok-date-end');
+    if (dateStartEl) dateStartEl.value = dateStart;
+    if (dateEndEl) dateEndEl.value = dateEnd;
+    currentPage = 0;
+    updateClearButton();
+    applyFilter();
+  }
+
+  function updateDateNavButtons() {
+    const prevBtn = document.getElementById('grok-date-prev');
+    const nextBtn = document.getElementById('grok-date-next');
+    const enabled = hasSingleDayFilter();
+    if (prevBtn) prevBtn.disabled = !enabled;
+    if (nextBtn) nextBtn.disabled = !enabled;
+  }
+
   function applyDateFilterForDay(dateKey) {
     if (!dateKey) return;
     if (isFilteredToSingleDay(dateKey)) {
@@ -1458,6 +1494,7 @@
     if (dateEndEl) dateEndEl.value = dateEnd;
     currentPage = 0;
     updateClearButton();
+    updateDateNavButtons();
     applyFilter();
   }
 
@@ -1679,6 +1716,53 @@
   function updateClearButton() {
     const clearBtn = document.getElementById('grok-search-clear');
     if (clearBtn) clearBtn.classList.toggle('visible', hasActiveFilter());
+    updateDateNavButtons();
+  }
+
+  const DATE_NAV_PREV_SVG = `<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="7,1 3,5 7,9"/></svg>`;
+  const DATE_NAV_NEXT_SVG = `<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="3,1 7,5 3,9"/></svg>`;
+
+  function createDateNavButton(id, title, svgHtml) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = id;
+    btn.className = 'grok-date-nav-btn icon-only';
+    btn.title = title;
+    btn.setAttribute('aria-label', title);
+    btn.disabled = true;
+    btn.innerHTML = svgHtml;
+    return btn;
+  }
+
+  function ensureDateNavButtons() {
+    const filters = getFiltersRow();
+    if (!filters) return;
+
+    let prevBtn = document.getElementById('grok-date-prev');
+    let nextBtn = document.getElementById('grok-date-next');
+    const startEl = document.getElementById('grok-date-start');
+    const endEl = document.getElementById('grok-date-end');
+
+    if (!prevBtn) {
+      prevBtn = createDateNavButton('grok-date-prev', 'Previous day', DATE_NAV_PREV_SVG);
+      if (startEl) filters.insertBefore(prevBtn, startEl);
+      else filters.prepend(prevBtn);
+    }
+    if (!nextBtn) {
+      nextBtn = createDateNavButton('grok-date-next', 'Next day', DATE_NAV_NEXT_SVG);
+      if (endEl) endEl.insertAdjacentElement('afterend', nextBtn);
+      else filters.appendChild(nextBtn);
+    }
+
+    if (!prevBtn.dataset.grokDateNavBound) {
+      prevBtn.dataset.grokDateNavBound = '1';
+      prevBtn.addEventListener('click', () => shiftSingleDayFilter(-1));
+    }
+    if (!nextBtn.dataset.grokDateNavBound) {
+      nextBtn.dataset.grokDateNavBound = '1';
+      nextBtn.addEventListener('click', () => shiftSingleDayFilter(1));
+    }
+    updateDateNavButtons();
   }
 
   // ─── Styles ────────────────────────────────────────────────────────────────
@@ -1844,6 +1928,24 @@
       .grok-date-input:hover { border-color: rgba(139,92,246,0.5); }
       .grok-date-input:focus { border-color: rgba(139,92,246,0.6); color: #fff; }
       .grok-date-sep { color: rgba(255,255,255,0.35); font-size: 11px; flex-shrink: 0; }
+      .grok-date-nav-btn {
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0; width: 28px; height: 28px; padding: 0;
+        border-radius: 8px; border: 1px solid rgba(255,255,255,0.15);
+        background: rgba(255,255,255,0.07); color: rgba(255,255,255,0.85);
+        cursor: pointer; transition: border-color 0.15s, background 0.15s, opacity 0.15s;
+      }
+      .grok-date-nav-btn:hover:not(:disabled) {
+        border-color: rgba(139,92,246,0.55);
+        background: rgba(139,92,246,0.22);
+        color: #fff;
+      }
+      .grok-date-nav-btn:disabled {
+        opacity: 0.28;
+        cursor: default;
+        pointer-events: none;
+      }
+      .grok-date-nav-btn svg { display: block; }
       #grok-search-bar:focus-within {
         border-color: rgba(139,92,246,0.6);
         box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 0 3px rgba(139,92,246,0.15);
@@ -2273,7 +2375,8 @@
     const ids = [
       'grok-results-only-label', 'grok-search-icon', 'grok-search-input',
       'grok-stamp-status', 'grok-search-count', 'grok-sort-select',
-      'grok-date-start', 'grok-date-end', 'grok-filter-video-label',
+      'grok-date-prev', 'grok-date-start', 'grok-date-end', 'grok-date-next',
+      'grok-filter-video-label',
       'grok-filter-children-label', 'grok-search-clear',
       'grok-export-json-btn', 'grok-reindex-btn',
     ];
@@ -2299,7 +2402,7 @@
     const filters = document.createElement('div');
     filters.id = 'grok-bar-filters';
     filters.className = 'grok-bar-filters';
-    ['grok-date-start'].forEach(id => { if (nodes[id]) filters.appendChild(nodes[id]); });
+    ['grok-date-prev', 'grok-date-start'].forEach(id => { if (nodes[id]) filters.appendChild(nodes[id]); });
     if (dateSep) filters.appendChild(dateSep);
     else {
       const sep = document.createElement('span');
@@ -2308,6 +2411,7 @@
       filters.appendChild(sep);
     }
     if (nodes['grok-date-end']) filters.appendChild(nodes['grok-date-end']);
+    if (nodes['grok-date-next']) filters.appendChild(nodes['grok-date-next']);
     ['grok-filter-video-label', 'grok-filter-children-label', 'grok-search-clear']
       .forEach(id => { if (nodes[id]) filters.appendChild(nodes[id]); });
 
@@ -2322,6 +2426,7 @@
     bar.appendChild(bottom);
 
     if (resultsRow.childElementCount > 0) wrap.insertBefore(resultsRow, bar);
+    ensureDateNavButtons();
     bindMediaFilterListeners();
   }
 
@@ -2527,6 +2632,7 @@
       ensureReindexButton();
       ensureMediaFilterCheckboxes();
       ensureDisplayControls();
+      ensureDateNavButtons();
       ensureSearchBarToggle();
       return;
     }
@@ -2563,9 +2669,11 @@
         </div>
         <div class="grok-bar-bottom">
           <div id="grok-bar-filters" class="grok-bar-filters">
+            <button type="button" id="grok-date-prev" class="grok-date-nav-btn icon-only" title="Previous day" aria-label="Previous day" disabled>${DATE_NAV_PREV_SVG}</button>
             <input id="grok-date-start" class="grok-date-input" type="date" title="From date" aria-label="From date" />
             <span class="grok-date-sep">–</span>
             <input id="grok-date-end" class="grok-date-input" type="date" title="To date" aria-label="To date" />
+            <button type="button" id="grok-date-next" class="grok-date-nav-btn icon-only" title="Next day" aria-label="Next day" disabled>${DATE_NAV_NEXT_SVG}</button>
             <label id="grok-filter-video-label" class="grok-filter-check-label" title="Show only items with at least N videos">
               <input type="checkbox" id="grok-filter-video" />
               Only with video
@@ -2649,6 +2757,7 @@
     syncMediaMinSelects();
     bindDisplayControlListeners();
     bindMediaFilterListeners();
+    ensureDateNavButtons();
     updateClearButton();
     const prevBtn = document.getElementById('grok-page-prev');
     const nextBtn = document.getElementById('grok-page-next');
