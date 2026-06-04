@@ -3,7 +3,9 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.35
 // @description  Search saved Grok media; child posts in DB with own dates in results. Fast list/deep sync. Per-page count, sliders, filters, results panel.
-// @author       AnnaLynn (with fixes), Richard Lipka (modifications)
+// @author       AnnaLynn (original), Richard Lipka (enhanced fork)
+// @homepage     https://github.com/YOUR_USER/YOUR_REPO
+// @supportURL   https://github.com/YOUR_USER/YOUR_REPO/issues
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
 // @connect      grok.com
