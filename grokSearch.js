@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.34
+// @version      1.35
 // @description  Search saved Grok media; child posts in DB with own dates in results. Fast list/deep sync. Per-page count, sliders, filters, results panel.
 // @author       AnnaLynn (with fixes), Richard Lipka (modifications)
 // @match        https://grok.com/imagine*
@@ -1311,15 +1311,14 @@
     const parentPromptById = terms.length > 0 ? buildParentPromptIndex() : null;
 
     matchedPosts = allPosts.filter(post => {
+      if ((filterOnlyVideo || filterOnlyChildren) && isChildPost(post)) return false;
       if (terms.length > 0) {
         const p = getSearchablePromptText(post, parentPromptById);
         if (!terms.every(t => p.includes(t))) return false;
       }
       if (!matchesDateFilter(post)) return false;
       if (filterOnlyVideo && (post.videoCount ?? 0) < filterMinVideos) return false;
-      if (filterOnlyChildren && !isChildPost(post) && (post.childPostCount ?? 0) < filterMinChildren) {
-        return false;
-      }
+      if (filterOnlyChildren && (post.childPostCount ?? 0) < filterMinChildren) return false;
       return true;
     });
 
