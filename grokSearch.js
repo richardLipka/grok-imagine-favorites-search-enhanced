@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.28
-// @description  Search saved Grok media by prompt and date. Sync on focus and navigation; refresh recent metadata. Per-page count, thumbnail sliders, video/child filters, results panel.
+// @version      1.29
+// @description  Search saved Grok media by prompt and date. Fast sync: list-API metadata refresh (incl. children) plus parallel deep refresh. Per-page count, sliders, filters, results panel.
 // @author       AnnaLynn (with fixes), Richard Lipka (modifications)
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
@@ -29,9 +29,14 @@
   const GRID_SIZE_MAX_PCT = 200;
   const ENDPOINT = 'https://grok.com/rest/media/post/list';
   const POST_GET = 'https://grok.com/rest/media/post/get';
-  const RECENT_REFRESH_COUNT = 50;
-  const RECENT_REFRESH_DELAY_MS = 120;
+  /** Liked-list pages to walk for metadata (40 posts/page; includes childPosts). */
+  const SYNC_LIST_REFRESH_PAGES = 4;
+  const SYNC_LIST_PAGE_DELAY_MS = 40;
+  /** Parallel post/get for items with children (full child tree from API). */
+  const SYNC_DEEP_REFRESH_LIMIT = 24;
+  const SYNC_DEEP_CONCURRENCY = 5;
   const SYNC_FOCUS_MIN_INTERVAL_MS = 60 * 1000;
+  const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const DB_NAME = 'GrokSearchIndex';
   const DB_VERSION = 1;
   const STORE_NAME = 'posts';
@@ -230,31 +235,147 @@
       || (before.mediaType || '') !== (after.mediaType || '');
   }
 
-  /** Refresh child/video counts and prompts for the N newest cached posts. */
-  async function refreshRecentPostsMetadata(statusEl) {
-    const n = Math.min(RECENT_REFRESH_COUNT, allPosts.length);
-    if (n === 0) return 0;
+  function postNeedsDeepRefresh(post) {
+    return (post.childPostCount ?? 0) > 0
+      || (post.childImageCount ?? 0) > 0
+      || (post.childVideoCount ?? 0) > 0
+      || (post.videoCount ?? 0) > 1;
+  }
 
-    const updated = [];
-    for (let i = 0; i < n; i++) {
-      const cached = allPosts[i];
-      const remote = await fetchRemotePost(cached.id);
-      if (remote) {
-        const merged = mergePostFromRemote(cached, remote);
+  function stampMetadataRefreshed(post) {
+    return { ...post, [METADATA_REFRESH_KEY]: Date.now() };
+  }
+
+  function buildPostIdIndex() {
+    return new Map(allPosts.map((p, i) => [p.id, i]));
+  }
+
+  async function runPool(items, concurrency, fn) {
+    if (!items.length) return [];
+    const results = new Array(items.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (next < items.length) {
+        const i = next++;
+        results[i] = await fn(items[i], i);
+      }
+    });
+    await Promise.all(workers);
+    return results;
+  }
+
+  /**
+   * New posts from liked list + in-place metadata refresh (child counts from childPosts on list payload).
+   */
+  async function syncLikedFeed(statusEl) {
+    const idToIndex = buildPostIdIndex();
+    const listUpdatedIds = new Set();
+    const newPosts = [];
+    const updatedPosts = [];
+    let newCount = 0;
+    let listUpdatedCount = 0;
+    let cursor = null;
+    let pageIndex = 0;
+
+    while (true) {
+      const data = await fetchPage(cursor);
+      if (!data) break;
+      const posts = data.posts || [];
+      if (posts.length === 0) break;
+
+      const refreshThisPage = pageIndex < SYNC_LIST_REFRESH_PAGES;
+      let pageNew = 0;
+
+      for (const raw of posts) {
+        const parsed = parsePost(raw);
+        if (!parsed) continue;
+
+        if (!knownIds.has(parsed.id)) {
+          newPosts.push(stampMetadataRefreshed(parsed));
+          pageNew++;
+          continue;
+        }
+
+        if (!refreshThisPage) continue;
+
+        const idx = idToIndex.get(parsed.id);
+        if (idx === undefined) continue;
+
+        const cached = allPosts[idx];
+        const merged = stampMetadataRefreshed(normalizePost({ ...cached, ...parsed }));
         if (postMetadataChanged(cached, merged)) {
-          allPosts[i] = merged;
-          updated.push(merged);
+          allPosts[idx] = merged;
+          updatedPosts.push(merged);
+          listUpdatedIds.add(parsed.id);
+          listUpdatedCount++;
         }
       }
-      if (statusEl && (i + 1) % 10 === 0) {
-        statusEl.textContent = `refreshing… ${i + 1}/${n}`;
+
+      pageIndex++;
+      const needNewPages = pageNew > 0;
+      const needRefreshPages = pageIndex < SYNC_LIST_REFRESH_PAGES;
+      if (!needNewPages && !needRefreshPages) break;
+      if (!data.nextCursor) break;
+
+      cursor = data.nextCursor;
+      if (statusEl) {
+        statusEl.textContent = `syncing… +${newPosts.length + pageNew} new, ${listUpdatedCount} updated`;
       }
-      await sleep(RECENT_REFRESH_DELAY_MS);
+      await sleep(SYNC_LIST_PAGE_DELAY_MS);
     }
+
+    if (newPosts.length > 0) {
+      for (const p of newPosts) knownIds.add(p.id);
+      allPosts = [...newPosts, ...allPosts];
+      sortAllPostsNewestFirst();
+      await dbPutMany(newPosts);
+      newCount = newPosts.length;
+      console.log(`[GrokSearch] +${newCount} new post(s) from liked list`);
+    }
+
+    if (updatedPosts.length > 0) {
+      await dbPutMany(updatedPosts);
+      console.log(`[GrokSearch] List refresh: ${listUpdatedCount} post(s) (incl. child counts)`);
+    }
+
+    const deepUpdatedCount = await refreshPostsViaGet(statusEl, listUpdatedIds, buildPostIdIndex());
+    return { newCount, updatedCount: listUpdatedCount + deepUpdatedCount, listUpdatedIds };
+  }
+
+  /** post/get for recent items with children — parallel, skips rows already updated from list. */
+  async function refreshPostsViaGet(statusEl, skipIds, idToIndex) {
+    const withChildren = [];
+    const rest = [];
+    for (const p of allPosts) {
+      if (skipIds.has(p.id)) continue;
+      if (postNeedsDeepRefresh(p)) withChildren.push(p);
+      else rest.push(p);
+      if (withChildren.length >= SYNC_DEEP_REFRESH_LIMIT
+        && withChildren.length + rest.length >= SYNC_DEEP_REFRESH_LIMIT * 2) break;
+    }
+    const targets = [...withChildren, ...rest].slice(0, SYNC_DEEP_REFRESH_LIMIT);
+    if (!targets.length) return 0;
+
+    const updated = [];
+    let done = 0;
+
+    await runPool(targets, SYNC_DEEP_CONCURRENCY, async cached => {
+      const remote = await fetchRemotePost(cached.id);
+      done++;
+      if (statusEl && done % 6 === 0) {
+        statusEl.textContent = `deep refresh… ${done}/${targets.length}`;
+      }
+      if (!remote) return;
+      const merged = stampMetadataRefreshed(mergePostFromRemote(cached, remote));
+      if (!postMetadataChanged(cached, merged)) return;
+      const idx = idToIndex.get(cached.id);
+      if (idx !== undefined) allPosts[idx] = merged;
+      updated.push(merged);
+    });
 
     if (updated.length > 0) {
       await dbPutMany(updated);
-      console.log(`[GrokSearch] Refreshed metadata for ${updated.length} recent post(s)`);
+      console.log(`[GrokSearch] Deep refresh (post/get): ${updated.length} post(s) with child/video data`);
     }
     return updated.length;
   }
@@ -279,13 +400,10 @@
     const statusEl = document.getElementById('grok-stamp-status');
     try {
       if (!db) db = await openDB();
-      if (!quiet && statusEl) statusEl.textContent = 'checking for new…';
-      const newCount = await fetchNewPosts(statusEl);
-      let refreshedCount = 0;
-      if (refreshRecent) {
-        if (!quiet && statusEl) statusEl.textContent = 'refreshing recent…';
-        refreshedCount = await refreshRecentPostsMetadata(statusEl);
-      }
+      if (!quiet && statusEl) statusEl.textContent = 'syncing…';
+      const { newCount, updatedCount: refreshedCount } = refreshRecent
+        ? await syncLikedFeed(statusEl)
+        : await fetchNewPostsOnly(statusEl);
       lastIncrementalSyncAt = Date.now();
       if (!quiet && statusEl) {
         statusEl.textContent = formatSyncStatusMessage(newCount, refreshedCount);
@@ -388,10 +506,9 @@
     });
   }
 
-  /** Incremental sync: walk liked feed from newest until a page has no new IDs. */
-  async function fetchNewPosts(statusEl) {
+  /** New IDs only — no metadata refresh (fast path). */
+  async function fetchNewPostsOnly(statusEl) {
     let cursor = null;
-    let newCount = 0;
     const newPosts = [];
     while (true) {
       const data = await fetchPage(cursor);
@@ -404,16 +521,15 @@
         if (knownIds.has(post.id)) continue;
         const parsed = parsePost(post);
         if (!parsed) continue;
-        newPosts.push(parsed);
-        newCount++;
+        newPosts.push(stampMetadataRefreshed(parsed));
         pageNew++;
       }
 
       if (pageNew === 0) break;
       if (!data.nextCursor) break;
       cursor = data.nextCursor;
-      if (statusEl) statusEl.textContent = `checking new… +${newCount}`;
-      await sleep(100);
+      if (statusEl) statusEl.textContent = `checking new… +${newPosts.length}`;
+      await sleep(SYNC_LIST_PAGE_DELAY_MS);
     }
 
     if (newPosts.length > 0) {
@@ -421,11 +537,8 @@
       allPosts = [...newPosts, ...allPosts];
       sortAllPostsNewestFirst();
       await dbPutMany(newPosts);
-      console.log(`[GrokSearch] Incremental sync: +${newCount} new post(s)`);
-    } else {
-      console.log('[GrokSearch] Incremental sync: up to date');
     }
-    return newCount;
+    return { newCount: newPosts.length, updatedCount: 0 };
   }
 
   async function fetchFullIndex(statusEl) {
@@ -480,10 +593,8 @@
           statusEl.textContent = `${allPosts.length.toLocaleString()} cached`;
           setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2000);
         }
-        if (statusEl) statusEl.textContent = 'checking for new…';
-        const newCount = await fetchNewPosts(statusEl);
-        if (statusEl) statusEl.textContent = 'refreshing recent…';
-        const refreshedCount = await refreshRecentPostsMetadata(statusEl);
+        if (statusEl) statusEl.textContent = 'syncing…';
+        const { newCount, updatedCount: refreshedCount } = await syncLikedFeed(statusEl);
         lastIncrementalSyncAt = Date.now();
         if (statusEl) {
           statusEl.textContent = formatSyncStatusMessage(newCount, refreshedCount);
