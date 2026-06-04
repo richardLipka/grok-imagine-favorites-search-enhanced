@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.31
+// @version      1.32
 // @description  Search saved Grok media; child posts in DB with own dates in results. Fast list/deep sync. Per-page count, sliders, filters, results panel.
 // @author       AnnaLynn (with fixes), Richard Lipka (modifications)
 // @match        https://grok.com/imagine*
@@ -37,6 +37,7 @@
   const SYNC_DEEP_CONCURRENCY = 5;
   const SYNC_FOCUS_MIN_INTERVAL_MS = 60 * 1000;
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
+  const INDEX_SCHEMA_VERSION = 3;
   const DB_NAME = 'GrokSearchIndex';
   const DB_VERSION = 1;
   const STORE_NAME = 'posts';
@@ -106,7 +107,7 @@
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       const store = tx.objectStore(STORE_NAME);
-      posts.forEach(p => store.put(p));
+      posts.forEach(p => store.put(toStorageRecord(p)));
       tx.oncomplete = resolve;
       tx.onerror = e => reject(e.target.error);
     });
@@ -173,18 +174,41 @@
     };
   }
 
-  function normalizePost(post) {
+  /** Canonical index row — all fields persisted to IndexedDB and export. */
+  function toStorageRecord(post) {
     const isChild = Boolean(post.isChild);
-    return {
-      ...post,
-      isChild,
-      parentId: post.parentId || null,
+    const row = {
+      id: String(post.id || ''),
+      prompt: String(post.prompt || ''),
       parentPrompt: isChild ? String(post.parentPrompt || '') : null,
+      parentId: isChild ? String(post.parentId || '') : null,
+      isChild,
+      thumbnail: String(post.thumbnail || ''),
+      mediaUrl: String(post.mediaUrl || ''),
+      createTime: String(post.createTime || ''),
+      model: String(post.model || ''),
+      mediaType: String(post.mediaType || ''),
       childPostCount: post.childPostCount ?? 0,
       childImageCount: post.childImageCount ?? 0,
       childVideoCount: post.childVideoCount ?? 0,
       videoCount: post.videoCount ?? 0,
     };
+    if (post[METADATA_REFRESH_KEY] != null) {
+      row[METADATA_REFRESH_KEY] = post[METADATA_REFRESH_KEY];
+    }
+    return row;
+  }
+
+  function normalizePost(post) {
+    return toStorageRecord(post);
+  }
+
+  function buildParentPromptIndex() {
+    const map = new Map();
+    for (const p of allPosts) {
+      if (!isChildPost(p)) map.set(p.id, String(p.prompt || ''));
+    }
+    return map;
   }
 
   function isChildPost(post) {
@@ -216,14 +240,16 @@
     ).trim();
   }
 
-  /** Text used for prompt search (child rows include parentPrompt). */
-  function getSearchablePromptText(post) {
+  /** Fulltext prompt search — child rows always include parentPrompt (field or live parent lookup). */
+  function getSearchablePromptText(post, parentPromptById) {
     const own = String(post.prompt || '').trim();
     if (!isChildPost(post)) return own.toLowerCase();
-    const parent = String(post.parentPrompt || '').trim();
-    const parts = [];
-    if (own) parts.push(own);
-    if (parent && parent !== own) parts.push(parent);
+
+    let parent = String(post.parentPrompt || '').trim();
+    if (!parent && post.parentId && parentPromptById) {
+      parent = String(parentPromptById.get(post.parentId) || '').trim();
+    }
+    const parts = [...new Set([own, parent].filter(Boolean))];
     return parts.join(' ').toLowerCase();
   }
 
@@ -337,7 +363,28 @@
   function mergePostFromRemote(cached, remote) {
     const parsed = parsePost(remote);
     if (!parsed) return cached;
-    return normalizePost({ ...cached, ...parsed, isChild: false, parentId: null });
+    return normalizePost({
+      ...cached,
+      ...parsed,
+      isChild: false,
+      parentId: null,
+      parentPrompt: null,
+    });
+  }
+
+  async function propagateParentPromptToChildren(parentId, parentPrompt) {
+    const pp = String(parentPrompt || '');
+    const updated = [];
+    for (let i = 0; i < allPosts.length; i++) {
+      const p = allPosts[i];
+      if (!isChildPost(p) || p.parentId !== parentId) continue;
+      if ((p.parentPrompt || '') === pp) continue;
+      const row = stampMetadataRefreshed(normalizePost({ ...p, parentPrompt: pp }));
+      allPosts[i] = row;
+      updated.push(row);
+    }
+    if (updated.length) await dbPutMany(updated);
+    return updated.length;
   }
 
   function postMetadataChanged(before, after) {
@@ -354,6 +401,29 @@
       || Boolean(before.isChild) !== Boolean(after.isChild)
       || (before.parentId || '') !== (after.parentId || '')
       || (before.parentPrompt || '') !== (after.parentPrompt || '');
+  }
+
+  function verifyIndexIntegrity() {
+    const parentPromptById = buildParentPromptIndex();
+    let orphans = 0;
+    let missingParent = 0;
+    let emptySearchText = 0;
+    for (const p of allPosts) {
+      if (!isChildPost(p)) continue;
+      if (!p.parentId) orphans++;
+      else if (!parentPromptById.has(p.parentId)) missingParent++;
+      if (!getSearchablePromptText(p, parentPromptById).trim()) emptySearchText++;
+    }
+    const summary = {
+      total: allPosts.length,
+      parents: allPosts.filter(r => !isChildPost(r)).length,
+      children: allPosts.filter(r => isChildPost(r)).length,
+      orphans,
+      childMissingParent: missingParent,
+      emptySearchText,
+    };
+    console.log('[GrokSearch] Index integrity:', summary);
+    return summary;
   }
 
   function backfillChildParentPrompts() {
@@ -452,6 +522,7 @@
               listUpdatedIds.add(parsed.id);
               listUpdatedCount++;
             }
+            childSyncCount += await propagateParentPromptToChildren(merged.id, merged.prompt);
             const childStats = await syncChildRecordsForParent(raw, merged, idToIndex);
             childSyncCount += childStats.added + childStats.updated + childStats.removed;
             idToIndex = buildPostIdIndex();
@@ -524,6 +595,7 @@
       const idx = idToIndex.get(cached.id);
       if (idx !== undefined) allPosts[idx] = merged;
       if (postMetadataChanged(cached, merged)) updated.push(merged);
+      childSyncCount += await propagateParentPromptToChildren(merged.id, merged.prompt);
       const childStats = await syncChildRecordsForParent(remote, merged, idToIndex);
       childSyncCount += childStats.added + childStats.updated + childStats.removed;
       idToIndex = buildPostIdIndex();
@@ -618,16 +690,29 @@
     const exportBtn = document.getElementById('grok-export-json-btn');
     if (exportBtn) exportBtn.disabled = true;
     try {
-      let posts = allPosts.map(normalizePost);
+      let posts = allPosts.map(toStorageRecord);
       if (!posts.length) {
         if (!db) db = await openDB();
-        posts = (await dbGetAll()).map(normalizePost);
+        posts = (await dbGetAll()).map(toStorageRecord);
       }
+      const parentCount = posts.filter(p => !p.isChild).length;
+      const childCount = posts.filter(p => p.isChild).length;
       const payload = {
         exportedAt: new Date().toISOString(),
-        schemaVersion: 3,
+        schemaVersion: INDEX_SCHEMA_VERSION,
         source: DB_NAME,
         count: posts.length,
+        counts: {
+          total: posts.length,
+          parents: parentCount,
+          children: childCount,
+        },
+        recordFields: [
+          'id', 'prompt', 'parentPrompt', 'parentId', 'isChild',
+          'thumbnail', 'mediaUrl', 'createTime', 'model', 'mediaType',
+          'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount',
+          METADATA_REFRESH_KEY,
+        ],
         posts,
       };
       const json = JSON.stringify(payload, null, 2);
@@ -781,7 +866,10 @@
       if (statusEl) statusEl.textContent = 'load failed';
     } finally {
       indexing = false;
-      if (loaded) applyFilter();
+      if (loaded) {
+        applyFilter();
+        verifyIndexIntegrity();
+      }
     }
   }
 
@@ -1206,10 +1294,11 @@
 
     const queryLower = (currentQuery || '').toLowerCase().trim();
     const terms = queryLower ? queryLower.split(/\s+/).filter(Boolean) : [];
+    const parentPromptById = terms.length > 0 ? buildParentPromptIndex() : null;
 
     matchedPosts = allPosts.filter(post => {
       if (terms.length > 0) {
-        const p = getSearchablePromptText(post);
+        const p = getSearchablePromptText(post, parentPromptById);
         if (!terms.every(t => p.includes(t))) return false;
       }
       if (!matchesDateFilter(post)) return false;
