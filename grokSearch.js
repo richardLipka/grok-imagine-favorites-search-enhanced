@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.29
-// @description  Search saved Grok media by prompt and date. Fast sync: list-API metadata refresh (incl. children) plus parallel deep refresh. Per-page count, sliders, filters, results panel.
+// @version      1.30
+// @description  Search saved Grok media; child posts in DB with own dates in results. Fast list/deep sync. Per-page count, sliders, filters, results panel.
 // @author       AnnaLynn (with fixes), Richard Lipka (modifications)
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
@@ -122,6 +122,18 @@
     });
   }
 
+  function dbDeleteMany(ids) {
+    const unique = [...new Set(ids.filter(Boolean))];
+    if (!unique.length) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      unique.forEach(id => store.delete(id));
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   // ─── API & fetch ───────────────────────────────────────────────────────────
   function fetchPage(cursor) {
     return new Promise(resolve => {
@@ -164,6 +176,8 @@
   function normalizePost(post) {
     return {
       ...post,
+      isChild: Boolean(post.isChild),
+      parentId: post.parentId || null,
       childPostCount: post.childPostCount ?? 0,
       childImageCount: post.childImageCount ?? 0,
       childVideoCount: post.childVideoCount ?? 0,
@@ -171,20 +185,102 @@
     };
   }
 
+  function isChildPost(post) {
+    return Boolean(post?.isChild);
+  }
+
   function parsePost(post) {
     if (!post.id) return null;
     const prompt = post.prompt || post.originalPrompt || '';
     const counts = extractChildMediaCounts(post);
     return {
-      id: post.id,
+      id: String(post.id),
       prompt,
       thumbnail: post.thumbnailImageUrl || post.thumbnail || post.mediaUrl || '',
       mediaUrl: post.mediaUrl || post.hdMediaUrl || '',
       createTime: post.createTime || post.createdAt || post.create_time || '',
       model: post.modelName || post.model || post.modelId || '',
       mediaType: post.mediaType || '',
+      isChild: false,
+      parentId: null,
       ...counts,
     };
+  }
+
+  function parseChildPost(parentRaw, childRaw, parentParsed) {
+    if (!childRaw?.id || !parentParsed?.id) return null;
+    const parentPrompt = parentParsed.prompt || parentRaw.prompt || parentRaw.originalPrompt || '';
+    const prompt = (childRaw.prompt || childRaw.originalPrompt || parentPrompt || '').trim();
+    const isVideo = isVideoMediaType(childRaw.mediaType);
+    return normalizePost({
+      id: String(childRaw.id),
+      parentId: String(parentParsed.id),
+      isChild: true,
+      prompt,
+      thumbnail: childRaw.thumbnailImageUrl || childRaw.thumbnail || childRaw.mediaUrl || '',
+      mediaUrl: childRaw.mediaUrl || childRaw.hdMediaUrl || '',
+      createTime: childRaw.createTime || childRaw.createdAt || childRaw.create_time
+        || parentParsed.createTime || '',
+      model: childRaw.modelName || childRaw.model || parentParsed.model || '',
+      mediaType: childRaw.mediaType || '',
+      childPostCount: 0,
+      childImageCount: 0,
+      childVideoCount: 0,
+      videoCount: isVideo ? 1 : 0,
+    });
+  }
+
+  function collectChildRecords(parentRaw, parentParsed) {
+    const records = [];
+    for (const child of parentRaw.childPosts || []) {
+      const parsed = parseChildPost(parentRaw, child, parentParsed);
+      if (parsed) records.push(stampMetadataRefreshed(parsed));
+    }
+    return records;
+  }
+
+  function removeChildrenOfParent(parentId, keepIds) {
+    const removedIds = [];
+    allPosts = allPosts.filter(p => {
+      if (p.parentId === parentId && p.isChild && !keepIds.has(p.id)) {
+        removedIds.push(p.id);
+        knownIds.delete(p.id);
+        return false;
+      }
+      return true;
+    });
+    return removedIds;
+  }
+
+  async function syncChildRecordsForParent(parentRaw, parentParsed, idToIndex) {
+    if (!parentParsed?.id) return { added: 0, updated: 0, removed: 0 };
+    const childRecords = collectChildRecords(parentRaw, parentParsed);
+    const keepIds = new Set(childRecords.map(c => c.id));
+    const removedIds = removeChildrenOfParent(parentParsed.id, keepIds);
+
+    const added = [];
+    const updated = [];
+    for (const child of childRecords) {
+      const idx = idToIndex.get(child.id);
+      if (idx === undefined) {
+        allPosts.push(child);
+        knownIds.add(child.id);
+        added.push(child);
+        idToIndex.set(child.id, allPosts.length - 1);
+        continue;
+      }
+      const cached = allPosts[idx];
+      const merged = stampMetadataRefreshed(normalizePost({ ...cached, ...child }));
+      if (postMetadataChanged(cached, merged)) {
+        allPosts[idx] = merged;
+        updated.push(merged);
+      }
+    }
+
+    if (removedIds.length) await dbDeleteMany(removedIds);
+    const toPut = [...added, ...updated];
+    if (toPut.length) await dbPutMany(toPut);
+    return { added: added.length, updated: updated.length, removed: removedIds.length };
   }
 
   function isImagineListPage() {
@@ -219,7 +315,7 @@
   function mergePostFromRemote(cached, remote) {
     const parsed = parsePost(remote);
     if (!parsed) return cached;
-    return normalizePost({ ...cached, ...parsed });
+    return normalizePost({ ...cached, ...parsed, isChild: false, parentId: null });
   }
 
   function postMetadataChanged(before, after) {
@@ -232,10 +328,13 @@
       || (before.childImageCount ?? 0) !== (after.childImageCount ?? 0)
       || (before.childVideoCount ?? 0) !== (after.childVideoCount ?? 0)
       || (before.model || '') !== (after.model || '')
-      || (before.mediaType || '') !== (after.mediaType || '');
+      || (before.mediaType || '') !== (after.mediaType || '')
+      || Boolean(before.isChild) !== Boolean(after.isChild)
+      || (before.parentId || '') !== (after.parentId || '');
   }
 
   function postNeedsDeepRefresh(post) {
+    if (isChildPost(post)) return false;
     return (post.childPostCount ?? 0) > 0
       || (post.childImageCount ?? 0) > 0
       || (post.childVideoCount ?? 0) > 0
@@ -268,12 +367,13 @@
    * New posts from liked list + in-place metadata refresh (child counts from childPosts on list payload).
    */
   async function syncLikedFeed(statusEl) {
-    const idToIndex = buildPostIdIndex();
+    let idToIndex = buildPostIdIndex();
     const listUpdatedIds = new Set();
     const newPosts = [];
     const updatedPosts = [];
     let newCount = 0;
     let listUpdatedCount = 0;
+    let childSyncCount = 0;
     let cursor = null;
     let pageIndex = 0;
 
@@ -291,23 +391,30 @@
         if (!parsed) continue;
 
         if (!knownIds.has(parsed.id)) {
-          newPosts.push(stampMetadataRefreshed(parsed));
+          const parentRow = stampMetadataRefreshed(parsed);
+          newPosts.push(parentRow);
+          for (const child of collectChildRecords(raw, parsed)) {
+            newPosts.push(child);
+          }
           pageNew++;
           continue;
         }
 
-        if (!refreshThisPage) continue;
-
-        const idx = idToIndex.get(parsed.id);
-        if (idx === undefined) continue;
-
-        const cached = allPosts[idx];
-        const merged = stampMetadataRefreshed(normalizePost({ ...cached, ...parsed }));
-        if (postMetadataChanged(cached, merged)) {
-          allPosts[idx] = merged;
-          updatedPosts.push(merged);
-          listUpdatedIds.add(parsed.id);
-          listUpdatedCount++;
+        if (refreshThisPage) {
+          const idx = idToIndex.get(parsed.id);
+          if (idx !== undefined) {
+            const cached = allPosts[idx];
+            const merged = stampMetadataRefreshed(normalizePost({ ...cached, ...parsed }));
+            if (postMetadataChanged(cached, merged)) {
+              allPosts[idx] = merged;
+              updatedPosts.push(merged);
+              listUpdatedIds.add(parsed.id);
+              listUpdatedCount++;
+            }
+            const childStats = await syncChildRecordsForParent(raw, merged, idToIndex);
+            childSyncCount += childStats.added + childStats.updated + childStats.removed;
+            idToIndex = buildPostIdIndex();
+          }
         }
       }
 
@@ -330,16 +437,21 @@
       sortAllPostsNewestFirst();
       await dbPutMany(newPosts);
       newCount = newPosts.length;
-      console.log(`[GrokSearch] +${newCount} new post(s) from liked list`);
+      console.log(`[GrokSearch] +${newCount} new row(s) from liked list (parents + children)`);
+      idToIndex = buildPostIdIndex();
     }
 
     if (updatedPosts.length > 0) {
       await dbPutMany(updatedPosts);
-      console.log(`[GrokSearch] List refresh: ${listUpdatedCount} post(s) (incl. child counts)`);
+      console.log(`[GrokSearch] List refresh: ${listUpdatedCount} parent(s)`);
     }
 
     const deepUpdatedCount = await refreshPostsViaGet(statusEl, listUpdatedIds, buildPostIdIndex());
-    return { newCount, updatedCount: listUpdatedCount + deepUpdatedCount, listUpdatedIds };
+    return {
+      newCount,
+      updatedCount: listUpdatedCount + deepUpdatedCount + childSyncCount,
+      listUpdatedIds,
+    };
   }
 
   /** post/get for recent items with children — parallel, skips rows already updated from list. */
@@ -347,7 +459,7 @@
     const withChildren = [];
     const rest = [];
     for (const p of allPosts) {
-      if (skipIds.has(p.id)) continue;
+      if (isChildPost(p) || skipIds.has(p.id)) continue;
       if (postNeedsDeepRefresh(p)) withChildren.push(p);
       else rest.push(p);
       if (withChildren.length >= SYNC_DEEP_REFRESH_LIMIT
@@ -357,6 +469,7 @@
     if (!targets.length) return 0;
 
     const updated = [];
+    let childSyncCount = 0;
     let done = 0;
 
     await runPool(targets, SYNC_DEEP_CONCURRENCY, async cached => {
@@ -367,17 +480,19 @@
       }
       if (!remote) return;
       const merged = stampMetadataRefreshed(mergePostFromRemote(cached, remote));
-      if (!postMetadataChanged(cached, merged)) return;
       const idx = idToIndex.get(cached.id);
       if (idx !== undefined) allPosts[idx] = merged;
-      updated.push(merged);
+      if (postMetadataChanged(cached, merged)) updated.push(merged);
+      const childStats = await syncChildRecordsForParent(remote, merged, idToIndex);
+      childSyncCount += childStats.added + childStats.updated + childStats.removed;
+      idToIndex = buildPostIdIndex();
     });
 
-    if (updated.length > 0) {
-      await dbPutMany(updated);
-      console.log(`[GrokSearch] Deep refresh (post/get): ${updated.length} post(s) with child/video data`);
+    if (updated.length > 0) await dbPutMany(updated);
+    if (updated.length > 0 || childSyncCount > 0) {
+      console.log(`[GrokSearch] Deep refresh: ${updated.length} parent(s), ${childSyncCount} child row change(s)`);
     }
-    return updated.length;
+    return updated.length + childSyncCount;
   }
 
   function formatSyncStatusMessage(newCount, refreshedCount) {
@@ -469,7 +584,7 @@
       }
       const payload = {
         exportedAt: new Date().toISOString(),
-        schemaVersion: 1,
+        schemaVersion: 2,
         source: DB_NAME,
         count: posts.length,
         posts,
@@ -518,10 +633,12 @@
 
       let pageNew = 0;
       for (const post of posts) {
-        if (knownIds.has(post.id)) continue;
         const parsed = parsePost(post);
-        if (!parsed) continue;
+        if (!parsed || knownIds.has(parsed.id)) continue;
         newPosts.push(stampMetadataRefreshed(parsed));
+        for (const child of collectChildRecords(post, parsed)) {
+          if (!knownIds.has(child.id)) newPosts.push(child);
+        }
         pageNew++;
       }
 
@@ -549,9 +666,15 @@
       if (!data) break;
       const posts = data.posts || [];
       for (const post of posts) {
-        if (knownIds.has(post.id)) continue;
         const parsed = parsePost(post);
-        if (parsed) { allFetched.push(parsed); knownIds.add(parsed.id); }
+        if (!parsed || knownIds.has(parsed.id)) continue;
+        allFetched.push(stampMetadataRefreshed(parsed));
+        knownIds.add(parsed.id);
+        for (const child of collectChildRecords(post, parsed)) {
+          if (knownIds.has(child.id)) continue;
+          allFetched.push(child);
+          knownIds.add(child.id);
+        }
       }
       if (statusEl) statusEl.textContent = `indexing… ${allFetched.length.toLocaleString()}`;
       cursor = data.nextCursor || null;
@@ -954,8 +1077,18 @@
       const dateKey = formatPostDateKey(post.createTime);
       const dateStr = formatPostDate(post.createTime);
       const dateActive = dateKey && isFilteredToSingleDay(dateKey) ? ' grok-result-date-active' : '';
+      const childCard = isChildPost(post);
+      const cardClass = childCard ? ' grok-result-card--child' : '';
+      const childMark = childCard
+        ? `<span class="grok-result-child-mark" title="Child post">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+              <path d="M6 3v12"/><circle cx="6" cy="18" r="2"/><path d="M18 7v14"/><circle cx="18" cy="5" r="2"/>
+            </svg>
+           </span>`
+        : '';
       return `
-      <div class="grok-result-card" data-id="${escapeHtml(post.id)}" data-media="${escapeHtml(post.mediaUrl)}" title="${escapeHtml(post.prompt)}">
+      <div class="grok-result-card${cardClass}" data-id="${escapeHtml(post.id)}" data-media="${escapeHtml(post.mediaUrl)}" title="${escapeHtml(post.prompt)}">
+        ${childMark}
         ${dateStr ? `<div class="grok-result-date${dateActive}" data-date="${escapeHtml(dateKey)}" title="Filter to ${escapeHtml(dateStr)} (click again to clear)">${escapeHtml(dateStr)}</div>` : ''}
         <img src="${escapeHtml(post.thumbnail)}" alt="${escapeHtml(post.prompt)}" loading="lazy" style="width:100%; display:block; border-radius:14px; aspect-ratio:3/4; object-fit:cover;" />
         <div class="grok-result-prompt">${escapeHtml(post.prompt)}</div>
@@ -1038,7 +1171,9 @@
       }
       if (!matchesDateFilter(post)) return false;
       if (filterOnlyVideo && (post.videoCount ?? 0) < filterMinVideos) return false;
-      if (filterOnlyChildren && (post.childPostCount ?? 0) < filterMinChildren) return false;
+      if (filterOnlyChildren && !isChildPost(post) && (post.childPostCount ?? 0) < filterMinChildren) {
+        return false;
+      }
       return true;
     });
 
@@ -1123,6 +1258,17 @@
   }
 
   function renderResultBadges(post) {
+    if (isChildPost(post)) {
+      const videos = post.videoCount ?? 0;
+      if (videos > 0) {
+        return `<div class="grok-result-badges">
+          <span class="grok-badge grok-badge-video" title="Video">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+          </span>
+        </div>`;
+      }
+      return '';
+    }
     const videos = post.videoCount ?? 0;
     const childImages = post.childImageCount ?? 0;
     const parts = [];
@@ -1784,6 +1930,27 @@
         overflow: hidden; background: rgba(255,255,255,0.05);
         transition: transform 0.2s, box-shadow 0.2s;
       }
+      .grok-result-card--child {
+        box-shadow: inset 0 0 0 2px rgba(139, 92, 246, 0.45);
+      }
+      .grok-result-child-mark {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        z-index: 4;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        border-radius: 8px;
+        background: rgba(88, 28, 135, 0.92);
+        border: 1px solid rgba(196, 181, 253, 0.55);
+        color: #ede9fe;
+        pointer-events: none;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+      }
+      .grok-result-child-mark svg { display: block; }
       .grok-result-card:hover { transform: scale(1.03); box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
       .grok-result-card img { width: 100%; display: block; border-radius: 14px; aspect-ratio: 3/4; object-fit: cover; }
       .grok-result-prompt {
