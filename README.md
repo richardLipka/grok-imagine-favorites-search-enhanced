@@ -56,8 +56,8 @@ Both scripts share the same IndexedDB database: **`GrokSearchIndex`**.
 
 **Install from GitHub (raw scripts):**
 
-- Search: `https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/raw/master/grokSearch.js`
-- Sidebar: `https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/raw/master/grokPostSidebar.js`
+- Search: `https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/raw/main/grokSearch.js`
+- Sidebar: `https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/raw/main/grokPostSidebar.js`
 
 ### Option B — Clone and copy locally
 
@@ -82,7 +82,7 @@ This project is maintained as a **GitHub fork** of [ironsniper1/Grok-imagine-fav
 ```bash
 git remote add upstream https://github.com/ironsniper1/Grok-imagine-favorite-image-search.git
 git remote add origin https://github.com/richardLipka/grok-imagine-favorites-search-enhanced.git
-git push -u origin master:main
+git push -u origin master:main   # first publish only; later: git push
 ```
 
 4. On GitHub, set the default branch to `main` if prompted.
