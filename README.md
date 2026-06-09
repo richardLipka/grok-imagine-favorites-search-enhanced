@@ -1,8 +1,8 @@
 # Grok Imagine Favorites Search (Enhanced Fork)
 
-Tampermonkey userscripts that add **full-text search**, **filters**, and **offline indexing** to your liked media on [Grok Imagine](https://grok.com/imagine), plus an optional **post detail sidebar**.
+Tampermonkey userscripts that add **full-text search**, **filters**, **downloads**, and **offline indexing** to your liked media on [Grok Imagine](https://grok.com/imagine), plus an optional **post detail sidebar**.
 
-This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, collapsible UI, and related improvements by **Richard Lipka**.
+This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
 ## Fork lineage
 
@@ -10,13 +10,13 @@ This repository is an **enhanced fork** of the original *Grok Imagine Favorites 
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | Early GitHub fork in the same family |
-| **This repo** | `grokSearch.js` v1.35 + `grokPostSidebar.js` v1.3 |
+| **This repo** | `grokSearch.js` v1.53 + `grokPostSidebar.js` v1.3 |
 
 ## What is included
 
 | File | Runs on | Purpose |
 |------|---------|---------|
-| **`grokSearch.js`** | `https://grok.com/imagine*` (not post detail URLs) | Search bar, IndexedDB index, results grid/panel, sync |
+| **`grokSearch.js`** | `https://grok.com/imagine*` (not post detail URLs) | Search bar, IndexedDB index, results grid/panel, sync, downloads |
 | **`grokPostSidebar.js`** | `https://grok.com/imagine/post/*` | Collapsible sidebar: metadata + prompt on post pages |
 
 Both scripts share the same IndexedDB database: **`GrokSearchIndex`**.
@@ -25,15 +25,17 @@ Both scripts share the same IndexedDB database: **`GrokSearchIndex`**.
 
 ## Requirements
 
-- A Chromium-based browser, Firefox, or Edge
+- **Chrome or Edge** recommended (bulk **Download selected** uses the folder picker API)
+- Firefox works for search/sync; folder bulk-download may be unavailable
 - [Tampermonkey](https://www.tampermonkey.net/) (v4+)
 - A Grok account with **liked** Imagine posts
 - Logged in at `grok.com`
+- Network access to **jsDelivr** on first run (loads `piexifjs` for EXIF tagging)
 
 ### Tampermonkey (Chrome / Edge)
 
 1. Open `chrome://extensions` → Tampermonkey → **Details**
-2. Enable **Allow User Scripts** (required for `@grant GM_xmlhttpRequest`)
+2. Enable **Allow User Scripts** (required for `@grant GM_xmlhttpRequest` and `unsafeWindow`)
 3. Optional: **Allow in Incognito** if you use private windows
 
 ---
@@ -80,15 +82,19 @@ Indexing time depends on library size. Leave the tab open until the status finis
 
 | Control | Action |
 |---------|--------|
-| Text field | **AND** search on prompt (parents); child rows also match **parent prompt** (`parentPrompt`) |
+| Text field | **AND** search on prompt (parents); child rows also match **parent prompt** (`parentPrompt`). Filters **400 ms** after you stop typing. |
 | **From / To** dates | Filter by post date (child cards use **their own** date) |
 | **‹ / ›** (beside dates) | Previous / next day — **only** when a **single day** is selected (same From and To) |
 | **Results only** | Hide Grok’s native grid; show paginated results panel (when bar is visible) |
-| **Only with video** | Parents only; min video count (includes all descendant videos on root) |
-| **Only with child posts** | Parents only; min descendant count (full tree, not just first generation) |
+| **Video** | Parents only; min video count (includes all descendant videos on root) |
+| **With child** | Parents only; min descendant count (full tree, not just first generation) |
+| **Hide childs** | Hide child post rows from results (show parents only) |
 | **Per page / Size** | Pagination size (1–300) and thumbnail scale (10–200%) |
 | **Default** | Reset to 44 per page, 100% size |
+| **Sort** | Newest or oldest |
 | **Clear** | Clears text, dates, and media filters |
+| **Download data** | Export **current matched results** as JSON (filters + row metadata) |
+| **Download selected** | Save checked images to a folder you pick (Chrome/Edge); shows progress in toolbar and panel |
 | **Export JSON** | Download full index (schema v3, parents + children) |
 | **Reindex** | Clear DB and rebuild from API (use after upgrades or bad cache) |
 
@@ -100,18 +106,32 @@ Indexing time depends on library size. Leave the tab open until the status finis
 
 ### Results
 
+- **Left-click** a card → **lightbox** over current matched results (←/→ inside lightbox, Esc to close).
+- **Right-click** a card → context menu: Open, open in new tab, copy prompt/URL, download image, filter to date, open parent (child rows).
+- **Checkbox** (top-left, subtle until hover/selected) → select for **Download selected**.
+- **Date badge** (top center) → filter to that day (click again to clear).
 - **Parent** cards: video / descendant image badges (counts include **all generations** in `childPosts` tree).
-- **Child** cards: purple **child** icon (top-right), own date; click opens that child’s post.
-- Click a **date** on a card to filter to that day (click again to clear).
-- **← / →** keys page results when the search box is not focused.
+- **Child** cards: purple **child** icon (top-right), own date badge.
+- **← / →** keys page results when the search box is not focused and the lightbox is closed.
+
+### Downloads and metadata
+
+| Action | Behavior |
+|--------|----------|
+| Context menu → **Download image** | Single file via browser download |
+| **Download selected** | Pick a folder once; files saved as `grok-{id}.{ext}` one by one |
+| Image downloads | Prompt embedded in **JPEG EXIF** (`ImageDescription`, `UserComment`) and **PNG** `Description` text chunk |
+| Videos | Downloaded without EXIF changes |
+
+Long prompts are trimmed (~2000 chars). WebP is not tagged yet. If tagging fails, the file still downloads.
 
 ### Keyboard
 
 | Key | Action |
 |-----|--------|
 | Ctrl/Cmd+F | Show search bar + focus input |
-| Esc | Blur search input |
-| ← / → | Previous / next results page |
+| Esc | Close lightbox or context menu; blur search input when focused |
+| ← / → | Lightbox prev/next when open; otherwise previous/next results page |
 
 ---
 
@@ -174,14 +194,17 @@ req.onsuccess = e => {
 | No search bar | Tampermonkey on? On `/imagine` not `/imagine/post/...`? Hard refresh |
 | Script errors / no API | Enable **Allow User Scripts** in Tampermonkey |
 | Stale counts or missing children | Wait for sync or click **Reindex** once |
-| Child filters still show child cards | Update to v1.35+ (video/child filters = parents only) |
+| **Download selected** does nothing / no folder picker | Use Chrome or Edge; must click the button (user gesture) |
+| EXIF not in downloaded file | JPEG/PNG only; check file type; see browser console for `[GrokSearch]` warnings |
+| `piexif` / CDN blocked | Allow `cdn.jsdelivr.net` or reinstall script so `@require` can load |
+| Video/child filters still show child cards | **Video** / **With child** are parents-only; use **Hide childs** to drop child rows |
 | Greasy Fork + this script | Use **one** search script to avoid conflicts |
 
 ---
 
 ## Privacy
 
-Scripts run **only in your browser**. API calls go to **`grok.com`** (your session cookies). IndexedDB stays local. No third-party analytics in these files.
+Scripts run **only in your browser**. API calls go to **`grok.com`** (your session cookies). IndexedDB stays local. On first run, Tampermonkey may fetch **`piexifjs`** from **jsDelivr** (`cdn.jsdelivr.net`) for EXIF embedding. No other third-party analytics in these files.
 
 ---
 

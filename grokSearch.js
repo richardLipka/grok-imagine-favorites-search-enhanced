@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.53
-// @description  Search saved Grok media; downloads embed prompt in image metadata (EXIF/tEXt).
+// @version      1.55
+// @description  Search, filter, and paginate saved Grok media; lightbox, bulk folder download, EXIF prompt tags.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/YOUR_USER/YOUR_REPO
 // @supportURL   https://github.com/YOUR_USER/YOUR_REPO/issues
@@ -1239,6 +1239,8 @@
             <span id="grok-panel-count"></span>
             <button type="button" class="grok-download-results-btn grok-toolbar-btn" title="Download current search results as JSON">Download data</button>
             <button type="button" class="grok-download-selected-btn grok-toolbar-btn" title="Download selected images to a folder">Download selected</button>
+            <button type="button" class="grok-check-all-btn grok-toolbar-btn" title="Select all results in current search">Check all</button>
+            <button type="button" class="grok-clear-selection-btn grok-toolbar-btn" title="Clear image selection">Clear selection</button>
           </div>
         </div>
         <div class="grok-results-panel-body">
@@ -1260,6 +1262,8 @@
             <span id="grok-panel-count"></span>
             <button type="button" class="grok-download-results-btn grok-toolbar-btn" title="Download current search results as JSON">Download data</button>
             <button type="button" class="grok-download-selected-btn grok-toolbar-btn" title="Download selected images to a folder">Download selected</button>
+            <button type="button" class="grok-check-all-btn grok-toolbar-btn" title="Select all results in current search">Check all</button>
+            <button type="button" class="grok-clear-selection-btn grok-toolbar-btn" title="Clear image selection">Clear selection</button>
           </div>
         `;
       }
@@ -1716,6 +1720,27 @@
     for (const id of selectedPostIds) {
       if (!validIds.has(id)) selectedPostIds.delete(id);
     }
+  }
+
+  function syncSelectionOnGrid() {
+    document.querySelectorAll('.grok-result-select-input').forEach(input => {
+      const id = input.dataset.id;
+      const checked = selectedPostIds.has(id);
+      input.checked = checked;
+      input.closest('.grok-result-card')?.classList.toggle('grok-result-card--selected', checked);
+    });
+  }
+
+  function selectAllMatchedPosts() {
+    matchedPosts.forEach(p => selectedPostIds.add(p.id));
+    syncSelectionOnGrid();
+    syncDownloadSelectedButtons();
+  }
+
+  function clearSelection() {
+    selectedPostIds.clear();
+    syncSelectionOnGrid();
+    syncDownloadSelectedButtons();
   }
 
   function getSelectedPostsInOrder() {
@@ -2946,7 +2971,9 @@
         display: inline-flex;
       }
       .grok-download-results-btn,
-      .grok-download-selected-btn {
+      .grok-download-selected-btn,
+      .grok-check-all-btn,
+      .grok-clear-selection-btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -3814,6 +3841,14 @@
     }
   }
 
+  function stripSearchBarActionButtons() {
+    const wrap = document.getElementById('grok-search-count-wrap');
+    if (!wrap) return;
+    wrap.querySelectorAll(
+      '.grok-download-results-btn, .grok-check-all-btn, .grok-clear-selection-btn'
+    ).forEach(el => el.remove());
+  }
+
   function ensureDownloadResultsButtons() {
     const toolbarCount = document.getElementById('grok-search-count');
     if (toolbarCount && !document.getElementById('grok-search-count-wrap')) {
@@ -3822,13 +3857,8 @@
       wrap.className = 'grok-results-count-wrap';
       toolbarCount.parentElement?.insertBefore(wrap, toolbarCount);
       wrap.appendChild(toolbarCount);
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'grok-download-results-btn grok-toolbar-btn';
-      btn.title = 'Download current search results as JSON';
-      btn.textContent = 'Download data';
-      wrap.appendChild(btn);
     }
+    stripSearchBarActionButtons();
 
     const panelCount = document.getElementById('grok-panel-count');
     if (panelCount && !document.getElementById('grok-panel-count-wrap')) {
@@ -3864,26 +3894,45 @@
     });
   }
 
+  function appendSelectionToolbarButton(wrap, className, text, title) {
+    if (!wrap || wrap.querySelector(`.${className}`)) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `${className} grok-toolbar-btn`;
+    btn.title = title;
+    btn.textContent = text;
+    wrap.appendChild(btn);
+  }
+
   function ensureDownloadSelectedButtons() {
+    stripSearchBarActionButtons();
     const toolbarWrap = document.getElementById('grok-search-count-wrap');
-    if (toolbarWrap && !toolbarWrap.querySelector('.grok-download-selected-btn')) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'grok-download-selected-btn grok-toolbar-btn';
-      btn.title = 'Download selected images to a folder';
-      btn.textContent = 'Download selected';
-      toolbarWrap.appendChild(btn);
-    }
+    appendSelectionToolbarButton(
+      toolbarWrap,
+      'grok-download-selected-btn',
+      'Download selected',
+      'Download selected images to a folder'
+    );
 
     const panelWrap = document.getElementById('grok-panel-count-wrap');
-    if (panelWrap && !panelWrap.querySelector('.grok-download-selected-btn')) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'grok-download-selected-btn grok-toolbar-btn';
-      btn.title = 'Download selected images to a folder';
-      btn.textContent = 'Download selected';
-      panelWrap.appendChild(btn);
-    }
+    appendSelectionToolbarButton(
+      panelWrap,
+      'grok-download-selected-btn',
+      'Download selected',
+      'Download selected images to a folder'
+    );
+    appendSelectionToolbarButton(
+      panelWrap,
+      'grok-check-all-btn',
+      'Check all',
+      'Select all results in current search'
+    );
+    appendSelectionToolbarButton(
+      panelWrap,
+      'grok-clear-selection-btn',
+      'Clear selection',
+      'Clear image selection'
+    );
 
     document.querySelectorAll('.grok-download-selected-btn').forEach(btn => {
       if (btn.dataset.grokDownloadSelectedBound) return;
@@ -3894,18 +3943,43 @@
         downloadSelectedPosts();
       });
     });
+    document.querySelectorAll('.grok-check-all-btn').forEach(btn => {
+      if (btn.dataset.grokCheckAllBound) return;
+      btn.dataset.grokCheckAllBound = '1';
+      btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        selectAllMatchedPosts();
+      });
+    });
+    document.querySelectorAll('.grok-clear-selection-btn').forEach(btn => {
+      if (btn.dataset.grokClearSelectionBound) return;
+      btn.dataset.grokClearSelectionBound = '1';
+      btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        clearSelection();
+      });
+    });
     syncDownloadSelectedButtons();
   }
 
   function syncDownloadSelectedButtons() {
     const count = selectedPostIds.size;
-    const disabled = count === 0 || bulkDownloadInProgress;
+    const total = matchedPosts.length;
+    const busy = bulkDownloadInProgress;
     document.querySelectorAll('.grok-download-selected-btn').forEach(btn => {
-      btn.disabled = disabled;
+      btn.disabled = count === 0 || busy;
       btn.textContent = count > 0 ? `Download selected (${count})` : 'Download selected';
       btn.title = count > 0
         ? `Download ${count} selected image${count === 1 ? '' : 's'} to a folder`
         : 'Download selected images to a folder';
+    });
+    document.querySelectorAll('.grok-check-all-btn').forEach(btn => {
+      btn.disabled = busy || total === 0 || count === total;
+    });
+    document.querySelectorAll('.grok-clear-selection-btn').forEach(btn => {
+      btn.disabled = busy || count === 0;
     });
   }
 
@@ -4063,7 +4137,6 @@
           <span id="grok-stamp-status"></span>
           <span id="grok-search-count-wrap" class="grok-results-count-wrap">
             <span id="grok-search-count"></span>
-            <button type="button" class="grok-download-results-btn grok-toolbar-btn" title="Download current search results as JSON">Download data</button>
             <button type="button" class="grok-download-selected-btn grok-toolbar-btn" title="Download selected images to a folder">Download selected</button>
           </span>
           <select id="grok-sort-select" title="Sort order">
