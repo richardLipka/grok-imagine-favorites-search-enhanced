@@ -4,8 +4,8 @@
 // @version      1.3.0
 // @description  Collapsible sidebar on /imagine/post/{id}: metadata and prompt from IndexedDB and Grok API.
 // @author       Richard Lipka
-// @homepage     https://github.com/YOUR_USER/YOUR_REPO
-// @supportURL   https://github.com/YOUR_USER/YOUR_REPO/issues
+// @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
+// @supportURL   https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/issues
 // @match        https://grok.com/imagine/post/*
 // @grant        GM_xmlhttpRequest
 // @connect      grok.com

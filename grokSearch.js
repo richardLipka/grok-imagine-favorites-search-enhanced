@@ -4,8 +4,8 @@
 // @version      1.57
 // @description  Search, filter, and paginate saved Grok media; lightbox, bulk folder download, EXIF prompt tags.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
-// @homepage     https://github.com/YOUR_USER/YOUR_REPO
-// @supportURL   https://github.com/YOUR_USER/YOUR_REPO/issues
+// @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
+// @supportURL   https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/issues
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow

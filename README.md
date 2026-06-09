@@ -4,6 +4,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 
 This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
+**Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
 **Current versions:** `grokSearch.js` **v1.57** · `grokPostSidebar.js` **v1.3.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
@@ -12,8 +13,8 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 | Source | Notes |
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
-| [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | Early GitHub fork in the same family |
-| **This repo** | `grokSearch.js` v1.57 + `grokPostSidebar.js` v1.3.0 |
+| [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | **Upstream GitHub fork** this project is based on |
+| **This repo** | Enhanced fork: `grokSearch.js` v1.57 + `grokPostSidebar.js` v1.3.0 |
 
 ## What is included
 
@@ -53,18 +54,40 @@ Both scripts share the same IndexedDB database: **`GrokSearchIndex`**.
 3. Repeat for **`grokPostSidebar.js`** if you want the post sidebar.
 4. Hard-refresh `https://grok.com/imagine` (Ctrl+Shift+R).
 
-Replace `YOUR_USER` / `YOUR_REPO` with your GitHub path once published:
+**Install from GitHub (raw scripts):**
 
-- Search: `https://github.com/YOUR_USER/YOUR_REPO/raw/master/grokSearch.js`
-- Sidebar: `https://github.com/YOUR_USER/YOUR_REPO/raw/master/grokPostSidebar.js`
+- Search: `https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/raw/master/grokSearch.js`
+- Sidebar: `https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/raw/master/grokPostSidebar.js`
 
 ### Option B — Clone and copy locally
 
 ```bash
-git clone https://github.com/YOUR_USER/YOUR_REPO.git
+git clone https://github.com/richardLipka/grok-imagine-favorites-search-enhanced.git
 ```
 
 Copy each `.js` file into Tampermonkey as in option A.
+
+---
+
+## Publishing / fork relationship
+
+This project is maintained as a **GitHub fork** of [ironsniper1/Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search).
+
+**One-time setup (maintainer):**
+
+1. On GitHub, open the upstream repo and click **Fork** (creates a fork under your account).
+2. In the fork’s **Settings → General**, rename the repository to `grok-imagine-favorites-search-enhanced` if desired (fork parent link is kept).
+3. From this folder:
+
+```bash
+git remote add upstream https://github.com/ironsniper1/Grok-imagine-favorite-image-search.git
+git remote add origin https://github.com/richardLipka/grok-imagine-favorites-search-enhanced.git
+git push -u origin master:main
+```
+
+4. On GitHub, set the default branch to `main` if prompted.
+
+To pull upstream README/license changes later: `git fetch upstream` then merge or cherry-pick as needed (histories may differ).
 
 ---
 
