@@ -1,16 +1,18 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.47
-// @description  Search saved Grok media; child posts in DB with own dates. Debounced text search filter.
+// @version      1.53
+// @description  Search saved Grok media; downloads embed prompt in image metadata (EXIF/tEXt).
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/YOUR_USER/YOUR_REPO
 // @supportURL   https://github.com/YOUR_USER/YOUR_REPO/issues
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      grok.com
 // @connect      *
 // @run-at       document-idle
+// @require      https://cdn.jsdelivr.net/npm/piexifjs@1.0.6/piexif.js
 // ==/UserScript==
 
 (function () {
@@ -86,6 +88,8 @@
   let searchFilterDebounceTimer = null;
   let lightboxIndex = -1;
   let contextMenuPostId = null;
+  const selectedPostIds = new Set();
+  let bulkDownloadInProgress = false;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -1229,10 +1233,12 @@
           <div class="grok-results-panel-title-wrap">
             <span class="grok-results-panel-title" id="grok-panel-title">Search results</span>
             <span id="grok-panel-range" class="grok-results-panel-range"></span>
+            <span id="grok-panel-download-status" class="grok-panel-download-status"></span>
           </div>
           <div id="grok-panel-count-wrap" class="grok-results-count-wrap">
             <span id="grok-panel-count"></span>
             <button type="button" class="grok-download-results-btn grok-toolbar-btn" title="Download current search results as JSON">Download data</button>
+            <button type="button" class="grok-download-selected-btn grok-toolbar-btn" title="Download selected images to a folder">Download selected</button>
           </div>
         </div>
         <div class="grok-results-panel-body">
@@ -1248,16 +1254,29 @@
           <div class="grok-results-panel-title-wrap">
             <span class="grok-results-panel-title" id="grok-panel-title">Search results</span>
             <span id="grok-panel-range" class="grok-results-panel-range"></span>
+            <span id="grok-panel-download-status" class="grok-panel-download-status"></span>
           </div>
           <div id="grok-panel-count-wrap" class="grok-results-count-wrap">
             <span id="grok-panel-count"></span>
             <button type="button" class="grok-download-results-btn grok-toolbar-btn" title="Download current search results as JSON">Download data</button>
+            <button type="button" class="grok-download-selected-btn grok-toolbar-btn" title="Download selected images to a folder">Download selected</button>
           </div>
         `;
       }
     }
+    ensurePanelDownloadStatus();
     ensureDownloadResultsButtons();
+    ensureDownloadSelectedButtons();
     return panel;
+  }
+
+  function ensurePanelDownloadStatus() {
+    const titleWrap = document.querySelector('.grok-results-panel-title-wrap');
+    if (!titleWrap || document.getElementById('grok-panel-download-status')) return;
+    const status = document.createElement('span');
+    status.id = 'grok-panel-download-status';
+    status.className = 'grok-panel-download-status';
+    titleWrap.appendChild(status);
   }
 
   function layoutPagerInPanel() {
@@ -1461,28 +1480,224 @@
     }
   }
 
+  let downloadStatusClearTimer = null;
+
+  function getPageWindow() {
+    try {
+      if (typeof unsafeWindow !== 'undefined') return unsafeWindow;
+    } catch { /* ignore */ }
+    return window;
+  }
+
+  function setDownloadStatus(text, persist = false) {
+    const els = [
+      document.getElementById('grok-stamp-status'),
+      document.getElementById('grok-panel-download-status'),
+    ].filter(Boolean);
+    els.forEach(el => { el.textContent = text; });
+    clearTimeout(downloadStatusClearTimer);
+    if (!text) return;
+    if (!persist) {
+      downloadStatusClearTimer = setTimeout(() => {
+        els.forEach(el => { if (el.textContent === text) el.textContent = ''; });
+      }, 4000);
+    }
+  }
+
   function flashStampStatus(text) {
-    const statusEl = document.getElementById('grok-stamp-status');
-    if (!statusEl) return;
-    statusEl.textContent = text;
-    setTimeout(() => { if (statusEl.textContent === text) statusEl.textContent = ''; }, 2000);
+    setDownloadStatus(text);
+  }
+
+  function getPostDownloadFilename(post) {
+    const url = getPostMediaUrl(post);
+    if (!url || !post?.id) return '';
+    const ext = guessMediaExtension(url, post.mediaType);
+    return `grok-${post.id}.${ext}`;
+  }
+
+  function fetchPostMediaBlobGm(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        responseType: 'arraybuffer',
+        timeout: 120000,
+        onload(res) {
+          if (res.status < 200 || res.status >= 300) {
+            reject(new Error(`HTTP ${res.status}`));
+            return;
+          }
+          const type = String(res.responseHeaders || '').match(/content-type:\s*([^\r\n]+)/i)?.[1]?.trim()
+            || 'application/octet-stream';
+          resolve(new Blob([res.response], { type }));
+        },
+        onerror() {
+          reject(new Error('network error'));
+        },
+        ontimeout() {
+          reject(new Error('timeout'));
+        },
+      });
+    });
+  }
+
+  async function fetchPostMediaBlob(post) {
+    const url = getPostMediaUrl(post);
+    if (!url) throw new Error('no url');
+    try {
+      const res = await getPageWindow().fetch(url, { credentials: 'include' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.blob();
+    } catch (fetchErr) {
+      console.warn('[GrokSearch] fetch failed, using GM_xmlhttpRequest:', fetchErr);
+      return fetchPostMediaBlobGm(url);
+    }
+  }
+
+  const PNG_CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      table[i] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function pngCrc32(bytes) {
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; i++) {
+      crc = PNG_CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 1);
+    }
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  function arrayBufferToBinaryString(buffer) {
+    const bytes = new Uint8Array(buffer);
+    const parts = [];
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize)));
+    }
+    return parts.join('');
+  }
+
+  function binaryStringToArrayBuffer(binary) {
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) & 0xff;
+    return bytes.buffer;
+  }
+
+  function isJpegBytes(u8) {
+    return u8.length >= 3 && u8[0] === 0xFF && u8[1] === 0xD8 && u8[2] === 0xFF;
+  }
+
+  function isPngBytes(u8) {
+    return u8.length >= 8
+      && u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4E && u8[3] === 0x47;
+  }
+
+  function truncateMetadataText(text, maxLen = 2000) {
+    const s = String(text || '').trim();
+    if (s.length <= maxLen) return s;
+    return `${s.slice(0, maxLen - 1)}…`;
+  }
+
+  function embedPromptInJpeg(buffer, prompt) {
+    if (typeof piexif === 'undefined') return buffer;
+    const text = truncateMetadataText(prompt);
+    if (!text) return buffer;
+    try {
+      const binary = arrayBufferToBinaryString(buffer);
+      const zeroth = {};
+      const exif = {};
+      zeroth[piexif.ImageIFD.ImageDescription] = text;
+      exif[piexif.ExifIFD.UserComment] = `ASCII\0\0\0${text}`;
+      const exifObj = {
+        '0th': zeroth,
+        Exif: exif,
+        GPS: {},
+        Interop: {},
+        '1st': {},
+        thumbnail: null,
+      };
+      const exifBytes = piexif.dump(exifObj);
+      const newBinary = piexif.insert(exifBytes, binary);
+      return binaryStringToArrayBuffer(newBinary);
+    } catch (err) {
+      console.warn('[GrokSearch] JPEG EXIF embed failed:', err);
+      return buffer;
+    }
+  }
+
+  function buildPngTextChunk(keyword, text) {
+    const enc = new TextEncoder();
+    const keyBytes = enc.encode(keyword);
+    const textBytes = enc.encode(text);
+    const data = new Uint8Array(keyBytes.length + 1 + textBytes.length);
+    data.set(keyBytes, 0);
+    data[keyBytes.length] = 0;
+    data.set(textBytes, keyBytes.length + 1);
+    const type = enc.encode('tEXt');
+    const chunk = new Uint8Array(4 + 4 + data.length + 4);
+    const view = new DataView(chunk.buffer);
+    view.setUint32(0, data.length, false);
+    chunk.set(type, 4);
+    chunk.set(data, 8);
+    view.setUint32(8 + data.length, pngCrc32(chunk.subarray(4, 8 + data.length)), false);
+    return chunk;
+  }
+
+  function embedPromptInPng(buffer, prompt) {
+    const text = truncateMetadataText(prompt);
+    if (!text) return buffer;
+    const u8 = new Uint8Array(buffer);
+    if (u8.length < 33) return buffer;
+    try {
+      const chunk = buildPngTextChunk('Description', text);
+      const out = new Uint8Array(u8.length + chunk.length);
+      out.set(u8.subarray(0, 33), 0);
+      out.set(chunk, 33);
+      out.set(u8.subarray(33), 33 + chunk.length);
+      return out.buffer;
+    } catch (err) {
+      console.warn('[GrokSearch] PNG metadata embed failed:', err);
+      return buffer;
+    }
+  }
+
+  async function embedPromptInImageBlob(blob, prompt) {
+    const buf = await blob.arrayBuffer();
+    const u8 = new Uint8Array(buf);
+    let out = buf;
+    if (isJpegBytes(u8)) out = embedPromptInJpeg(buf, prompt);
+    else if (isPngBytes(u8)) out = embedPromptInPng(buf, prompt);
+    if (out === buf) return blob;
+    return new Blob([out], { type: blob.type || 'application/octet-stream' });
+  }
+
+  function isDownloadableImagePost(post) {
+    if (isVideoMediaType(post.mediaType)) return false;
+    const url = getPostMediaUrl(post);
+    return !/\.mp4(\?|$)/i.test(url);
+  }
+
+  async function prepareDownloadBlob(post) {
+    const blob = await fetchPostMediaBlob(post);
+    if (!isDownloadableImagePost(post)) return blob;
+    try {
+      return await embedPromptInImageBlob(blob, post.prompt);
+    } catch (err) {
+      console.warn('[GrokSearch] metadata embed failed:', err);
+      return blob;
+    }
   }
 
   function downloadPostMedia(post) {
-    const url = getPostMediaUrl(post);
-    if (!url) return;
-    const ext = guessMediaExtension(url, post.mediaType);
-    const filename = `grok-${post.id}.${ext}`;
-    GM_xmlhttpRequest({
-      method: 'GET',
-      url,
-      responseType: 'blob',
-      onload(res) {
-        if (res.status < 200 || res.status >= 300) {
-          flashStampStatus('download failed');
-          return;
-        }
-        const blob = res.response;
+    const filename = getPostDownloadFilename(post);
+    if (!filename) return;
+    prepareDownloadBlob(post)
+      .then(blob => {
         const objUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = objUrl;
@@ -1492,11 +1707,110 @@
         a.remove();
         URL.revokeObjectURL(objUrl);
         flashStampStatus('downloaded');
-      },
-      onerror() {
-        flashStampStatus('download failed');
-      },
-    });
+      })
+      .catch(() => flashStampStatus('download failed'));
+  }
+
+  function pruneSelection() {
+    const validIds = new Set(matchedPosts.map(p => p.id));
+    for (const id of selectedPostIds) {
+      if (!validIds.has(id)) selectedPostIds.delete(id);
+    }
+  }
+
+  function getSelectedPostsInOrder() {
+    return matchedPosts.filter(p => selectedPostIds.has(p.id));
+  }
+
+  async function pickDownloadFolder() {
+    const pageWin = getPageWindow();
+    if (typeof pageWin.showDirectoryPicker !== 'function') {
+      throw new Error('unsupported');
+    }
+    return pageWin.showDirectoryPicker({ mode: 'readwrite' });
+  }
+
+  async function ensureDirWritePermission(dirHandle) {
+    const opts = { mode: 'readwrite' };
+    if (typeof dirHandle.queryPermission === 'function') {
+      let perm = await dirHandle.queryPermission(opts);
+      if (perm !== 'granted' && typeof dirHandle.requestPermission === 'function') {
+        perm = await dirHandle.requestPermission(opts);
+      }
+      if (perm !== 'granted') throw new Error('permission denied');
+    }
+  }
+
+  async function saveBlobToFolder(dirHandle, filename, blob) {
+    if (!filename) throw new Error('no filename');
+    const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
+    const writable = await fileHandle.createWritable();
+    try {
+      const data = blob instanceof Blob ? await blob.arrayBuffer() : blob;
+      await writable.write(data);
+    } finally {
+      await writable.close();
+    }
+  }
+
+  async function downloadSelectedPosts() {
+    if (bulkDownloadInProgress) return;
+    const posts = getSelectedPostsInOrder();
+    if (posts.length === 0) {
+      setDownloadStatus('no selection');
+      return;
+    }
+    let dirHandle;
+    try {
+      dirHandle = await pickDownloadFolder();
+      await ensureDirWritePermission(dirHandle);
+    } catch (err) {
+      if (err?.name === 'AbortError') return;
+      console.error('[GrokSearch] folder picker failed:', err);
+      setDownloadStatus(
+        err?.message === 'unsupported'
+          ? 'folder picker unavailable (Chrome/Edge)'
+          : 'folder access denied'
+      );
+      return;
+    }
+
+    bulkDownloadInProgress = true;
+    syncDownloadSelectedButtons();
+    let ok = 0;
+    let fail = 0;
+    const total = posts.length;
+    try {
+      setDownloadStatus(`downloading 0/${total}…`, true);
+      for (let i = 0; i < posts.length; i++) {
+        const post = posts[i];
+        const filename = getPostDownloadFilename(post);
+        if (!filename) {
+          fail++;
+          continue;
+        }
+        setDownloadStatus(`downloading ${i + 1}/${total}…`, true);
+        try {
+          const blob = await prepareDownloadBlob(post);
+          await saveBlobToFolder(dirHandle, filename, blob);
+          ok++;
+        } catch (err) {
+          console.error('[GrokSearch] save failed:', post.id, err);
+          fail++;
+        }
+      }
+      setDownloadStatus(
+        fail === 0
+          ? `saved ${ok} file${ok === 1 ? '' : 's'}`
+          : `saved ${ok}, failed ${fail}`
+      );
+    } catch (err) {
+      console.error('[GrokSearch] bulk download failed:', err);
+      setDownloadStatus('download failed');
+    } finally {
+      bulkDownloadInProgress = false;
+      syncDownloadSelectedButtons();
+    }
   }
 
   function ensureResultContextMenu() {
@@ -1796,7 +2110,23 @@
       showResultContextMenu(e.clientX, e.clientY, post);
     });
 
+    container.addEventListener('change', e => {
+      const input = e.target.closest('.grok-result-select-input');
+      if (!input || !container.contains(input)) return;
+      const id = input.dataset.id;
+      if (!id) return;
+      if (input.checked) selectedPostIds.add(id);
+      else selectedPostIds.delete(id);
+      const card = input.closest('.grok-result-card');
+      if (card) card.classList.toggle('grok-result-card--selected', input.checked);
+      syncDownloadSelectedButtons();
+    });
+
     container.addEventListener('click', e => {
+      if (e.target.closest('.grok-result-select')) {
+        e.stopPropagation();
+        return;
+      }
       if (e.target.closest('.grok-result-date')) {
         e.preventDefault();
         e.stopPropagation();
@@ -1855,7 +2185,9 @@
       const dateStr = formatPostDate(post.createTime);
       const dateActive = dateKey && isFilteredToSingleDay(dateKey) ? ' grok-result-date-active' : '';
       const childCard = isChildPost(post);
+      const selected = selectedPostIds.has(post.id);
       const cardClass = childCard ? ' grok-result-card--child' : '';
+      const selectedClass = selected ? ' grok-result-card--selected' : '';
       const childMark = childCard
         ? `<span class="grok-result-child-mark" title="Child post">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
@@ -1864,7 +2196,10 @@
            </span>`
         : '';
       return `
-      <div class="grok-result-card${cardClass}" data-id="${escapeHtml(post.id)}" data-media="${escapeHtml(post.mediaUrl)}" title="${escapeHtml(post.prompt)}">
+      <div class="grok-result-card${cardClass}${selectedClass}" data-id="${escapeHtml(post.id)}" data-media="${escapeHtml(post.mediaUrl)}" title="${escapeHtml(post.prompt)}">
+        <label class="grok-result-select" title="Select for download">
+          <input type="checkbox" class="grok-result-select-input" data-id="${escapeHtml(post.id)}"${selected ? ' checked' : ''} />
+        </label>
         ${childMark}
         ${dateStr ? `<div class="grok-result-date${dateActive}" data-date="${escapeHtml(dateKey)}" title="Filter to ${escapeHtml(dateStr)} (click again to clear)">${escapeHtml(dateStr)}</div>` : ''}
         <img src="${escapeHtml(post.thumbnail)}" alt="${escapeHtml(post.prompt)}" loading="lazy" style="width:100%; display:block; border-radius:14px; aspect-ratio:3/4; object-fit:cover;" />
@@ -1942,7 +2277,9 @@
       return currentSort === 'oldest' ? ta - tb : tb - ta;
     });
 
+    pruneSelection();
     syncResultsView();
+    syncDownloadSelectedButtons();
   }
 
   let enforceTimer = null;
@@ -2608,7 +2945,8 @@
       #grok-search-count-wrap {
         display: inline-flex;
       }
-      .grok-download-results-btn {
+      .grok-download-results-btn,
+      .grok-download-selected-btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -2688,27 +3026,31 @@
       }
       .grok-result-date {
         position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
+        top: 8px;
+        left: 50%;
+        transform: translateX(-50%);
         z-index: 2;
-        padding: 6px 8px;
+        padding: 5px 10px;
         font-size: 10px;
         font-weight: 600;
         color: rgba(255, 255, 255, 0.95);
-        background: linear-gradient(rgba(0,0,0,0.72), transparent);
-        border-radius: 14px 14px 0 0;
+        background: rgba(0, 0, 0, 0.55);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
         font-family: -apple-system, BlinkMacSystemFont, sans-serif;
         pointer-events: auto;
         cursor: pointer;
-        transition: background 0.15s, color 0.15s;
+        white-space: nowrap;
+        transition: background 0.15s, color 0.15s, border-color 0.15s;
       }
       .grok-result-date:hover {
-        background: linear-gradient(rgba(139,92,246,0.55), transparent);
+        background: rgba(139, 92, 246, 0.65);
+        border-color: rgba(196, 181, 253, 0.45);
         color: #fff;
       }
       .grok-result-date-active {
-        background: linear-gradient(rgba(139,92,246,0.75), rgba(139,92,246,0.2));
+        background: rgba(139, 92, 246, 0.82);
+        border-color: rgba(196, 181, 253, 0.55);
         color: #fff;
       }
       #grok-results-backdrop {
@@ -2765,6 +3107,13 @@
         color: rgba(255, 255, 255, 0.5);
         line-height: 1.35;
       }
+      .grok-panel-download-status {
+        font-size: 11px;
+        color: rgba(139, 92, 246, 0.95);
+        line-height: 1.35;
+        min-height: 1.35em;
+      }
+      .grok-panel-download-status:empty { display: none; }
       #grok-panel-count {
         display: flex;
         align-items: center;
@@ -2850,7 +3199,62 @@
         box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
       }
       .grok-result-child-mark svg { display: block; }
+      .grok-result-select {
+        position: absolute;
+        top: 8px;
+        left: 8px;
+        z-index: 5;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.15);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        cursor: pointer;
+        opacity: 0.28;
+        transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+      }
+      .grok-result-card:hover .grok-result-select {
+        opacity: 0.7;
+        background: rgba(0, 0, 0, 0.45);
+        border-color: rgba(255, 255, 255, 0.14);
+      }
+      .grok-result-select:hover {
+        opacity: 1;
+        background: rgba(0, 0, 0, 0.72);
+        border-color: rgba(139, 92, 246, 0.45);
+      }
+      .grok-result-select:has(.grok-result-select-input:checked),
+      .grok-result-card--selected .grok-result-select {
+        opacity: 1;
+        background: rgba(0, 0, 0, 0.72);
+        border-color: rgba(139, 92, 246, 0.55);
+      }
+      .grok-result-select-input {
+        width: 16px;
+        height: 16px;
+        margin: 0;
+        cursor: pointer;
+        accent-color: #8b5cf6;
+        opacity: 0.45;
+      }
+      .grok-result-card:hover .grok-result-select-input,
+      .grok-result-select:hover .grok-result-select-input,
+      .grok-result-select:has(.grok-result-select-input:checked) .grok-result-select-input {
+        opacity: 1;
+      }
+      .grok-result-card--selected {
+        box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.75);
+      }
+      .grok-result-card--child.grok-result-card--selected {
+        box-shadow: inset 0 0 0 2px rgba(139, 92, 246, 0.45), 0 0 0 2px rgba(139, 92, 246, 0.75);
+      }
       .grok-result-card:hover { transform: scale(1.03); box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+      .grok-result-card--selected:hover {
+        box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.75), 0 8px 32px rgba(0,0,0,0.5);
+      }
       .grok-result-card img { width: 100%; display: block; border-radius: 14px; aspect-ratio: 3/4; object-fit: cover; }
       .grok-result-prompt {
         position: absolute; bottom: 0; left: 0; right: 0;
@@ -3460,6 +3864,51 @@
     });
   }
 
+  function ensureDownloadSelectedButtons() {
+    const toolbarWrap = document.getElementById('grok-search-count-wrap');
+    if (toolbarWrap && !toolbarWrap.querySelector('.grok-download-selected-btn')) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'grok-download-selected-btn grok-toolbar-btn';
+      btn.title = 'Download selected images to a folder';
+      btn.textContent = 'Download selected';
+      toolbarWrap.appendChild(btn);
+    }
+
+    const panelWrap = document.getElementById('grok-panel-count-wrap');
+    if (panelWrap && !panelWrap.querySelector('.grok-download-selected-btn')) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'grok-download-selected-btn grok-toolbar-btn';
+      btn.title = 'Download selected images to a folder';
+      btn.textContent = 'Download selected';
+      panelWrap.appendChild(btn);
+    }
+
+    document.querySelectorAll('.grok-download-selected-btn').forEach(btn => {
+      if (btn.dataset.grokDownloadSelectedBound) return;
+      btn.dataset.grokDownloadSelectedBound = '1';
+      btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        downloadSelectedPosts();
+      });
+    });
+    syncDownloadSelectedButtons();
+  }
+
+  function syncDownloadSelectedButtons() {
+    const count = selectedPostIds.size;
+    const disabled = count === 0 || bulkDownloadInProgress;
+    document.querySelectorAll('.grok-download-selected-btn').forEach(btn => {
+      btn.disabled = disabled;
+      btn.textContent = count > 0 ? `Download selected (${count})` : 'Download selected';
+      btn.title = count > 0
+        ? `Download ${count} selected image${count === 1 ? '' : 's'} to a folder`
+        : 'Download selected images to a folder';
+    });
+  }
+
   function ensureExportJsonButton() {
     if (document.getElementById('grok-export-json-btn')) return;
     const actions = getActionsRow();
@@ -3580,6 +4029,7 @@
       ensureDateNavButtons();
       ensureSearchBarToggle();
       ensureDownloadResultsButtons();
+      ensureDownloadSelectedButtons();
       ensureLoadingIndicator();
       ensureSearchInputListener();
       syncInitialResultsView();
@@ -3614,6 +4064,7 @@
           <span id="grok-search-count-wrap" class="grok-results-count-wrap">
             <span id="grok-search-count"></span>
             <button type="button" class="grok-download-results-btn grok-toolbar-btn" title="Download current search results as JSON">Download data</button>
+            <button type="button" class="grok-download-selected-btn grok-toolbar-btn" title="Download selected images to a folder">Download selected</button>
           </span>
           <select id="grok-sort-select" title="Sort order">
             <option value="newest">Newest</option>
@@ -3691,6 +4142,7 @@
     document.body.appendChild(noResults);
     ensureLoadingIndicator();
     ensureDownloadResultsButtons();
+    ensureDownloadSelectedButtons();
     syncInitialResultsView();
 
     const input = document.getElementById('grok-search-input');
