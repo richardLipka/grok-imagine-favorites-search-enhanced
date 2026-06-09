@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.44
-// @description  Search saved Grok media; child posts in DB with own dates. Context menu and lightbox on results.
+// @version      1.47
+// @description  Search saved Grok media; child posts in DB with own dates. Debounced text search filter.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/YOUR_USER/YOUR_REPO
 // @supportURL   https://github.com/YOUR_USER/YOUR_REPO/issues
@@ -54,6 +54,9 @@
   const GRID_SIZE_PCT_KEY = 'grokSearchGridSizePct';
   const SEARCH_BAR_COLLAPSED_KEY = 'grokSearchBarCollapsed';
   const MEDIA_MIN_OPTIONS = [1, 3, 5, 7, 10];
+  /** Wait after last keystroke before filtering (ms); capped at 1s. */
+  const SEARCH_DEBOUNCE_MS = 400;
+  const SEARCH_DEBOUNCE_MAX_MS = 1000;
 
   let allPosts = [];
   let searchBarExpanded = true;
@@ -77,8 +80,10 @@
   let indexing = false;
   let syncInProgress = false;
   let rendering = false;
+  let renderResultsPending = false;
   let lastIncrementalSyncAt = 0;
   let syncDebounceTimer = null;
+  let searchFilterDebounceTimer = null;
   let lightboxIndex = -1;
   let contextMenuPostId = null;
 
@@ -1744,6 +1749,37 @@
     }, true);
   }
 
+  function flushSearchFilter() {
+    clearTimeout(searchFilterDebounceTimer);
+    searchFilterDebounceTimer = null;
+    applyFilter();
+  }
+
+  function scheduleSearchFilter() {
+    clearTimeout(searchFilterDebounceTimer);
+    const delay = Math.min(SEARCH_DEBOUNCE_MS, SEARCH_DEBOUNCE_MAX_MS);
+    searchFilterDebounceTimer = setTimeout(() => {
+      searchFilterDebounceTimer = null;
+      applyFilter();
+    }, delay);
+  }
+
+  function ensureSearchInputListener() {
+    const input = document.getElementById('grok-search-input');
+    if (!input || input.dataset.grokSearchInputBound) return;
+    input.dataset.grokSearchInputBound = '1';
+    input.addEventListener('input', () => {
+      currentQuery = input.value;
+      updateClearButton();
+      currentPage = 0;
+      document.getElementById('grok-no-results')?.classList.remove('visible');
+      scheduleSearchFilter();
+    });
+    input.addEventListener('blur', () => {
+      if (searchFilterDebounceTimer) flushSearchFilter();
+    });
+  }
+
   function bindResultsGridInteractions(container) {
     if (!container || container.dataset.grokInteractionsBound) return;
     container.dataset.grokInteractionsBound = '1';
@@ -1771,21 +1807,22 @@
       if (!card || !container.contains(card)) return;
       e.preventDefault();
       e.stopPropagation();
-      const postId = card.dataset.id;
-      if (postId) {
-        console.log('[GrokSearch] Opening saved item detail page:', postId);
-        window.open(getPostDetailUrl(postId), '_blank');
-      } else {
-        console.log('[GrokSearch] No postId – opening media directly');
+      const post = getPostById(card.dataset.id);
+      if (post) {
+        openResultLightbox(post);
+      } else if (card.dataset.media) {
         window.open(card.dataset.media, '_blank');
       }
     });
   }
 
   function showResults() {
-    if (rendering) return;
+    if (rendering) {
+      renderResultsPending = true;
+      return;
+    }
     rendering = true;
-    setTimeout(() => { rendering = false; }, 50);
+    renderResultsPending = false;
 
     hideLoadingIndicator();
 
@@ -1805,6 +1842,10 @@
     }
     if (!layoutResultsGridPlacement(container)) {
       rendering = false;
+      if (renderResultsPending) {
+        renderResultsPending = false;
+        showResults();
+      }
       console.warn('[GrokSearch] Could not place results grid');
       return;
     }
@@ -1853,6 +1894,12 @@
     updatePanelPageRange(page);
     updatePager();
     enforceDisplayMode();
+
+    rendering = false;
+    if (renderResultsPending) {
+      renderResultsPending = false;
+      showResults();
+    }
   }
 
   function hideResults() {
@@ -1866,6 +1913,9 @@
       showLoadingIndicator(DEFAULT_LOADING_MESSAGE);
       return;
     }
+
+    const inputEl = document.getElementById('grok-search-input');
+    if (inputEl) currentQuery = inputEl.value;
 
     updateDisplayMode();
 
@@ -3531,6 +3581,7 @@
       ensureSearchBarToggle();
       ensureDownloadResultsButtons();
       ensureLoadingIndicator();
+      ensureSearchInputListener();
       syncInitialResultsView();
       if (!loaded && !indexing) loadAllPosts();
       return;
@@ -3679,11 +3730,7 @@
       applyFilter();
     };
 
-    input.addEventListener('input', () => {
-      currentQuery = input.value.trim();
-      updateClearButton();
-      onFilterInput();
-    });
+    ensureSearchInputListener();
 
     const onDateChange = () => {
       dateStart = dateStartEl.value;
@@ -3700,6 +3747,8 @@
     if (exportJsonBtn) exportJsonBtn.addEventListener('click', () => downloadDatabaseJson());
 
     clearBtn.addEventListener('click', () => {
+      clearTimeout(searchFilterDebounceTimer);
+      searchFilterDebounceTimer = null;
       input.value = '';
       currentQuery = '';
       dateStartEl.value = '';
