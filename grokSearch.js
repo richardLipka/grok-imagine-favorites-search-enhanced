@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.43
-// @description  Search saved Grok media; child posts in DB with own dates. Download current results as JSON.
+// @version      1.44
+// @description  Search saved Grok media; child posts in DB with own dates. Context menu and lightbox on results.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/YOUR_USER/YOUR_REPO
 // @supportURL   https://github.com/YOUR_USER/YOUR_REPO/issues
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
 // @connect      grok.com
+// @connect      *
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -78,6 +79,8 @@
   let rendering = false;
   let lastIncrementalSyncAt = 0;
   let syncDebounceTimer = null;
+  let lightboxIndex = -1;
+  let contextMenuPostId = null;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -1414,6 +1417,371 @@
     updateDisplayMode();
   }
 
+  function getPostById(id) {
+    if (!id) return null;
+    return matchedPosts.find(p => p.id === id) || allPosts.find(p => p.id === id) || null;
+  }
+
+  function getPostDetailUrl(id) {
+    return id ? `https://grok.com/imagine/post/${id}` : '';
+  }
+
+  function getPostMediaUrl(post) {
+    return post?.mediaUrl || post?.thumbnail || '';
+  }
+
+  function guessMediaExtension(url, mediaType) {
+    if (isVideoMediaType(mediaType)) return 'mp4';
+    const m = String(url || '').match(/\.([a-z0-9]{3,4})(?:\?|$)/i);
+    return m ? m[1].toLowerCase() : 'jpg';
+  }
+
+  async function copyText(text) {
+    const value = String(text || '');
+    if (!value) return false;
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = value;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch { /* ignore */ }
+      ta.remove();
+      return ok;
+    }
+  }
+
+  function flashStampStatus(text) {
+    const statusEl = document.getElementById('grok-stamp-status');
+    if (!statusEl) return;
+    statusEl.textContent = text;
+    setTimeout(() => { if (statusEl.textContent === text) statusEl.textContent = ''; }, 2000);
+  }
+
+  function downloadPostMedia(post) {
+    const url = getPostMediaUrl(post);
+    if (!url) return;
+    const ext = guessMediaExtension(url, post.mediaType);
+    const filename = `grok-${post.id}.${ext}`;
+    GM_xmlhttpRequest({
+      method: 'GET',
+      url,
+      responseType: 'blob',
+      onload(res) {
+        if (res.status < 200 || res.status >= 300) {
+          flashStampStatus('download failed');
+          return;
+        }
+        const blob = res.response;
+        const objUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(objUrl);
+        flashStampStatus('downloaded');
+      },
+      onerror() {
+        flashStampStatus('download failed');
+      },
+    });
+  }
+
+  function ensureResultContextMenu() {
+    let menu = document.getElementById('grok-result-context-menu');
+    if (menu) return menu;
+    menu = document.createElement('div');
+    menu.id = 'grok-result-context-menu';
+    menu.className = 'grok-result-context-menu';
+    menu.setAttribute('role', 'menu');
+    menu.hidden = true;
+    document.body.appendChild(menu);
+    return menu;
+  }
+
+  function hideResultContextMenu() {
+    const menu = document.getElementById('grok-result-context-menu');
+    if (menu) menu.hidden = true;
+    contextMenuPostId = null;
+  }
+
+  function positionFloatingMenu(menu, x, y) {
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+    menu.hidden = false;
+    const pad = 8;
+    const rect = menu.getBoundingClientRect();
+    let left = x;
+    let top = y;
+    if (rect.right > window.innerWidth - pad) left = Math.max(pad, x - rect.width);
+    if (rect.bottom > window.innerHeight - pad) top = Math.max(pad, y - rect.height);
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+  }
+
+  function buildContextMenuItems(post) {
+    const items = [
+      { action: 'open', label: 'Open' },
+      { action: 'open-tab', label: 'Open on new tab' },
+      { action: 'copy-prompt', label: 'Copy prompt' },
+      { action: 'copy-url', label: 'Copy URL' },
+      { action: 'download', label: 'Download image' },
+    ];
+    const dateKey = formatPostDateKey(post.createTime);
+    if (dateKey) {
+      items.push({ action: 'filter-date', label: 'Filter to post\'s date' });
+    }
+    if (isChildPost(post) && post.parentId) {
+      items.push({ action: 'open-parent', label: 'Open parent post' });
+    }
+    return items;
+  }
+
+  function showResultContextMenu(clientX, clientY, post) {
+    const menu = ensureResultContextMenu();
+    contextMenuPostId = post.id;
+    menu.innerHTML = buildContextMenuItems(post).map(item => `
+      <button type="button" class="grok-result-context-item" role="menuitem" data-action="${escapeHtml(item.action)}">
+        ${escapeHtml(item.label)}
+      </button>
+    `).join('');
+    menu.querySelectorAll('.grok-result-context-item').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const action = btn.dataset.action;
+        const target = getPostById(contextMenuPostId);
+        hideResultContextMenu();
+        if (target) runContextMenuAction(action, target);
+      });
+    });
+    positionFloatingMenu(menu, clientX, clientY);
+  }
+
+  async function runContextMenuAction(action, post) {
+    switch (action) {
+      case 'open':
+        openResultLightbox(post);
+        break;
+      case 'open-tab':
+        if (post.id) window.open(getPostDetailUrl(post.id), '_blank');
+        else window.open(getPostMediaUrl(post), '_blank');
+        break;
+      case 'copy-prompt':
+        if (await copyText(post.prompt)) flashStampStatus('prompt copied');
+        break;
+      case 'copy-url':
+        if (await copyText(getPostMediaUrl(post))) flashStampStatus('URL copied');
+        break;
+      case 'download':
+        downloadPostMedia(post);
+        break;
+      case 'filter-date': {
+        const dateKey = formatPostDateKey(post.createTime);
+        if (dateKey) applyDateFilterForDay(dateKey);
+        break;
+      }
+      case 'open-parent':
+        if (post.parentId) window.open(getPostDetailUrl(post.parentId), '_blank');
+        break;
+      default:
+        break;
+    }
+  }
+
+  function ensureResultLightbox() {
+    let lb = document.getElementById('grok-result-lightbox');
+    if (lb) return lb;
+    lb = document.createElement('div');
+    lb.id = 'grok-result-lightbox';
+    lb.className = 'grok-result-lightbox';
+    lb.hidden = true;
+    lb.innerHTML = `
+      <div class="grok-lightbox-backdrop" data-grok-lightbox-close></div>
+      <div class="grok-lightbox-panel" role="dialog" aria-modal="true" aria-label="Image preview">
+        <button type="button" class="grok-lightbox-close" data-grok-lightbox-close title="Close" aria-label="Close">×</button>
+        <button type="button" class="grok-lightbox-nav grok-lightbox-prev" id="grok-lightbox-prev" title="Previous" aria-label="Previous">‹</button>
+        <button type="button" class="grok-lightbox-nav grok-lightbox-next" id="grok-lightbox-next" title="Next" aria-label="Next">›</button>
+        <div class="grok-lightbox-stage" id="grok-lightbox-stage"></div>
+        <div class="grok-lightbox-footer">
+          <div class="grok-lightbox-meta">
+            <div class="grok-lightbox-prompt" id="grok-lightbox-prompt"></div>
+            <div class="grok-lightbox-sub" id="grok-lightbox-sub"></div>
+          </div>
+          <div class="grok-lightbox-actions">
+            <button type="button" class="grok-toolbar-btn" id="grok-lightbox-open-tab">Open on new tab</button>
+            <button type="button" class="grok-toolbar-btn" id="grok-lightbox-open-post">Open post</button>
+          </div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(lb);
+
+    lb.querySelectorAll('[data-grok-lightbox-close]').forEach(el => {
+      el.addEventListener('click', e => {
+        e.preventDefault();
+        closeResultLightbox();
+      });
+    });
+    document.getElementById('grok-lightbox-prev')?.addEventListener('click', e => {
+      e.preventDefault();
+      stepResultLightbox(-1);
+    });
+    document.getElementById('grok-lightbox-next')?.addEventListener('click', e => {
+      e.preventDefault();
+      stepResultLightbox(1);
+    });
+    document.getElementById('grok-lightbox-open-tab')?.addEventListener('click', e => {
+      e.preventDefault();
+      const post = matchedPosts[lightboxIndex];
+      if (!post) return;
+      if (post.id) window.open(getPostDetailUrl(post.id), '_blank');
+      else window.open(getPostMediaUrl(post), '_blank');
+    });
+    document.getElementById('grok-lightbox-open-post')?.addEventListener('click', e => {
+      e.preventDefault();
+      const post = matchedPosts[lightboxIndex];
+      if (post?.id) window.open(getPostDetailUrl(post.id), '_blank');
+    });
+
+    return lb;
+  }
+
+  function renderResultLightbox() {
+    const lb = ensureResultLightbox();
+    const post = matchedPosts[lightboxIndex];
+    const stage = document.getElementById('grok-lightbox-stage');
+    const promptEl = document.getElementById('grok-lightbox-prompt');
+    const subEl = document.getElementById('grok-lightbox-sub');
+    const prevBtn = document.getElementById('grok-lightbox-prev');
+    const nextBtn = document.getElementById('grok-lightbox-next');
+    if (!post || !stage || !promptEl || !subEl) return;
+
+    const mediaUrl = getPostMediaUrl(post);
+    const isVideo = isVideoMediaType(post.mediaType) || /\.mp4(\?|$)/i.test(mediaUrl);
+    stage.innerHTML = isVideo
+      ? `<video class="grok-lightbox-media" src="${escapeHtml(mediaUrl)}" controls autoplay playsinline></video>`
+      : `<img class="grok-lightbox-media" src="${escapeHtml(mediaUrl)}" alt="${escapeHtml(post.prompt)}" />`;
+
+    promptEl.textContent = post.prompt || '(no prompt)';
+    const bits = [];
+    bits.push(`${lightboxIndex + 1} / ${matchedPosts.length.toLocaleString()}`);
+    const dateStr = formatPostDate(post.createTime);
+    if (dateStr) bits.push(dateStr);
+    if (isChildPost(post)) bits.push('Child post');
+    subEl.textContent = bits.join(' · ');
+
+    if (prevBtn) prevBtn.disabled = lightboxIndex <= 0;
+    if (nextBtn) nextBtn.disabled = lightboxIndex >= matchedPosts.length - 1;
+    lb.hidden = false;
+    document.documentElement.classList.add('grok-lightbox-open');
+  }
+
+  function openResultLightbox(post) {
+    const idx = matchedPosts.findIndex(p => p.id === post.id);
+    if (idx < 0) return;
+    hideResultContextMenu();
+    lightboxIndex = idx;
+    renderResultLightbox();
+  }
+
+  function closeResultLightbox() {
+    const lb = document.getElementById('grok-result-lightbox');
+    if (lb) {
+      lb.hidden = true;
+      const video = lb.querySelector('video');
+      if (video) video.pause();
+    }
+    document.documentElement.classList.remove('grok-lightbox-open');
+    lightboxIndex = -1;
+  }
+
+  function stepResultLightbox(delta) {
+    if (lightboxIndex < 0 || !matchedPosts.length) return;
+    const next = Math.max(0, Math.min(matchedPosts.length - 1, lightboxIndex + delta));
+    if (next === lightboxIndex) return;
+    lightboxIndex = next;
+    renderResultLightbox();
+  }
+
+  function bindGlobalResultUiListeners() {
+    if (document.body.dataset.grokResultUiBound) return;
+    document.body.dataset.grokResultUiBound = '1';
+
+    document.addEventListener('click', e => {
+      if (!e.target.closest('#grok-result-context-menu')) hideResultContextMenu();
+    });
+    document.addEventListener('scroll', hideResultContextMenu, true);
+    window.addEventListener('resize', hideResultContextMenu);
+
+    document.addEventListener('keydown', e => {
+      const lbOpen = lightboxIndex >= 0 && !document.getElementById('grok-result-lightbox')?.hidden;
+      if (lbOpen) {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          closeResultLightbox();
+          return;
+        }
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          stepResultLightbox(-1);
+          return;
+        }
+        if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          stepResultLightbox(1);
+          return;
+        }
+      }
+      if (e.key === 'Escape') hideResultContextMenu();
+    }, true);
+  }
+
+  function bindResultsGridInteractions(container) {
+    if (!container || container.dataset.grokInteractionsBound) return;
+    container.dataset.grokInteractionsBound = '1';
+    bindGlobalResultUiListeners();
+
+    container.addEventListener('contextmenu', e => {
+      if (e.target.closest('.grok-result-date')) return;
+      const card = e.target.closest('.grok-result-card');
+      if (!card || !container.contains(card)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const post = getPostById(card.dataset.id);
+      if (!post) return;
+      showResultContextMenu(e.clientX, e.clientY, post);
+    });
+
+    container.addEventListener('click', e => {
+      if (e.target.closest('.grok-result-date')) {
+        e.preventDefault();
+        e.stopPropagation();
+        applyDateFilterForDay(e.target.closest('.grok-result-date').dataset.date);
+        return;
+      }
+      const card = e.target.closest('.grok-result-card');
+      if (!card || !container.contains(card)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const postId = card.dataset.id;
+      if (postId) {
+        console.log('[GrokSearch] Opening saved item detail page:', postId);
+        window.open(getPostDetailUrl(postId), '_blank');
+      } else {
+        console.log('[GrokSearch] No postId – opening media directly');
+        window.open(card.dataset.media, '_blank');
+      }
+    });
+  }
+
   function showResults() {
     if (rendering) return;
     rendering = true;
@@ -1464,30 +1832,7 @@
       </div>`;
     }).join('');
 
-    container.querySelectorAll('.grok-result-date').forEach(dateEl => {
-      dateEl.addEventListener('click', e => {
-        e.preventDefault();
-        e.stopPropagation();
-        applyDateFilterForDay(dateEl.dataset.date);
-      });
-    });
-
-    container.querySelectorAll('.grok-result-card').forEach(card => {
-      card.addEventListener('click', e => {
-        if (e.target.closest('.grok-result-date')) return;
-        e.preventDefault();
-        e.stopPropagation();
-
-        const postId = card.dataset.id;
-        if (postId) {
-          console.log('[GrokSearch] Opening saved item detail page:', postId);
-          window.open(`https://grok.com/imagine/post/${postId}`, '_blank');
-        } else {
-          console.log('[GrokSearch] No postId – opening media directly');
-          window.open(card.dataset.media, '_blank');
-        }
-      });
-    });
+    bindResultsGridInteractions(container);
 
     container.style.display = 'grid';
     applyGridLayoutStyles();
@@ -2515,6 +2860,143 @@
         opacity: 0.4;
         cursor: default;
       }
+      .grok-result-context-menu {
+        position: fixed;
+        z-index: 100002;
+        min-width: 190px;
+        padding: 6px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        background: rgba(18, 18, 26, 0.98);
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+        backdrop-filter: blur(12px);
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+      .grok-result-context-menu[hidden] { display: none !important; }
+      .grok-result-context-item {
+        display: block;
+        width: 100%;
+        text-align: left;
+        border: none;
+        background: transparent;
+        color: rgba(255, 255, 255, 0.88);
+        font-size: 12px;
+        line-height: 1.3;
+        padding: 8px 10px;
+        border-radius: 7px;
+        cursor: pointer;
+      }
+      .grok-result-context-item:hover {
+        background: rgba(139, 92, 246, 0.22);
+        color: #fff;
+      }
+      .grok-result-lightbox {
+        position: fixed;
+        inset: 0;
+        z-index: 100003;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        box-sizing: border-box;
+      }
+      .grok-result-lightbox[hidden] { display: none !important; }
+      .grok-lightbox-backdrop {
+        position: absolute;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.88);
+      }
+      .grok-lightbox-panel {
+        position: relative;
+        z-index: 1;
+        width: min(1100px, 96vw);
+        max-height: 92vh;
+        display: flex;
+        flex-direction: column;
+        border-radius: 16px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: #14141c;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.65);
+        overflow: hidden;
+      }
+      .grok-lightbox-close {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        z-index: 3;
+        width: 34px;
+        height: 34px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 10px;
+        background: rgba(0, 0, 0, 0.55);
+        color: #fff;
+        font-size: 22px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .grok-lightbox-nav {
+        position: absolute;
+        top: 50%;
+        transform: translateY(-50%);
+        z-index: 3;
+        width: 40px;
+        height: 56px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 10px;
+        background: rgba(0, 0, 0, 0.55);
+        color: #fff;
+        font-size: 28px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .grok-lightbox-nav:disabled {
+        opacity: 0.25;
+        cursor: default;
+      }
+      .grok-lightbox-prev { left: 10px; }
+      .grok-lightbox-next { right: 10px; }
+      .grok-lightbox-stage {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 240px;
+        max-height: calc(92vh - 150px);
+        background: #0b0b10;
+        padding: 16px;
+      }
+      .grok-lightbox-media {
+        max-width: 100%;
+        max-height: calc(92vh - 180px);
+        object-fit: contain;
+        border-radius: 10px;
+      }
+      .grok-lightbox-footer {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 16px 14px;
+        border-top: 1px solid rgba(255, 255, 255, 0.1);
+        background: #1a1a24;
+      }
+      .grok-lightbox-meta { min-width: 0; flex: 1; }
+      .grok-lightbox-prompt {
+        font-size: 13px;
+        line-height: 1.45;
+        color: rgba(255, 255, 255, 0.92);
+        word-break: break-word;
+      }
+      .grok-lightbox-sub {
+        margin-top: 4px;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.45);
+      }
+      .grok-lightbox-actions {
+        display: flex;
+        gap: 8px;
+        flex-shrink: 0;
+      }
+      html.grok-lightbox-open { overflow: hidden; }
       #grok-no-results {
         display: none; position: fixed; top: 50%; left: 50%;
         transform: translate(-50%,-50%); z-index: 99998; text-align: center;
