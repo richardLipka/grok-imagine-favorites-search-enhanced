@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.55
+// @version      1.57
 // @description  Search, filter, and paginate saved Grok media; lightbox, bulk folder download, EXIF prompt tags.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/YOUR_USER/YOUR_REPO
@@ -59,6 +59,8 @@
   /** Wait after last keystroke before filtering (ms); capped at 1s. */
   const SEARCH_DEBOUNCE_MS = 400;
   const SEARCH_DEBOUNCE_MAX_MS = 1000;
+  /** Ask before bulk download when selection exceeds this count. */
+  const BULK_DOWNLOAD_CONFIRM_ABOVE = 5;
 
   let allPosts = [];
   let searchBarExpanded = true;
@@ -1778,12 +1780,82 @@
     }
   }
 
+  let bulkDownloadConfirmResolver = null;
+
+  function closeBulkDownloadConfirm(result) {
+    const dlg = document.getElementById('grok-bulk-download-confirm');
+    if (dlg) dlg.hidden = true;
+    if (bulkDownloadConfirmResolver) {
+      const resolve = bulkDownloadConfirmResolver;
+      bulkDownloadConfirmResolver = null;
+      resolve(result);
+    }
+  }
+
+  function ensureBulkDownloadConfirmDialog() {
+    if (document.getElementById('grok-bulk-download-confirm')) return;
+    const root = document.createElement('div');
+    root.id = 'grok-bulk-download-confirm';
+    root.className = 'grok-bulk-download-confirm';
+    root.hidden = true;
+    root.innerHTML = `
+      <div class="grok-bulk-download-confirm-backdrop" data-grok-bulk-confirm-cancel></div>
+      <div class="grok-bulk-download-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="grok-bulk-download-confirm-title">
+        <div class="grok-bulk-download-confirm-title" id="grok-bulk-download-confirm-title">Download selected images</div>
+        <p class="grok-bulk-download-confirm-message" id="grok-bulk-download-confirm-message"></p>
+        <div class="grok-bulk-download-confirm-actions">
+          <button type="button" class="grok-toolbar-btn grok-bulk-download-confirm-cancel">Cancel</button>
+          <button type="button" class="grok-toolbar-btn grok-bulk-download-confirm-ok">Continue</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(root);
+    root.querySelector('[data-grok-bulk-confirm-cancel]')?.addEventListener('click', () => {
+      closeBulkDownloadConfirm(false);
+    });
+    root.querySelector('.grok-bulk-download-confirm-cancel')?.addEventListener('click', () => {
+      closeBulkDownloadConfirm(false);
+    });
+    root.querySelector('.grok-bulk-download-confirm-ok')?.addEventListener('click', () => {
+      closeBulkDownloadConfirm(true);
+    });
+    document.addEventListener('keydown', e => {
+      const dlg = document.getElementById('grok-bulk-download-confirm');
+      if (!dlg || dlg.hidden) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeBulkDownloadConfirm(false);
+      }
+    });
+  }
+
+  function confirmBulkDownload(count) {
+    ensureBulkDownloadConfirmDialog();
+    return new Promise(resolve => {
+      bulkDownloadConfirmResolver = resolve;
+      const dlg = document.getElementById('grok-bulk-download-confirm');
+      const msg = document.getElementById('grok-bulk-download-confirm-message');
+      const noun = count === 1 ? 'image' : 'images';
+      if (msg) {
+        msg.textContent = `This will take some time. You selected ${count} ${noun}.`;
+      }
+      if (dlg) {
+        dlg.hidden = false;
+        dlg.querySelector('.grok-bulk-download-confirm-ok')?.focus();
+      }
+    });
+  }
+
   async function downloadSelectedPosts() {
     if (bulkDownloadInProgress) return;
     const posts = getSelectedPostsInOrder();
     if (posts.length === 0) {
       setDownloadStatus('no selection');
       return;
+    }
+    if (posts.length > BULK_DOWNLOAD_CONFIRM_ABOVE) {
+      const confirmed = await confirmBulkDownload(posts.length);
+      if (!confirmed) return;
     }
     let dirHandle;
     try {
@@ -3354,6 +3426,62 @@
         font-family: -apple-system, BlinkMacSystemFont, sans-serif;
       }
       .grok-result-context-menu[hidden] { display: none !important; }
+      .grok-bulk-download-confirm {
+        position: fixed;
+        inset: 0;
+        z-index: 100010;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 16px;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+      .grok-bulk-download-confirm[hidden] { display: none !important; }
+      .grok-bulk-download-confirm-backdrop {
+        position: absolute;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+        backdrop-filter: blur(4px);
+        -webkit-backdrop-filter: blur(4px);
+      }
+      .grok-bulk-download-confirm-panel {
+        position: relative;
+        z-index: 1;
+        width: min(400px, 92vw);
+        background: rgba(15, 15, 20, 0.93);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 14px;
+        padding: 16px 18px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+      }
+      .grok-bulk-download-confirm-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: rgba(255, 255, 255, 0.92);
+        margin-bottom: 8px;
+      }
+      .grok-bulk-download-confirm-message {
+        font-size: 13px;
+        line-height: 1.45;
+        color: rgba(255, 255, 255, 0.72);
+        margin: 0 0 16px;
+      }
+      .grok-bulk-download-confirm-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+      }
+      .grok-bulk-download-confirm-ok {
+        border-color: rgba(139, 92, 246, 0.45);
+        background: rgba(139, 92, 246, 0.2);
+        color: #fff;
+      }
+      .grok-bulk-download-confirm-ok:hover:not(:disabled) {
+        border-color: rgba(139, 92, 246, 0.65);
+        background: rgba(139, 92, 246, 0.32);
+      }
       .grok-result-context-item {
         display: block;
         width: 100%;
