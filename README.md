@@ -4,13 +4,16 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 
 This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
+**Current versions:** `grokSearch.js` **v1.57** · `grokPostSidebar.js` **v1.3.0**  
+See **[CHANGELOG.md](CHANGELOG.md)** for release history.
+
 ## Fork lineage
 
 | Source | Notes |
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | Early GitHub fork in the same family |
-| **This repo** | `grokSearch.js` v1.53 + `grokPostSidebar.js` v1.3 |
+| **This repo** | `grokSearch.js` v1.57 + `grokPostSidebar.js` v1.3.0 |
 
 ## What is included
 
@@ -93,10 +96,22 @@ Indexing time depends on library size. Leave the tab open until the status finis
 | **Default** | Reset to 44 per page, 100% size |
 | **Sort** | Newest or oldest |
 | **Clear** | Clears text, dates, and media filters |
-| **Download data** | Export **current matched results** as JSON (filters + row metadata) |
-| **Download selected** | Save checked images to a folder you pick (Chrome/Edge); shows progress in toolbar and panel |
+| **Download selected** | In the match-count area — save checked images to a folder (Chrome/Edge) |
 | **Export JSON** | Download full index (schema v3, parents + children) |
 | **Reindex** | Clear DB and rebuild from API (use after upgrades or bad cache) |
+
+### Results panel header
+
+Shown when **Results only** is on (default). These controls are **not** in the search bar:
+
+| Control | Action |
+|---------|--------|
+| **Download data** | Export **current matched results** as JSON (active filters + row metadata) |
+| **Download selected** | Same as toolbar — folder bulk download with progress under “Search results” |
+| **Check all** | Select every item in the current filter/match set (all pages) |
+| **Clear selection** | Uncheck all selected items |
+
+> **Inline mode** (`Results only` off): the panel is hidden, so **Download data**, **Check all**, and **Clear selection** are unavailable. Use **Download selected** from the search bar or turn **Results only** back on.
 
 ### Collapsed search bar
 
@@ -119,7 +134,8 @@ Indexing time depends on library size. Leave the tab open until the status finis
 | Action | Behavior |
 |--------|----------|
 | Context menu → **Download image** | Single file via browser download |
-| **Download selected** | Pick a folder once; files saved as `grok-{id}.{ext}` one by one |
+| **Download selected** | Pick a folder once; files saved as `grok-{id}.{ext}` one by one; progress in toolbar and panel |
+| **> 5 selected** | Custom confirm dialog: *“This will take some time. You selected N images.”* |
 | Image downloads | Prompt embedded in **JPEG EXIF** (`ImageDescription`, `UserComment`) and **PNG** `Description` text chunk |
 | Videos | Downloaded without EXIF changes |
 
@@ -130,7 +146,7 @@ Long prompts are trimmed (~2000 chars). WebP is not tagged yet. If tagging fails
 | Key | Action |
 |-----|--------|
 | Ctrl/Cmd+F | Show search bar + focus input |
-| Esc | Close lightbox or context menu; blur search input when focused |
+| Esc | Close lightbox, bulk-download confirm, or context menu; blur search input when focused |
 | ← / → | Lightbox prev/next when open; otherwise previous/next results page |
 
 ---
@@ -195,6 +211,7 @@ req.onsuccess = e => {
 | Script errors / no API | Enable **Allow User Scripts** in Tampermonkey |
 | Stale counts or missing children | Wait for sync or click **Reindex** once |
 | **Download selected** does nothing / no folder picker | Use Chrome or Edge; must click the button (user gesture) |
+| No **Check all** / **Download data** | Turn on **Results only** or use the results panel header |
 | EXIF not in downloaded file | JPEG/PNG only; check file type; see browser console for `[GrokSearch]` warnings |
 | `piexif` / CDN blocked | Allow `cdn.jsdelivr.net` or reinstall script so `@require` can load |
 | Video/child filters still show child cards | **Video** / **With child** are parents-only; use **Hide childs** to drop child rows |
