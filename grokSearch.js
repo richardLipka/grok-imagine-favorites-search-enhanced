@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.35
-// @description  Search saved Grok media; child posts in DB with own dates in results. Fast list/deep sync. Per-page count, sliders, filters, results panel.
+// @version      1.38
+// @description  Search saved Grok media; child posts in DB with own dates in results. Fast list/deep sync. Fix results grid after loading panel.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/YOUR_USER/YOUR_REPO
 // @supportURL   https://github.com/YOUR_USER/YOUR_REPO/issues
@@ -554,7 +554,7 @@
 
       cursor = data.nextCursor;
       if (statusEl) {
-        statusEl.textContent = `syncing… +${newPosts.length + pageNew} new, ${listUpdatedCount} updated`;
+        setLoadStatus(`syncing… +${newPosts.length + pageNew} new, ${listUpdatedCount} updated`);
       }
       await sleep(SYNC_LIST_PAGE_DELAY_MS);
     }
@@ -604,7 +604,7 @@
       const remote = await fetchRemotePost(cached.id);
       done++;
       if (statusEl && done % 6 === 0) {
-        statusEl.textContent = `deep refresh… ${done}/${targets.length}`;
+        setLoadStatus(`deep refresh… ${done}/${targets.length}`);
       }
       if (!remote) return;
       const merged = stampMetadataRefreshed(mergePostFromRemote(cached, remote));
@@ -680,23 +680,25 @@
     matchedPosts = [];
     currentPage = 0;
     if (reindexBtn) reindexBtn.disabled = true;
+    showLoadingIndicator('Reindexing saved posts…');
     try {
       if (!db) db = await openDB();
       await dbClear();
-      if (statusEl) statusEl.textContent = 'reindexing…';
+      setLoadStatus('reindexing…');
       const count = await fetchFullIndex(statusEl);
       loaded = true;
       console.log(`[GrokSearch] Reindex done: ${count} posts`);
       if (statusEl) {
-        statusEl.textContent = `${count.toLocaleString()} reindexed`;
+        setLoadStatus(`${count.toLocaleString()} reindexed`);
         setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
       }
       applyFilter();
     } catch (e) {
       console.error('[GrokSearch] Reindex failed:', e);
-      if (statusEl) statusEl.textContent = 'reindex failed';
+      setLoadStatus('reindex failed');
     } finally {
       indexing = false;
+      hideLoadingIndicator();
       if (reindexBtn) reindexBtn.disabled = false;
     }
   }
@@ -818,7 +820,7 @@
           knownIds.add(child.id);
         }
       }
-      if (statusEl) statusEl.textContent = `indexing… ${allFetched.length.toLocaleString()}`;
+      if (statusEl) setLoadStatus(`indexing… ${allFetched.length.toLocaleString()}`);
       cursor = data.nextCursor || null;
       if (!cursor || posts.length === 0) break;
     }
@@ -831,15 +833,139 @@
     const chunkSize = 500;
     for (let i = 0; i < allFetched.length; i += chunkSize) {
       await dbPutMany(allFetched.slice(i, i + chunkSize));
-      if (statusEl) statusEl.textContent = `saving… ${Math.min(i + chunkSize, allFetched.length)}/${allFetched.length}`;
+      if (statusEl) setLoadStatus(`saving… ${Math.min(i + chunkSize, allFetched.length)}/${allFetched.length}`);
     }
     return allFetched.length;
+  }
+
+  const DEFAULT_LOADING_MESSAGE = 'Loading saved posts…';
+
+  function isAwaitingInitialDisplay() {
+    return !loaded;
+  }
+
+  function shouldUseResultsPanelLoading() {
+    return shouldShowSearchResults() && resultsOnly;
+  }
+
+  function ensureLoadingIndicator() {
+    let el = document.getElementById('grok-loading-indicator');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'grok-loading-indicator';
+      el.setAttribute('role', 'status');
+      el.setAttribute('aria-live', 'polite');
+      el.innerHTML = `
+        <div class="grok-loading-spinner" aria-hidden="true"></div>
+        <div class="grok-loading-message" id="grok-loading-message">${DEFAULT_LOADING_MESSAGE}</div>
+      `;
+      document.body.appendChild(el);
+    }
+    return el;
+  }
+
+  function isLoadingOverlayVisible() {
+    return Boolean(
+      document.getElementById('grok-loading-indicator')?.classList.contains('visible')
+      || document.querySelector('.grok-panel-loading')
+    );
+  }
+
+  function hideCenteredLoadingIndicator() {
+    document.getElementById('grok-loading-indicator')?.classList.remove('visible');
+  }
+
+  function hideResultsPanelLoading() {
+    document.querySelectorAll('.grok-panel-loading').forEach(el => el.remove());
+    const grid = document.getElementById('grok-results-grid');
+    if (grid && loaded && matchedPosts.length > 0) grid.style.display = 'grid';
+  }
+
+  function showResultsPanelLoading(message = DEFAULT_LOADING_MESSAGE) {
+    updateDisplayMode();
+    applyNativeVisibility();
+    const backdrop = ensureResultsBackdrop();
+    const panel = ensureResultsPanel();
+    backdrop.style.display = 'block';
+    panel.style.display = 'flex';
+    layoutPagerInPanel();
+
+    const body = panel.querySelector('.grok-results-panel-body');
+    if (body) {
+      let loading = body.querySelector('.grok-panel-loading');
+      if (!loading) {
+        loading = document.createElement('div');
+        loading.className = 'grok-panel-loading';
+        loading.setAttribute('role', 'status');
+        loading.setAttribute('aria-live', 'polite');
+        loading.innerHTML = `
+          <div class="grok-loading-spinner" aria-hidden="true"></div>
+          <div class="grok-loading-message" id="grok-panel-loading-message"></div>
+        `;
+        body.appendChild(loading);
+      }
+      const msg = loading.querySelector('.grok-loading-message')
+        || loading.querySelector('#grok-panel-loading-message');
+      if (msg) msg.textContent = message;
+      const grid = document.getElementById('grok-results-grid');
+      if (grid) grid.style.display = 'none';
+    }
+
+    const title = document.getElementById('grok-panel-title');
+    if (title) title.textContent = 'Loading…';
+    const range = document.getElementById('grok-panel-range');
+    if (range) range.textContent = '';
+    const count = document.getElementById('grok-panel-count');
+    if (count) count.textContent = '';
+    updatePager();
+  }
+
+  function showLoadingIndicator(message = DEFAULT_LOADING_MESSAGE) {
+    document.getElementById('grok-no-results')?.classList.remove('visible');
+    if (shouldUseResultsPanelLoading()) {
+      hideCenteredLoadingIndicator();
+      showResultsPanelLoading(message);
+    } else {
+      hideResultsPanelLoading();
+      const el = ensureLoadingIndicator();
+      const msg = document.getElementById('grok-loading-message');
+      if (msg) msg.textContent = message;
+      el.classList.add('visible');
+      if (shouldShowSearchResults()) applyNativeVisibility();
+    }
+  }
+
+  function hideLoadingIndicator() {
+    hideCenteredLoadingIndicator();
+    hideResultsPanelLoading();
+    const title = document.getElementById('grok-panel-title');
+    if (title) title.textContent = 'Search results';
+  }
+
+  function setLoadStatus(text) {
+    if (!text) return;
+    const statusEl = document.getElementById('grok-stamp-status');
+    if (statusEl) statusEl.textContent = text;
+    if (!isLoadingOverlayVisible()) return;
+    const msg = document.getElementById('grok-panel-loading-message')
+      || document.getElementById('grok-loading-message');
+    if (msg) msg.textContent = text;
+  }
+
+  function syncInitialResultsView() {
+    if (!shouldShowSearchResults()) return;
+    if (isAwaitingInitialDisplay()) {
+      showLoadingIndicator(DEFAULT_LOADING_MESSAGE);
+      return;
+    }
+    applyFilter();
   }
 
   async function loadAllPosts() {
     if (indexing || loaded) return;
     indexing = true;
     const statusEl = document.getElementById('grok-stamp-status');
+    showLoadingIndicator(DEFAULT_LOADING_MESSAGE);
     try {
       db = await openDB();
       const cached = await dbGetAll();
@@ -856,35 +982,42 @@
         if (backfilled.length) await dbPutMany(backfilled);
         loaded = true;
         console.log(`[GrokSearch] ${allPosts.length} posts loaded from IndexedDB`);
+        applyFilter();
         if (statusEl) {
-          statusEl.textContent = `${allPosts.length.toLocaleString()} cached`;
+          setLoadStatus(`${allPosts.length.toLocaleString()} cached`);
           setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2000);
         }
-        if (statusEl) statusEl.textContent = 'syncing…';
+        setLoadStatus('syncing…');
         const { newCount, updatedCount: refreshedCount } = await syncLikedFeed(statusEl);
         lastIncrementalSyncAt = Date.now();
         if (statusEl) {
-          statusEl.textContent = formatSyncStatusMessage(newCount, refreshedCount);
+          setLoadStatus(formatSyncStatusMessage(newCount, refreshedCount));
           setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
         }
       } else {
-        if (statusEl) statusEl.textContent = 'first-time indexing…';
+        setLoadStatus('first-time indexing…');
         const count = await fetchFullIndex(statusEl);
         loaded = true;
         console.log(`[GrokSearch] Full index done: ${count} posts`);
         if (statusEl) {
-          statusEl.textContent = `${count.toLocaleString()} indexed`;
+          setLoadStatus(`${count.toLocaleString()} indexed`);
           setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
         }
       }
     } catch (e) {
       console.error('[GrokSearch] loadAllPosts failed:', e);
-      if (statusEl) statusEl.textContent = 'load failed';
+      setLoadStatus('load failed');
     } finally {
       indexing = false;
       if (loaded) {
         applyFilter();
+        requestAnimationFrame(() => {
+          applyFilter();
+          scheduleEnforceDisplay();
+        });
         verifyIndexIntegrity();
+      } else {
+        hideLoadingIndicator();
       }
     }
   }
@@ -985,11 +1118,13 @@
     if (vp) vp.style.display = visible ? 'block' : 'none';
   }
 
-  function layoutResultsGridPlacement() {
-    let container = document.getElementById('grok-results-grid');
+  function layoutResultsGridPlacement(container) {
+    if (!container) container = document.getElementById('grok-results-grid');
     if (!container) return null;
     if (resultsOnly) {
       const body = ensureResultsPanel().querySelector('.grok-results-panel-body');
+      if (!body) return null;
+      body.querySelector('.grok-panel-loading')?.remove();
       if (container.parentElement !== body) body.appendChild(container);
     } else {
       const vp = ensureInlineResultsViewport();
@@ -1128,6 +1263,8 @@
   }
 
   function hideAllSearchResults() {
+    if (isAwaitingInitialDisplay() && shouldUseResultsPanelLoading()) return;
+    hideLoadingIndicator();
     setResultsPanelVisible(false);
     setInlineResultsViewportVisible(false);
     const grid = document.getElementById('grok-results-grid');
@@ -1150,7 +1287,10 @@
       return;
     }
 
-    if (!loaded) return;
+    if (!loaded) {
+      showLoadingIndicator(DEFAULT_LOADING_MESSAGE);
+      return;
+    }
 
     currentPage = 0;
     const noResults = document.getElementById('grok-no-results');
@@ -1187,8 +1327,8 @@
     updateResultsOnlyLayout();
     currentPage = 0;
     if (!loaded) {
-      hideAllSearchResults();
       applyNativeVisibility();
+      showLoadingIndicator(DEFAULT_LOADING_MESSAGE);
       return;
     }
     applyFilter();
@@ -1204,6 +1344,8 @@
     rendering = true;
     setTimeout(() => { rendering = false; }, 50);
 
+    hideLoadingIndicator();
+
     const size = getPageSize();
     const totalPages = Math.max(1, Math.ceil(matchedPosts.length / size));
     currentPage = Math.max(0, Math.min(currentPage, totalPages - 1));
@@ -1218,7 +1360,11 @@
       container = document.createElement('div');
       container.id = 'grok-results-grid';
     }
-    layoutResultsGridPlacement();
+    if (!layoutResultsGridPlacement(container)) {
+      rendering = false;
+      console.warn('[GrokSearch] Could not place results grid');
+      return;
+    }
 
     container.innerHTML = page.map(post => {
       const dateKey = formatPostDateKey(post.createTime);
@@ -1297,12 +1443,7 @@
 
   function applyFilter() {
     if (!loaded) {
-      const noResults = document.getElementById('grok-no-results');
-      if (noResults) {
-        noResults.classList.add('visible');
-        noResults.querySelector('span').textContent = '⏳';
-        noResults.lastChild.textContent = 'Still indexing…';
-      }
+      showLoadingIndicator(DEFAULT_LOADING_MESSAGE);
       return;
     }
 
@@ -1340,6 +1481,10 @@
     if (!shouldShowSearchResults()) {
       hideAllSearchResults();
       applyNativeVisibility();
+      return;
+    }
+    if (isAwaitingInitialDisplay()) {
+      showLoadingIndicator(DEFAULT_LOADING_MESSAGE);
       return;
     }
     applyNativeVisibility();
@@ -2268,6 +2413,56 @@
       }
       #grok-no-results.visible { display: block; }
       #grok-no-results span { display: block; font-size: 36px; margin-bottom: 10px; }
+      #grok-loading-indicator {
+        display: none;
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 99998;
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+        text-align: center;
+        pointer-events: none;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        color: rgba(255, 255, 255, 0.55);
+        font-size: 14px;
+      }
+      #grok-loading-indicator.visible { display: flex; }
+      .grok-loading-spinner {
+        width: 36px;
+        height: 36px;
+        border: 3px solid rgba(255, 255, 255, 0.12);
+        border-top-color: #8b5cf6;
+        border-radius: 50%;
+        animation: grok-spin 0.85s linear infinite;
+      }
+      @keyframes grok-spin { to { transform: rotate(360deg); } }
+      .grok-loading-message {
+        max-width: 300px;
+        line-height: 1.45;
+        color: rgba(255, 255, 255, 0.72);
+      }
+      .grok-panel-loading {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        min-height: min(50vh, 420px);
+        padding: 48px 24px;
+        text-align: center;
+      }
+      .grok-panel-loading .grok-loading-spinner {
+        width: 44px;
+        height: 44px;
+        border-width: 4px;
+      }
+      .grok-panel-loading .grok-loading-message {
+        font-size: 15px;
+        color: rgba(255, 255, 255, 0.82);
+      }
       .grok-filter-check-label {
         display: flex; align-items: center; gap: 5px;
         font-size: 11px; color: rgba(255,255,255,0.55);
@@ -2649,6 +2844,9 @@
       ensureDisplayControls();
       ensureDateNavButtons();
       ensureSearchBarToggle();
+      ensureLoadingIndicator();
+      syncInitialResultsView();
+      if (!loaded && !indexing) loadAllPosts();
       return;
     }
     const wrap = document.createElement('div');
@@ -2747,6 +2945,8 @@
     noResults.id = 'grok-no-results';
     noResults.innerHTML = `<span>🔍</span>No images match your search`;
     document.body.appendChild(noResults);
+    ensureLoadingIndicator();
+    syncInitialResultsView();
 
     const input = document.getElementById('grok-search-input');
     const dateStartEl = document.getElementById('grok-date-start');
@@ -2878,11 +3078,16 @@
   let initiated = false;
   function init() {
     if (!isImagineListPage()) return;
+    if (initiated && document.getElementById('grok-search-wrap')) {
+      syncInitialResultsView();
+      if (!loaded && !indexing) loadAllPosts();
+      return;
+    }
     if (initiated) return;
     initiated = true;
     injectStyles();
     buildSearchBar();
-    setTimeout(loadAllPosts, 1000);
+    loadAllPosts();
   }
 
   document.addEventListener('visibilitychange', () => {
@@ -2896,8 +3101,10 @@
   new MutationObserver(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
-      setTimeout(init, 800);
-      if (isImagineListPage()) scheduleIncrementalSync('navigation');
+      setTimeout(() => {
+        init();
+        if (isImagineListPage()) scheduleIncrementalSync('navigation');
+      }, 800);
       return;
     }
     if (!searchBarExpanded) {
