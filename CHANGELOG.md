@@ -11,6 +11,9 @@ Versions match the `@version` in each userscript header.
   - **With video** — show image parents that have video in child/descendant results.
 - Legacy **Video** filter preference migrates to **With video**.
 
+### Fixed
+- Lightbox arrow keys no longer page search results while the lightbox is open.
+
 ---
 
 ## [1.57] — 2026-06-09
