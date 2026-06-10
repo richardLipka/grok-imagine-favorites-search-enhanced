@@ -3,6 +3,16 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.59] — 2026-06-10
+
+### Changed
+- Replaced the single **Video** checkbox (with min count) with two filters:
+  - **Video only** — show only video posts (not images).
+  - **With video** — show image parents that have video in child/descendant results.
+- Legacy **Video** filter preference migrates to **With video**.
+
+---
+
 ## [1.57] — 2026-06-09
 
 ### Added

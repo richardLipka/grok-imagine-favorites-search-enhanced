@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.57
+// @version      1.59
 // @description  Search, filter, and paginate saved Grok media; lightbox, bulk folder download, EXIF prompt tags.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -47,9 +47,11 @@
   const DB_VERSION = 1;
   const STORE_NAME = 'posts';
   const RESULTS_ONLY_KEY = 'grokSearchResultsOnly';
+  const FILTER_VIDEO_ONLY_KEY = 'grokSearchFilterVideoOnly';
+  const FILTER_WITH_VIDEO_KEY = 'grokSearchFilterWithVideo';
+  /** @deprecated legacy — migrated to FILTER_WITH_VIDEO_KEY */
   const FILTER_VIDEO_KEY = 'grokSearchFilterVideo';
   const FILTER_CHILDREN_KEY = 'grokSearchFilterChildren';
-  const FILTER_VIDEO_MIN_KEY = 'grokSearchFilterVideoMin';
   const FILTER_CHILDREN_MIN_KEY = 'grokSearchFilterChildrenMin';
   const FILTER_HIDE_CHILDS_KEY = 'grokSearchFilterHideChilds';
   const PAGE_SIZE_KEY = 'grokSearchPageSize';
@@ -69,10 +71,10 @@
   let dateStart = '';
   let dateEnd = '';
   let resultsOnly = true;
-  let filterOnlyVideo = false;
+  let filterVideoOnly = false;
+  let filterWithVideo = false;
   let filterOnlyChildren = false;
   let filterHideChilds = false;
-  let filterMinVideos = 1;
   let filterMinChildren = 1;
   let pageSize = DEFAULT_PAGE_SIZE;
   let gridSizePercent = DEFAULT_GRID_SIZE_PCT;
@@ -172,6 +174,25 @@
   function isVideoMediaType(mediaType) {
     const t = String(mediaType || '');
     return t === 'MEDIA_POST_TYPE_VIDEO' || t.includes('VIDEO');
+  }
+
+  function isVideoPost(post) {
+    return isVideoMediaType(post?.mediaType);
+  }
+
+  function matchesWithVideoFilter(post) {
+    return !isChildPost(post)
+      && !isVideoPost(post)
+      && (post.childVideoCount ?? 0) > 0;
+  }
+
+  function matchesVideoFilters(post) {
+    if (!filterVideoOnly && !filterWithVideo) return true;
+    const videoOnly = filterVideoOnly && isVideoPost(post);
+    const withVideo = filterWithVideo && matchesWithVideoFilter(post);
+    if (filterVideoOnly && filterWithVideo) return videoOnly || withVideo;
+    if (filterVideoOnly) return videoOnly;
+    return withVideo;
   }
 
   /** Walk entire childPosts tree (all generations). */
@@ -778,10 +799,10 @@
       query: currentQuery,
       dateStart,
       dateEnd,
-      filterOnlyVideo,
+      filterVideoOnly,
+      filterWithVideo,
       filterOnlyChildren,
       filterHideChilds,
-      filterMinVideos,
       filterMinChildren,
       sort: currentSort,
       resultsOnly,
@@ -2108,6 +2129,10 @@
     renderResultLightbox();
   }
 
+  function isResultLightboxOpen() {
+    return lightboxIndex >= 0 && !document.getElementById('grok-result-lightbox')?.hidden;
+  }
+
   function closeResultLightbox() {
     const lb = document.getElementById('grok-result-lightbox');
     if (lb) {
@@ -2138,21 +2163,17 @@
     window.addEventListener('resize', hideResultContextMenu);
 
     document.addEventListener('keydown', e => {
-      const lbOpen = lightboxIndex >= 0 && !document.getElementById('grok-result-lightbox')?.hidden;
-      if (lbOpen) {
+      if (isResultLightboxOpen()) {
         if (e.key === 'Escape') {
           e.preventDefault();
+          e.stopPropagation();
           closeResultLightbox();
           return;
         }
-        if (e.key === 'ArrowLeft') {
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
           e.preventDefault();
-          stepResultLightbox(-1);
-          return;
-        }
-        if (e.key === 'ArrowRight') {
-          e.preventDefault();
-          stepResultLightbox(1);
+          e.stopPropagation();
+          stepResultLightbox(e.key === 'ArrowRight' ? 1 : -1);
           return;
         }
       }
@@ -2357,13 +2378,13 @@
 
     matchedPosts = allPosts.filter(post => {
       if (filterHideChilds && isChildPost(post)) return false;
-      if ((filterOnlyVideo || filterOnlyChildren) && isChildPost(post)) return false;
+      if (filterOnlyChildren && isChildPost(post)) return false;
       if (terms.length > 0) {
         const p = getSearchablePromptText(post, parentPromptById);
         if (!terms.every(t => p.includes(t))) return false;
       }
       if (!matchesDateFilter(post)) return false;
-      if (filterOnlyVideo && (post.videoCount ?? 0) < filterMinVideos) return false;
+      if (!matchesVideoFilters(post)) return false;
       if (filterOnlyChildren && (post.childPostCount ?? 0) < filterMinChildren) return false;
       return true;
     });
@@ -2429,7 +2450,7 @@
     const n = matchedPosts.length.toLocaleString();
     const hasText = Boolean(currentQuery.trim());
     const hasDates = hasDateFilter();
-    if (hasText || hasDates || filterOnlyVideo || filterOnlyChildren || filterHideChilds) {
+    if (hasText || hasDates || filterVideoOnly || filterWithVideo || filterOnlyChildren || filterHideChilds) {
       countText = `${n} match${matchedPosts.length !== 1 ? 'es' : ''}`;
     } else {
       countText = `${n} saved`;
@@ -2725,19 +2746,16 @@
   }
 
   function syncMediaMinSelects() {
-    const videoMinEl = document.getElementById('grok-filter-video-min');
     const childrenMinEl = document.getElementById('grok-filter-children-min');
-    const filterVideoEl = document.getElementById('grok-filter-video');
+    const filterVideoOnlyEl = document.getElementById('grok-filter-video-only');
+    const filterWithVideoEl = document.getElementById('grok-filter-with-video');
     const filterChildrenEl = document.getElementById('grok-filter-children');
-    if (videoMinEl) {
-      videoMinEl.value = String(filterMinVideos);
-      videoMinEl.disabled = !filterOnlyVideo;
-    }
     if (childrenMinEl) {
       childrenMinEl.value = String(filterMinChildren);
       childrenMinEl.disabled = !filterOnlyChildren;
     }
-    if (filterVideoEl) filterVideoEl.checked = filterOnlyVideo;
+    if (filterVideoOnlyEl) filterVideoOnlyEl.checked = filterVideoOnly;
+    if (filterWithVideoEl) filterWithVideoEl.checked = filterWithVideo;
     if (filterChildrenEl) filterChildrenEl.checked = filterOnlyChildren;
     const filterHideChildsEl = document.getElementById('grok-filter-hide-childs');
     if (filterHideChildsEl) filterHideChildsEl.checked = filterHideChilds;
@@ -2749,7 +2767,7 @@
 
   function hasActiveFilter() {
     return Boolean(
-      currentQuery.trim() || hasDateFilter() || filterOnlyVideo || filterOnlyChildren || filterHideChilds
+      currentQuery.trim() || hasDateFilter() || filterVideoOnly || filterWithVideo || filterOnlyChildren || filterHideChilds
     );
   }
 
@@ -3787,7 +3805,8 @@
       'grok-results-only-label', 'grok-search-icon', 'grok-search-input',
       'grok-stamp-status', 'grok-search-count', 'grok-sort-select',
       'grok-date-prev', 'grok-date-start', 'grok-date-end', 'grok-date-next',
-      'grok-filter-video-label',
+      'grok-filter-video-only-label',
+      'grok-filter-with-video-label',
       'grok-filter-children-label', 'grok-filter-hide-childs-label', 'grok-search-clear',
       'grok-export-json-btn', 'grok-reindex-btn',
     ];
@@ -3823,7 +3842,7 @@
     }
     if (nodes['grok-date-end']) filters.appendChild(nodes['grok-date-end']);
     if (nodes['grok-date-next']) filters.appendChild(nodes['grok-date-next']);
-    ['grok-filter-video-label', 'grok-filter-children-label', 'grok-filter-hide-childs-label', 'grok-search-clear']
+    ['grok-filter-video-only-label', 'grok-filter-with-video-label', 'grok-filter-children-label', 'grok-filter-hide-childs-label', 'grok-search-clear']
       .forEach(id => { if (nodes[id]) filters.appendChild(nodes[id]); });
 
     const actions = document.createElement('div');
@@ -3852,19 +3871,50 @@
     labelEl.appendChild(sel);
   }
 
+  function migrateLegacyVideoFilterUi() {
+    document.getElementById('grok-filter-video-min')?.remove();
+    document.getElementById('grok-filter-video-label')?.remove();
+  }
+
+  function loadVideoFiltersFromStorage() {
+    try {
+      const videoOnlyStored = localStorage.getItem(FILTER_VIDEO_ONLY_KEY);
+      const withVideoStored = localStorage.getItem(FILTER_WITH_VIDEO_KEY);
+      if (videoOnlyStored !== null && videoOnlyStored !== '') {
+        filterVideoOnly = videoOnlyStored === '1';
+      }
+      if (withVideoStored !== null && withVideoStored !== '') {
+        filterWithVideo = withVideoStored === '1';
+      } else if (localStorage.getItem(FILTER_VIDEO_KEY) === '1') {
+        filterWithVideo = true;
+      }
+    } catch { /* ignore */ }
+  }
+
   function ensureMediaFilterCheckboxes() {
     const filters = getFiltersRow();
     const dateEnd = document.getElementById('grok-date-end');
     if (!filters) return;
 
-    if (!document.getElementById('grok-filter-video')) {
-      const videoLabel = document.createElement('label');
-      videoLabel.id = 'grok-filter-video-label';
-      videoLabel.className = 'grok-filter-check-label';
-      videoLabel.title = 'Show only items with at least N videos';
-      videoLabel.innerHTML = '<input type="checkbox" id="grok-filter-video" /> Video';
-      if (dateEnd) dateEnd.insertAdjacentElement('afterend', videoLabel);
-      else filters.appendChild(videoLabel);
+    migrateLegacyVideoFilterUi();
+
+    if (!document.getElementById('grok-filter-video-only')) {
+      const videoOnlyLabel = document.createElement('label');
+      videoOnlyLabel.id = 'grok-filter-video-only-label';
+      videoOnlyLabel.className = 'grok-filter-check-label';
+      videoOnlyLabel.title = 'Show only video posts (hide images)';
+      videoOnlyLabel.innerHTML = '<input type="checkbox" id="grok-filter-video-only" /> Video only';
+      if (dateEnd) dateEnd.insertAdjacentElement('afterend', videoOnlyLabel);
+      else filters.appendChild(videoOnlyLabel);
+    }
+    if (!document.getElementById('grok-filter-with-video')) {
+      const withVideoLabel = document.createElement('label');
+      withVideoLabel.id = 'grok-filter-with-video-label';
+      withVideoLabel.className = 'grok-filter-check-label';
+      withVideoLabel.title = 'Show image posts that have video in child results';
+      withVideoLabel.innerHTML = '<input type="checkbox" id="grok-filter-with-video" /> With video';
+      const videoOnlyLabel = document.getElementById('grok-filter-video-only-label');
+      (videoOnlyLabel || dateEnd || filters).insertAdjacentElement('afterend', withVideoLabel);
     }
     if (!document.getElementById('grok-filter-children')) {
       const childLabel = document.createElement('label');
@@ -3872,12 +3922,11 @@
       childLabel.className = 'grok-filter-check-label';
       childLabel.title = 'Show only items with at least N child posts';
       childLabel.innerHTML = '<input type="checkbox" id="grok-filter-children" /> With child';
-      const videoLabel = document.getElementById('grok-filter-video-label');
-      (videoLabel || dateEnd || filters).insertAdjacentElement('afterend', childLabel);
+      const withVideoLabel = document.getElementById('grok-filter-with-video-label');
+      (withVideoLabel || dateEnd || filters).insertAdjacentElement('afterend', childLabel);
     }
     ensureHideChildsCheckbox();
 
-    ensureMediaMinSelect('grok-filter-video-min', document.getElementById('grok-filter-video-label'));
     ensureMediaMinSelect('grok-filter-children-min', document.getElementById('grok-filter-children-label'));
 
     bindMediaFilterListeners();
@@ -3914,28 +3963,28 @@
 
   function bindMediaFilterListeners() {
     ensureHideChildsCheckbox();
-    const filterVideoEl = document.getElementById('grok-filter-video');
+    const filterVideoOnlyEl = document.getElementById('grok-filter-video-only');
+    const filterWithVideoEl = document.getElementById('grok-filter-with-video');
     const filterChildrenEl = document.getElementById('grok-filter-children');
     const filterHideChildsEl = document.getElementById('grok-filter-hide-childs');
-    const videoMinEl = document.getElementById('grok-filter-video-min');
     const childrenMinEl = document.getElementById('grok-filter-children-min');
-    if (!filterVideoEl || !filterChildrenEl || !filterHideChildsEl || !videoMinEl || !childrenMinEl) return;
+    if (!filterVideoOnlyEl || !filterWithVideoEl || !filterChildrenEl || !filterHideChildsEl || !childrenMinEl) return;
 
     const persistMediaFilters = () => {
       try {
-        localStorage.setItem(FILTER_VIDEO_KEY, filterOnlyVideo ? '1' : '0');
+        localStorage.setItem(FILTER_VIDEO_ONLY_KEY, filterVideoOnly ? '1' : '0');
+        localStorage.setItem(FILTER_WITH_VIDEO_KEY, filterWithVideo ? '1' : '0');
         localStorage.setItem(FILTER_CHILDREN_KEY, filterOnlyChildren ? '1' : '0');
         localStorage.setItem(FILTER_HIDE_CHILDS_KEY, filterHideChilds ? '1' : '0');
-        localStorage.setItem(FILTER_VIDEO_MIN_KEY, String(filterMinVideos));
         localStorage.setItem(FILTER_CHILDREN_MIN_KEY, String(filterMinChildren));
       } catch { /* ignore */ }
     };
 
     const onMediaFilterChange = () => {
-      filterOnlyVideo = filterVideoEl.checked;
+      filterVideoOnly = filterVideoOnlyEl.checked;
+      filterWithVideo = filterWithVideoEl.checked;
       filterOnlyChildren = filterChildrenEl.checked;
       filterHideChilds = filterHideChildsEl.checked;
-      filterMinVideos = parseMediaMin(videoMinEl.value);
       filterMinChildren = parseMediaMin(childrenMinEl.value);
       syncMediaMinSelects();
       persistMediaFilters();
@@ -3944,18 +3993,18 @@
       applyFilter();
     };
 
-    if (!filterVideoEl.dataset.grokFilterBound) {
-      filterVideoEl.dataset.grokFilterBound = '1';
+    if (!filterVideoOnlyEl.dataset.grokFilterBound) {
+      filterVideoOnlyEl.dataset.grokFilterBound = '1';
+      filterWithVideoEl.dataset.grokFilterBound = '1';
       filterChildrenEl.dataset.grokFilterBound = '1';
+      loadVideoFiltersFromStorage();
       try {
-        filterOnlyVideo = localStorage.getItem(FILTER_VIDEO_KEY) === '1';
         filterOnlyChildren = localStorage.getItem(FILTER_CHILDREN_KEY) === '1';
-        filterMinVideos = parseMediaMin(localStorage.getItem(FILTER_VIDEO_MIN_KEY));
         filterMinChildren = parseMediaMin(localStorage.getItem(FILTER_CHILDREN_MIN_KEY));
       } catch { /* ignore */ }
-      filterVideoEl.addEventListener('change', onMediaFilterChange);
+      filterVideoOnlyEl.addEventListener('change', onMediaFilterChange);
+      filterWithVideoEl.addEventListener('change', onMediaFilterChange);
       filterChildrenEl.addEventListener('change', onMediaFilterChange);
-      videoMinEl.addEventListener('change', onMediaFilterChange);
       childrenMinEl.addEventListener('change', onMediaFilterChange);
     }
 
@@ -4279,12 +4328,13 @@
             <span class="grok-date-sep">–</span>
             <input id="grok-date-end" class="grok-date-input" type="date" title="To date" aria-label="To date" />
             <button type="button" id="grok-date-next" class="grok-date-nav-btn icon-only" title="Next day" aria-label="Next day" disabled>${DATE_NAV_NEXT_SVG}</button>
-            <label id="grok-filter-video-label" class="grok-filter-check-label" title="Show only items with at least N videos">
-              <input type="checkbox" id="grok-filter-video" />
-              Video
-              <select id="grok-filter-video-min" class="grok-filter-min-select" title="Minimum videos (at least)" aria-label="Minimum videos">
-                <option value="1">1</option><option value="3">3</option><option value="5">5</option><option value="7">7</option><option value="10">10</option>
-              </select>
+            <label id="grok-filter-video-only-label" class="grok-filter-check-label" title="Show only video posts (hide images)">
+              <input type="checkbox" id="grok-filter-video-only" />
+              Video only
+            </label>
+            <label id="grok-filter-with-video-label" class="grok-filter-check-label" title="Show image posts that have video in child results">
+              <input type="checkbox" id="grok-filter-with-video" />
+              With video
             </label>
             <label id="grok-filter-children-label" class="grok-filter-check-label" title="Show only items with at least N child posts">
               <input type="checkbox" id="grok-filter-children" />
@@ -4354,16 +4404,14 @@
     const exportJsonBtn = document.getElementById('grok-export-json-btn');
     const sortSel = document.getElementById('grok-sort-select');
     const resultsOnlyEl = document.getElementById('grok-results-only');
-    const filterVideoEl = document.getElementById('grok-filter-video');
     const filterChildrenEl = document.getElementById('grok-filter-children');
     const firstBtn = document.getElementById('grok-page-first');
     const pageJumpEl = ensurePageJumpInput();
 
     try {
-      filterOnlyVideo = localStorage.getItem(FILTER_VIDEO_KEY) === '1';
+      loadVideoFiltersFromStorage();
       filterOnlyChildren = localStorage.getItem(FILTER_CHILDREN_KEY) === '1';
       loadHideChildsFilterFromStorage();
-      filterMinVideos = parseMediaMin(localStorage.getItem(FILTER_VIDEO_MIN_KEY));
       filterMinChildren = parseMediaMin(localStorage.getItem(FILTER_CHILDREN_MIN_KEY));
       pageSize = clampPageSize(localStorage.getItem(PAGE_SIZE_KEY));
       gridSizePercent = clampGridSizePercent(localStorage.getItem(GRID_SIZE_PCT_KEY));
@@ -4408,17 +4456,17 @@
       dateEndEl.value = '';
       dateStart = '';
       dateEnd = '';
-      filterOnlyVideo = false;
+      filterVideoOnly = false;
+      filterWithVideo = false;
       filterOnlyChildren = false;
       filterHideChilds = false;
-      filterMinVideos = 1;
       filterMinChildren = 1;
       syncMediaMinSelects();
       try {
-        localStorage.setItem(FILTER_VIDEO_KEY, '0');
+        localStorage.setItem(FILTER_VIDEO_ONLY_KEY, '0');
+        localStorage.setItem(FILTER_WITH_VIDEO_KEY, '0');
         localStorage.setItem(FILTER_CHILDREN_KEY, '0');
         localStorage.setItem(FILTER_HIDE_CHILDS_KEY, '0');
-        localStorage.setItem(FILTER_VIDEO_MIN_KEY, '1');
         localStorage.setItem(FILTER_CHILDREN_MIN_KEY, '1');
       } catch { /* ignore */ }
       currentPage = 0;
@@ -4467,7 +4515,17 @@
       const active = document.activeElement;
       const typingInSearch = active === input;
       const typingInPageJump = active?.id === 'grok-page-jump';
-      if (shouldShowSearchResults() && !typingInSearch && !typingInPageJump) {
+      const bulkConfirmOpen = (() => {
+        const dlg = document.getElementById('grok-bulk-download-confirm');
+        return Boolean(dlg && !dlg.hidden);
+      })();
+      if (
+        shouldShowSearchResults()
+        && !typingInSearch
+        && !typingInPageJump
+        && !isResultLightboxOpen()
+        && !bulkConfirmOpen
+      ) {
         if (e.key === 'ArrowRight') { e.preventDefault(); currentPage++; showResults(); }
         if (e.key === 'ArrowLeft') { e.preventDefault(); currentPage--; showResults(); }
       }

@@ -112,7 +112,8 @@ Indexing time depends on library size. Leave the tab open until the status finis
 | **From / To** dates | Filter by post date (child cards use **their own** date) |
 | **‹ / ›** (beside dates) | Previous / next day — **only** when a **single day** is selected (same From and To) |
 | **Results only** | Hide Grok’s native grid; show paginated results panel (when bar is visible) |
-| **Video** | Parents only; min video count (includes all descendant videos on root) |
+| **Video only** | Show only video posts (parent or child video rows; hides images) |
+| **With video** | Parents only — image posts that have at least one video in child/descendant results |
 | **With child** | Parents only; min descendant count (full tree, not just first generation) |
 | **Hide childs** | Hide child post rows from results (show parents only) |
 | **Per page / Size** | Pagination size (1–300) and thumbnail scale (10–200%) |
@@ -237,7 +238,7 @@ req.onsuccess = e => {
 | No **Check all** / **Download data** | Turn on **Results only** or use the results panel header |
 | EXIF not in downloaded file | JPEG/PNG only; check file type; see browser console for `[GrokSearch]` warnings |
 | `piexif` / CDN blocked | Allow `cdn.jsdelivr.net` or reinstall script so `@require` can load |
-| Video/child filters still show child cards | **Video** / **With child** are parents-only; use **Hide childs** to drop child rows |
+| Video/child filters still show child cards | **With video** / **With child** are parents-only; **Video only** includes child video rows; use **Hide childs** to drop child rows |
 | Greasy Fork + this script | Use **one** search script to avoid conflicts |
 
 ---
