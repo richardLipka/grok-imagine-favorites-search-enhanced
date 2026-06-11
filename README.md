@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.js` **v1.59** · `grokPostSidebar.js` **v1.3.0**  
+**Current versions:** `grokSearch.js` **v1.61** · `grokPostSidebar.js` **v1.3.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Fork lineage
@@ -14,7 +14,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | **Upstream GitHub fork** this project is based on |
-| **This repo** | Enhanced fork: `grokSearch.js` v1.59 + `grokPostSidebar.js` v1.3.0 |
+| **This repo** | Enhanced fork: `grokSearch.js` v1.61 + `grokPostSidebar.js` v1.3.0 |
 
 ## What is included
 
@@ -145,8 +145,8 @@ Shown when **Results only** is on (default). These controls are **not** in the s
 
 ### Results
 
-- **Left-click** a card → **lightbox** over current matched results (←/→ inside lightbox, Esc to close).
-- **Right-click** a card → context menu: Open, open in new tab, copy prompt/URL, download image, filter to date, open parent (child rows).
+- **Left-click** a card → **lightbox** over current matched results (←/→ inside lightbox, **Download** in footer, Esc to close).
+- **Right-click** a card → context menu: Open, open in new tab, copy prompt/URL, download image/video, download all child posts (parents with children), filter to date, open parent (child rows).
 - **Checkbox** (top-left, subtle until hover/selected) → select for **Download selected**.
 - **Date badge** (top center) → filter to that day (click again to clear).
 - **Parent** cards: video / descendant image badges (counts include **all generations** in `childPosts` tree).
@@ -157,7 +157,9 @@ Shown when **Results only** is on (default). These controls are **not** in the s
 
 | Action | Behavior |
 |--------|----------|
-| Context menu → **Download image** | Single file via browser download |
+| Context menu → **Download image** / **Download video** | Single file via browser download |
+| Context menu → **Download all** | All child/descendant posts to a folder (parents with children only) |
+| Lightbox → **Download** | Same single-file download for the current image or video |
 | **Download selected** | Pick a folder once; files saved as `grok-{id}.{ext}` one by one; progress in toolbar and panel |
 | **> 5 selected** | Custom confirm dialog: *“This will take some time. You selected N images.”* |
 | Image downloads | Prompt embedded in **JPEG EXIF** (`ImageDescription`, `UserComment`) and **PNG** `Description` text chunk |

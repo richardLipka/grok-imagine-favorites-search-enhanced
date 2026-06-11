@@ -3,6 +3,21 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.61] — 2026-06-10
+
+### Added
+- Lightbox **Download** button for the current image or video.
+
+## [1.60] — 2026-06-10
+
+### Added
+- Context menu **Download all** — saves all child/descendant posts to a folder (disabled when a post has no children).
+
+### Changed
+- Context menu download label is **Download image** or **Download video** based on media type.
+
+---
+
 ## [1.59] — 2026-06-10
 
 ### Changed

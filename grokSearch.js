@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.59
+// @version      1.61
 // @description  Search, filter, and paginate saved Grok media; lightbox, bulk folder download, EXIF prompt tags.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -1473,6 +1473,36 @@
     return matchedPosts.find(p => p.id === id) || allPosts.find(p => p.id === id) || null;
   }
 
+  function postHasChildPosts(post) {
+    return (post?.childPostCount ?? 0) > 0;
+  }
+
+  function getAllDescendantPosts(rootId) {
+    const id = String(rootId || '');
+    if (!id) return [];
+    const byParent = new Map();
+    for (const p of allPosts) {
+      if (!p.isChild || !p.parentId) continue;
+      const parentId = String(p.parentId);
+      if (!byParent.has(parentId)) byParent.set(parentId, []);
+      byParent.get(parentId).push(p);
+    }
+    const out = [];
+    const walk = parentId => {
+      for (const child of byParent.get(parentId) || []) {
+        out.push(child);
+        walk(child.id);
+      }
+    };
+    walk(id);
+    out.sort((a, b) => {
+      const ta = a.createTime ? new Date(a.createTime).getTime() : 0;
+      const tb = b.createTime ? new Date(b.createTime).getTime() : 0;
+      return ta - tb;
+    });
+    return out;
+  }
+
   function getPostDetailUrl(id) {
     return id ? `https://grok.com/imagine/post/${id}` : '';
   }
@@ -1867,13 +1897,9 @@
     });
   }
 
-  async function downloadSelectedPosts() {
+  async function downloadPostsToFolder(posts) {
     if (bulkDownloadInProgress) return;
-    const posts = getSelectedPostsInOrder();
-    if (posts.length === 0) {
-      setDownloadStatus('no selection');
-      return;
-    }
+    if (posts.length === 0) return;
     if (posts.length > BULK_DOWNLOAD_CONFIRM_ABOVE) {
       const confirmed = await confirmBulkDownload(posts.length);
       if (!confirmed) return;
@@ -1931,6 +1957,24 @@
     }
   }
 
+  async function downloadSelectedPosts() {
+    const posts = getSelectedPostsInOrder();
+    if (posts.length === 0) {
+      setDownloadStatus('no selection');
+      return;
+    }
+    await downloadPostsToFolder(posts);
+  }
+
+  async function downloadAllChildPosts(post) {
+    const posts = getAllDescendantPosts(post.id);
+    if (posts.length === 0) {
+      flashStampStatus('no child posts');
+      return;
+    }
+    await downloadPostsToFolder(posts);
+  }
+
   function ensureResultContextMenu() {
     let menu = document.getElementById('grok-result-context-menu');
     if (menu) return menu;
@@ -1964,12 +2008,14 @@
   }
 
   function buildContextMenuItems(post) {
+    const downloadLabel = isVideoPost(post) ? 'Download video' : 'Download image';
     const items = [
       { action: 'open', label: 'Open' },
       { action: 'open-tab', label: 'Open on new tab' },
       { action: 'copy-prompt', label: 'Copy prompt' },
       { action: 'copy-url', label: 'Copy URL' },
-      { action: 'download', label: 'Download image' },
+      { action: 'download', label: downloadLabel },
+      { action: 'download-all', label: 'Download all', disabled: !postHasChildPosts(post) },
     ];
     const dateKey = formatPostDateKey(post.createTime);
     if (dateKey) {
@@ -1985,7 +2031,7 @@
     const menu = ensureResultContextMenu();
     contextMenuPostId = post.id;
     menu.innerHTML = buildContextMenuItems(post).map(item => `
-      <button type="button" class="grok-result-context-item" role="menuitem" data-action="${escapeHtml(item.action)}">
+      <button type="button" class="grok-result-context-item${item.disabled ? ' grok-result-context-item--disabled' : ''}" role="menuitem" data-action="${escapeHtml(item.action)}"${item.disabled ? ' disabled' : ''}>
         ${escapeHtml(item.label)}
       </button>
     `).join('');
@@ -1993,6 +2039,7 @@
       btn.addEventListener('click', e => {
         e.preventDefault();
         e.stopPropagation();
+        if (btn.disabled) return;
         const action = btn.dataset.action;
         const target = getPostById(contextMenuPostId);
         hideResultContextMenu();
@@ -2020,6 +2067,9 @@
       case 'download':
         downloadPostMedia(post);
         break;
+      case 'download-all':
+        await downloadAllChildPosts(post);
+        break;
       case 'filter-date': {
         const dateKey = formatPostDateKey(post.createTime);
         if (dateKey) applyDateFilterForDay(dateKey);
@@ -2033,9 +2083,36 @@
     }
   }
 
+  function bindLightboxDownloadButton() {
+    const btn = document.getElementById('grok-lightbox-download');
+    if (!btn || btn.dataset.grokLightboxBound) return;
+    btn.dataset.grokLightboxBound = '1';
+    btn.addEventListener('click', e => {
+      e.preventDefault();
+      const post = matchedPosts[lightboxIndex];
+      if (post) downloadPostMedia(post);
+    });
+  }
+
+  function ensureLightboxDownloadButton(lb) {
+    const actions = lb?.querySelector('.grok-lightbox-actions');
+    if (!actions || document.getElementById('grok-lightbox-download')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'grok-toolbar-btn';
+    btn.id = 'grok-lightbox-download';
+    btn.textContent = 'Download';
+    btn.title = 'Download current image or video';
+    actions.appendChild(btn);
+    bindLightboxDownloadButton();
+  }
+
   function ensureResultLightbox() {
     let lb = document.getElementById('grok-result-lightbox');
-    if (lb) return lb;
+    if (lb) {
+      ensureLightboxDownloadButton(lb);
+      return lb;
+    }
     lb = document.createElement('div');
     lb.id = 'grok-result-lightbox';
     lb.className = 'grok-result-lightbox';
@@ -2055,6 +2132,7 @@
           <div class="grok-lightbox-actions">
             <button type="button" class="grok-toolbar-btn" id="grok-lightbox-open-tab">Open on new tab</button>
             <button type="button" class="grok-toolbar-btn" id="grok-lightbox-open-post">Open post</button>
+            <button type="button" class="grok-toolbar-btn" id="grok-lightbox-download" title="Download current image or video">Download</button>
           </div>
         </div>
       </div>
@@ -2087,6 +2165,7 @@
       const post = matchedPosts[lightboxIndex];
       if (post?.id) window.open(getPostDetailUrl(post.id), '_blank');
     });
+    bindLightboxDownloadButton();
 
     return lb;
   }
@@ -3513,9 +3592,14 @@
         border-radius: 7px;
         cursor: pointer;
       }
-      .grok-result-context-item:hover {
+      .grok-result-context-item:hover:not(:disabled) {
         background: rgba(139, 92, 246, 0.22);
         color: #fff;
+      }
+      .grok-result-context-item:disabled,
+      .grok-result-context-item--disabled {
+        opacity: 0.35;
+        cursor: default;
       }
       .grok-result-lightbox {
         position: fixed;
