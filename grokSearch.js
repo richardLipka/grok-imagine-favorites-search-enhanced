@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.62
+// @version      1.62.1
 // @description  Search, filter, and paginate saved Grok media; lightbox, bulk folder download, EXIF prompt tags.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -4405,6 +4405,12 @@
   function syncDownloadSelectedButtons() {
     const count = selectedPostIds.size;
     const total = matchedPosts.length;
+    // Selections outlive the active filter, so "Check all" has to look at how many of the
+    // *current* matches are selected — the overall count can equal `total` by coincidence.
+    let matchedSelected = 0;
+    if (count > 0) {
+      for (const p of matchedPosts) if (selectedPostIds.has(p.id)) matchedSelected++;
+    }
     const busy = bulkDownloadInProgress;
     document.querySelectorAll('.grok-download-selected-btn').forEach(btn => {
       btn.disabled = count === 0 || busy;
@@ -4414,7 +4420,7 @@
         : 'Download selected images to a folder';
     });
     document.querySelectorAll('.grok-check-all-btn').forEach(btn => {
-      btn.disabled = busy || total === 0 || count === total;
+      btn.disabled = busy || total === 0 || matchedSelected === total;
     });
     document.querySelectorAll('.grok-clear-selection-btn').forEach(btn => {
       btn.disabled = busy || count === 0;

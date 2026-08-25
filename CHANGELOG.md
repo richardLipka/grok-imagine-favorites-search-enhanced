@@ -3,6 +3,16 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.62.1] — 2026-08-25
+
+### Fixed
+- **Check all** could be greyed out while none of the visible results were selected. Now that
+  selections outlive the active filter, the button compares how many of the *current* matches
+  are selected instead of the overall selection count, which could equal the match count by
+  coincidence.
+
+---
+
 ## [1.62] — 2026-08-25
 
 Sync correctness and performance pass. No new UI.
