@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.js` **v1.61** · `grokPostSidebar.js` **v1.3.0**  
+**Current versions:** `grokSearch.js` **v1.62** · `grokPostSidebar.js` **v1.3.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Fork lineage
@@ -14,7 +14,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | **Upstream GitHub fork** this project is based on |
-| **This repo** | Enhanced fork: `grokSearch.js` v1.61 + `grokPostSidebar.js` v1.3.0 |
+| **This repo** | Enhanced fork: `grokSearch.js` v1.62 + `grokPostSidebar.js` v1.3.0 |
 
 ## What is included
 
@@ -135,6 +135,10 @@ Shown when **Results only** is on (default). These controls are **not** in the s
 | **Check all** | Select every item in the current filter/match set (all pages) |
 | **Clear selection** | Uncheck all selected items |
 
+> Selections **persist across filter changes** — searching or changing dates after checking
+> items no longer clears them. **Download selected** saves everything currently checked, not
+> just the items matching the active filter; use **Clear selection** to start over.
+
 > **Inline mode** (`Results only` off): the panel is hidden, so **Download data**, **Check all**, and **Clear selection** are unavailable. Use **Download selected** from the search bar or turn **Results only** back on.
 
 ### Collapsed search bar
@@ -194,11 +198,18 @@ Install together with `grokSearch.js` so the index is shared.
 | Event | Behavior |
 |-------|----------|
 | Page load | Load cache → fetch new likes → refresh recent metadata |
-| Tab focus | Incremental sync (rate-limited) |
-| Return from post page | Sync after navigation |
+| Tab focus | Incremental sync (rate-limited, 60 s) |
+| Return from post page | Sync after navigation (rate-limited, 15 s) |
 | **Reindex** button | Full rebuild (only when you need everything refreshed) |
 
 Child posts are stored as **separate rows** (`isChild: true`, `parentId`, `parentPrompt` for search).
+
+New **child posts** (variations and videos generated from a post you already have) are picked up
+two ways: from the `childPosts` tree on the first few liked-list pages, and from a rotating deep
+refresh that re-reads recent posts via the post API. Each post is deep-refreshed at most once
+every 10 minutes, so a sync right after a quiet one issues no extra requests. If a status ever
+reads `sync incomplete — check connection`, the walk hit a network or auth error and stopped
+early — the next sync picks up where it left off.
 
 ---
 

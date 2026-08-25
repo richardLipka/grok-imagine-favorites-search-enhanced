@@ -3,6 +3,51 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.62] — 2026-08-25
+
+Sync correctness and performance pass. No new UI.
+
+### Fixed
+- **New variations of older posts are now indexed.** Deep refresh only ever revisited posts
+  that *already* had children, so a post's **first** child was undiscoverable unless the post
+  sat in the first 4 pages of the liked feed. Childless parents are now candidates too, with
+  reserved slots in each refresh batch.
+- **Index corruption during sync.** Parallel deep-refresh workers wrote rows into `allPosts`
+  by array position using an index map that a concurrent child removal had already
+  invalidated, overwriting unrelated posts. Rows are now updated in place, keyed by id, and
+  post/get results are applied serially after fetching.
+- **A liked post that also appears as another post's child no longer loses its identity.**
+  Because IndexedDB is keyed on id, writing the child form overwrote the parent row and
+  flipped it to `isChild` — hiding it behind **Hide childs**. Such posts are no longer
+  collected as child rows.
+- **Network errors no longer report "up to date".** A failed liked-list page was
+  indistinguishable from the end of the feed; the walk now reports `sync incomplete — check
+  connection` instead of silently truncating.
+- **Sync triggers are no longer dropped.** A trigger arriving mid-sync (typically returning
+  from a post page right after generating an image) is remembered and re-run.
+- A malformed `post/get` payload could prune every child of a post. Child lists are only
+  treated as authoritative when the payload's id matches the post being refreshed.
+- **Reindex** could loop forever on a repeating cursor; the walk is now bounded and paced.
+- Selecting images then typing in the search box no longer clears the selection — selections
+  now persist across filter changes and only drop when a post leaves the index.
+
+### Changed
+- `metadataRefreshedAt` is now actually used: it gates deep refresh with a 10-minute TTL, so
+  repeated syncs rotate through the recent window instead of re-fetching the same 24 posts
+  every time. A quiet sync now issues no `post/get` requests at all.
+- Syncs triggered by SPA navigation are rate-limited (15 s), matching the existing focus limit.
+- Index writes during a sync are batched into one transaction pair instead of two per post.
+- Removed the unreachable `fetchNewPostsOnly()` fast path, which also skipped new children.
+
+### Performance
+- Post lookups, filtering, and sorting use a persistent id map and per-row cached
+  `createTime`/search text instead of rebuilding maps and re-parsing dates on every pass.
+  Derived fields are stripped by `toStorageRecord()`, so IndexedDB and the JSON export are
+  unchanged.
+- The date filter computed its bounds once per post; it now computes them once per pass.
+
+---
+
 ## [1.61] — 2026-06-10
 
 ### Added

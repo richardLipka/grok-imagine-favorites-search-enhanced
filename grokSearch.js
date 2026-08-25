@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.61
+// @version      1.62
 // @description  Search, filter, and paginate saved Grok media; lightbox, bulk folder download, EXIF prompt tags.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -40,7 +40,18 @@
   /** Parallel post/get for items with children (full child tree from API). */
   const SYNC_DEEP_REFRESH_LIMIT = 24;
   const SYNC_DEEP_CONCURRENCY = 5;
+  /**
+   * Slots inside SYNC_DEEP_REFRESH_LIMIT reserved for recent parents that have no
+   * children yet. Without this, posts with children always fill the budget and a
+   * post's *first* child is never discovered outside the list-refresh window.
+   */
+  const SYNC_DEEP_CHILDLESS_SLOTS = 8;
+  /** Skip deep refresh for posts refreshed more recently than this. */
+  const SYNC_DEEP_REFRESH_TTL_MS = 10 * 60 * 1000;
   const SYNC_FOCUS_MIN_INTERVAL_MS = 60 * 1000;
+  const SYNC_NAV_MIN_INTERVAL_MS = 15 * 1000;
+  /** Hard stops for the full-reindex walk (defensive against a repeating cursor). */
+  const FULL_INDEX_MAX_PAGES = 2000;
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 3;
   const DB_NAME = 'GrokSearchIndex';
@@ -65,6 +76,8 @@
   const BULK_DOWNLOAD_CONFIRM_ABOVE = 5;
 
   let allPosts = [];
+  /** id → the live row object inside allPosts. Rows are updated in place, never by array index. */
+  const postById = new Map();
   let searchBarExpanded = true;
   const knownIds = new Set();
   let currentQuery = '';
@@ -89,6 +102,8 @@
   let renderResultsPending = false;
   let lastIncrementalSyncAt = 0;
   let syncDebounceTimer = null;
+  /** Reason of a sync trigger that arrived while another sync was running. */
+  let pendingSyncReason = null;
   let searchFilterDebounceTimer = null;
   let lightboxIndex = -1;
   let contextMenuPostId = null;
@@ -156,6 +171,10 @@
   }
 
   // ─── API & fetch ───────────────────────────────────────────────────────────
+  /**
+   * Always resolves. `ok:false` means the request failed — callers must not confuse that
+   * with the end of the feed, or a 401/429 mid-walk silently reports "up to date".
+   */
   function fetchPage(cursor) {
     return new Promise(resolve => {
       const body = { limit: 40, filter: { source: 'MEDIA_POST_SOURCE_LIKED', safeForWork: false } };
@@ -165,8 +184,21 @@
         headers: { 'Content-Type': 'application/json' },
         data: JSON.stringify(body),
         withCredentials: true,
-        onload: res => { try { resolve(JSON.parse(res.responseText)); } catch { resolve(null); } },
-        onerror: () => resolve(null),
+        onload: res => {
+          if (res.status < 200 || res.status >= 300) {
+            console.warn(`[GrokSearch] list HTTP ${res.status}`);
+            resolve({ ok: false, status: res.status });
+            return;
+          }
+          try {
+            const data = JSON.parse(res.responseText);
+            resolve({ ok: true, posts: data?.posts || [], nextCursor: data?.nextCursor || null });
+          } catch {
+            console.warn('[GrokSearch] list response was not JSON');
+            resolve({ ok: false, status: res.status });
+          }
+        },
+        onerror: () => resolve({ ok: false, status: 0 }),
       });
     });
   }
@@ -249,8 +281,63 @@
     return row;
   }
 
+  /**
+   * Derived fields cached on the in-memory row. They are recomputed on every write and
+   * dropped by toStorageRecord(), so they never reach IndexedDB or the JSON export.
+   */
+  const RUNTIME_MS = '_ms';
+  const RUNTIME_SEARCH = '_search';
+
+  function computeCreatedMs(createTime) {
+    if (!createTime) return 0;
+    const t = new Date(createTime).getTime();
+    return Number.isNaN(t) ? 0 : t;
+  }
+
+  /** Lowercased haystack for the text filter: own prompt, plus parent prompt for child rows. */
+  function computeSearchText(row) {
+    const own = String(row.prompt || '').trim();
+    if (!row.isChild) return own.toLowerCase();
+    const parent = String(row.parentPrompt || '').trim();
+    const parts = [...new Set([own, parent].filter(Boolean))];
+    return parts.join(' ').toLowerCase();
+  }
+
+  /** Canonical row + cached derived fields. Everything placed into allPosts goes through this. */
   function normalizePost(post) {
-    return toStorageRecord(post);
+    const row = toStorageRecord(post);
+    row[RUNTIME_MS] = computeCreatedMs(row.createTime);
+    row[RUNTIME_SEARCH] = computeSearchText(row);
+    return row;
+  }
+
+  // ─── allPosts / postById maintenance ────────────────────────────────────────
+  /** Full rebuild of the id map. Only needed after allPosts is replaced or filtered. */
+  function rebuildPostIndex() {
+    postById.clear();
+    for (const p of allPosts) postById.set(p.id, p);
+  }
+
+  function addPostRow(row) {
+    allPosts.push(row);
+    postById.set(row.id, row);
+    knownIds.add(row.id);
+    return row;
+  }
+
+  /**
+   * Update an existing row in place, keyed by id. Mutating the live object keeps every
+   * array position and every reference held by matchedPosts/lightbox valid, which is why
+   * no caller needs an array index.
+   */
+  function updatePostRow(next) {
+    const current = postById.get(next.id);
+    if (!current) return null;
+    for (const key of Object.keys(current)) {
+      if (!(key in next)) delete current[key];
+    }
+    Object.assign(current, next);
+    return current;
   }
 
   function buildParentPromptIndex() {
@@ -290,8 +377,14 @@
     ).trim();
   }
 
-  /** Fulltext prompt search — child rows always include parentPrompt (field or live parent lookup). */
+  /**
+   * Fulltext prompt search — child rows always include parentPrompt (cached field, or a
+   * live parent lookup for rows whose parentPrompt has not been backfilled yet).
+   */
   function getSearchablePromptText(post, parentPromptById) {
+    const cached = post[RUNTIME_SEARCH];
+    if (typeof cached === 'string' && (cached || !isChildPost(post))) return cached;
+
     const own = String(post.prompt || '').trim();
     if (!isChildPost(post)) return own.toLowerCase();
 
@@ -328,12 +421,25 @@
     });
   }
 
+  /**
+   * A post can be liked in its own right *and* appear in another post's childPosts tree.
+   * IndexedDB is keyed on id, so writing the child form of such a post would overwrite the
+   * parent row and flip it to isChild — hide it behind "Hide childs" and lose its counts.
+   * Rows that already exist as a parent are therefore never re-collected as children.
+   */
+  function shadowsExistingParent(childId, parentId) {
+    if (childId === parentId) return true;
+    const existing = postById.get(childId);
+    return Boolean(existing && !existing.isChild);
+  }
+
   function collectChildRecords(parentRaw, parentParsed) {
     const records = [];
     const seen = new Set();
     walkDescendantPosts(parentRaw, child => {
       if (!child?.id || seen.has(child.id)) return;
       seen.add(child.id);
+      if (shadowsExistingParent(String(child.id), parentParsed?.id)) return;
       const parsed = parseChildPost(parentRaw, child, parentParsed);
       if (parsed) records.push(stampMetadataRefreshed(parsed));
     });
@@ -350,38 +456,70 @@
       }
       return true;
     });
+    if (removedIds.length) rebuildPostIndex();
     return removedIds;
   }
 
-  async function syncChildRecordsForParent(parentRaw, parentParsed, idToIndex) {
+  /**
+   * Buffers index writes for one sync run, so a pass over N parents costs a couple of
+   * IndexedDB transactions instead of two per parent. Buffered rows are the live objects
+   * from allPosts, so a later in-place update is picked up by flush().
+   */
+  function createIndexWriter() {
+    const puts = new Map();
+    const deletes = new Set();
+    return {
+      put(row) {
+        if (!row?.id) return;
+        deletes.delete(row.id);
+        puts.set(row.id, row);
+      },
+      del(id) {
+        if (!id) return;
+        puts.delete(id);
+        deletes.add(id);
+      },
+      async flush() {
+        const rows = [...puts.values()];
+        const ids = [...deletes];
+        puts.clear();
+        deletes.clear();
+        if (ids.length) await dbDeleteMany(ids);
+        if (rows.length) await dbPutMany(rows);
+        return rows.length + ids.length;
+      },
+    };
+  }
+
+  /** Synchronous by design: it mutates the index and buffers writes, so it cannot interleave. */
+  function syncChildRecordsForParent(parentRaw, parentParsed, writer) {
     if (!parentParsed?.id) return { added: 0, updated: 0, removed: 0 };
+    // The payload must be recognisable as this post before its child list is treated as
+    // authoritative — otherwise a malformed response prunes every child the parent has.
+    if (String(parentRaw?.id || '') !== parentParsed.id) {
+      console.warn(`[GrokSearch] Skipped child sync for ${parentParsed.id}: unexpected payload`);
+      return { added: 0, updated: 0, removed: 0 };
+    }
     const childRecords = collectChildRecords(parentRaw, parentParsed);
     const keepIds = new Set(childRecords.map(c => c.id));
     const removedIds = removeChildrenOfParent(parentParsed.id, keepIds);
+    for (const id of removedIds) writer.del(id);
 
-    const added = [];
-    const updated = [];
+    let added = 0;
+    let updated = 0;
     for (const child of childRecords) {
-      const idx = idToIndex.get(child.id);
-      if (idx === undefined) {
-        allPosts.push(child);
-        knownIds.add(child.id);
-        added.push(child);
-        idToIndex.set(child.id, allPosts.length - 1);
+      const cached = postById.get(child.id);
+      if (!cached) {
+        writer.put(addPostRow(child));
+        added++;
         continue;
       }
-      const cached = allPosts[idx];
       const merged = stampMetadataRefreshed(normalizePost({ ...cached, ...child }));
-      if (postMetadataChanged(cached, merged)) {
-        allPosts[idx] = merged;
-        updated.push(merged);
-      }
+      if (!postMetadataChanged(cached, merged)) continue;
+      writer.put(updatePostRow(merged) || addPostRow(merged));
+      updated++;
     }
-
-    if (removedIds.length) await dbDeleteMany(removedIds);
-    const toPut = [...added, ...updated];
-    if (toPut.length) await dbPutMany(toPut);
-    return { added: added.length, updated: updated.length, removed: removedIds.length };
+    return { added, updated, removed: removedIds.length };
   }
 
   function isImagineListPage() {
@@ -425,19 +563,18 @@
     });
   }
 
-  async function propagateParentPromptToChildren(parentId, parentPrompt) {
+  /** Only worth running when the parent prompt actually changed — callers must check first. */
+  function propagateParentPromptToChildren(parentId, parentPrompt, writer) {
     const pp = String(parentPrompt || '');
-    const updated = [];
-    for (let i = 0; i < allPosts.length; i++) {
-      const p = allPosts[i];
+    let count = 0;
+    for (const p of allPosts) {
       if (!isChildPost(p) || p.parentId !== parentId) continue;
       if ((p.parentPrompt || '') === pp) continue;
       const row = stampMetadataRefreshed(normalizePost({ ...p, parentPrompt: pp }));
-      allPosts[i] = row;
-      updated.push(row);
+      writer.put(updatePostRow(row) || p);
+      count++;
     }
-    if (updated.length) await dbPutMany(updated);
-    return updated.length;
+    return count;
   }
 
   function postMetadataChanged(before, after) {
@@ -467,10 +604,11 @@
       else if (!parentPromptById.has(p.parentId)) missingParent++;
       if (!getSearchablePromptText(p, parentPromptById).trim()) emptySearchText++;
     }
+    const children = allPosts.reduce((n, r) => n + (isChildPost(r) ? 1 : 0), 0);
     const summary = {
       total: allPosts.length,
-      parents: allPosts.filter(r => !isChildPost(r)).length,
-      children: allPosts.filter(r => isChildPost(r)).length,
+      parents: allPosts.length - children,
+      children,
       orphans,
       childMissingParent: missingParent,
       emptySearchText,
@@ -485,32 +623,42 @@
       if (!isChildPost(p)) parentPromptById.set(p.id, p.prompt || '');
     }
     const updated = [];
-    for (let i = 0; i < allPosts.length; i++) {
-      const p = allPosts[i];
+    for (const p of allPosts) {
       if (!isChildPost(p) || !p.parentId) continue;
       const nextParentPrompt = parentPromptById.get(p.parentId) || '';
       if ((p.parentPrompt || '') === nextParentPrompt) continue;
       const row = normalizePost({ ...p, parentPrompt: nextParentPrompt });
-      allPosts[i] = row;
-      updated.push(row);
+      updated.push(updatePostRow(row) || p);
     }
     return updated;
   }
 
-  function postNeedsDeepRefresh(post) {
-    if (isChildPost(post)) return false;
+  /** True for parents whose child tree is worth re-fetching via post/get. */
+  function postHasKnownChildren(post) {
     return (post.childPostCount ?? 0) > 0
       || (post.childImageCount ?? 0) > 0
       || (post.childVideoCount ?? 0) > 0
       || (post.videoCount ?? 0) > 1;
   }
 
-  function stampMetadataRefreshed(post) {
-    return { ...post, [METADATA_REFRESH_KEY]: Date.now() };
+  function metadataAgeMs(post) {
+    const at = post?.[METADATA_REFRESH_KEY];
+    return typeof at === 'number' ? Date.now() - at : Infinity;
   }
 
-  function buildPostIdIndex() {
-    return new Map(allPosts.map((p, i) => [p.id, i]));
+  /**
+   * Deep-refresh candidacy. Childless parents qualify too — that is the only way a post's
+   * *first* child is ever discovered outside the list-refresh window; SYNC_DEEP_CHILDLESS_SLOTS
+   * reserves budget for them. Recently refreshed rows are skipped so repeated syncs stop
+   * re-fetching the same top-of-feed posts.
+   */
+  function postNeedsDeepRefresh(post) {
+    if (isChildPost(post)) return false;
+    return metadataAgeMs(post) >= SYNC_DEEP_REFRESH_TTL_MS;
+  }
+
+  function stampMetadataRefreshed(post) {
+    return { ...post, [METADATA_REFRESH_KEY]: Date.now() };
   }
 
   async function runPool(items, concurrency, fn) {
@@ -531,20 +679,19 @@
    * New posts from liked list + in-place metadata refresh (child counts from childPosts on list payload).
    */
   async function syncLikedFeed(statusEl) {
-    let idToIndex = buildPostIdIndex();
-    const listUpdatedIds = new Set();
+    const writer = createIndexWriter();
     const newPosts = [];
-    const updatedPosts = [];
     let newCount = 0;
     let listUpdatedCount = 0;
     let childSyncCount = 0;
     let cursor = null;
     let pageIndex = 0;
+    let failed = false;
 
     while (true) {
-      const data = await fetchPage(cursor);
-      if (!data) break;
-      const posts = data.posts || [];
+      const page = await fetchPage(cursor);
+      if (!page.ok) { failed = true; break; }
+      const posts = page.posts;
       if (posts.length === 0) break;
 
       const refreshThisPage = pageIndex < SYNC_LIST_REFRESH_PAGES;
@@ -555,30 +702,35 @@
         if (!parsed) continue;
 
         if (!knownIds.has(parsed.id)) {
-          const parentRow = stampMetadataRefreshed(parsed);
-          newPosts.push(parentRow);
+          // Register the parent before collecting children so a child that is also a
+          // liked post in its own right is not re-collected as a child row.
+          newPosts.push(addPostRow(stampMetadataRefreshed(normalizePost(parsed))));
           for (const child of collectChildRecords(raw, parsed)) {
-            newPosts.push(child);
+            if (knownIds.has(child.id)) continue;
+            newPosts.push(addPostRow(child));
           }
           pageNew++;
           continue;
         }
 
         if (refreshThisPage) {
-          const idx = idToIndex.get(parsed.id);
-          if (idx !== undefined) {
-            const cached = allPosts[idx];
-            const merged = stampMetadataRefreshed(normalizePost({ ...cached, ...parsed }));
-            if (postMetadataChanged(cached, merged)) {
-              allPosts[idx] = merged;
-              updatedPosts.push(merged);
-              listUpdatedIds.add(parsed.id);
+          const cached = postById.get(parsed.id);
+          if (cached) {
+            const previousPrompt = cached.prompt;
+            // Deliberately not stamped: METADATA_REFRESH_KEY tracks the last *deep*
+            // (post/get) refresh, and the list payload may carry a shallower child tree.
+            const merged = normalizePost({ ...cached, ...parsed });
+            const changed = postMetadataChanged(cached, merged);
+            const row = changed ? (updatePostRow(merged) || cached) : cached;
+            if (changed) {
+              writer.put(row);
               listUpdatedCount++;
             }
-            childSyncCount += await propagateParentPromptToChildren(merged.id, merged.prompt);
-            const childStats = await syncChildRecordsForParent(raw, merged, idToIndex);
+            if (row.prompt !== previousPrompt) {
+              childSyncCount += propagateParentPromptToChildren(row.id, row.prompt, writer);
+            }
+            const childStats = syncChildRecordsForParent(raw, row, writer);
             childSyncCount += childStats.added + childStats.updated + childStats.removed;
-            idToIndex = buildPostIdIndex();
           }
         }
       }
@@ -587,78 +739,109 @@
       const needNewPages = pageNew > 0;
       const needRefreshPages = pageIndex < SYNC_LIST_REFRESH_PAGES;
       if (!needNewPages && !needRefreshPages) break;
-      if (!data.nextCursor) break;
+      if (!page.nextCursor) break;
 
-      cursor = data.nextCursor;
+      cursor = page.nextCursor;
       if (statusEl) {
-        setLoadStatus(`syncing… +${newPosts.length + pageNew} new, ${listUpdatedCount} updated`);
+        setLoadStatus(`syncing… +${newPosts.length} new, ${listUpdatedCount} updated`);
       }
       await sleep(SYNC_LIST_PAGE_DELAY_MS);
     }
 
     if (newPosts.length > 0) {
-      for (const p of newPosts) knownIds.add(p.id);
-      allPosts = [...newPosts, ...allPosts];
       sortAllPostsNewestFirst();
-      await dbPutMany(newPosts);
+      for (const p of newPosts) writer.put(p);
       newCount = newPosts.length;
       console.log(`[GrokSearch] +${newCount} new row(s) from liked list (parents + children)`);
-      idToIndex = buildPostIdIndex();
     }
 
-    if (updatedPosts.length > 0) {
-      await dbPutMany(updatedPosts);
+    await writer.flush();
+    if (listUpdatedCount > 0) {
       console.log(`[GrokSearch] List refresh: ${listUpdatedCount} parent(s)`);
     }
 
-    const deepUpdatedCount = await refreshPostsViaGet(statusEl, listUpdatedIds, buildPostIdIndex());
+    const deepUpdatedCount = await refreshPostsViaGet(statusEl);
     return {
       newCount,
       updatedCount: listUpdatedCount + deepUpdatedCount + childSyncCount,
-      listUpdatedIds,
+      failed,
     };
   }
 
   /** post/get for recent items with children — parallel, skips rows already updated from list. */
-  async function refreshPostsViaGet(statusEl, skipIds, idToIndex) {
+  /**
+   * Picks the deep-refresh batch from the newest parents, reserving SYNC_DEEP_CHILDLESS_SLOTS
+   * for parents that have no children yet so a first variation can be discovered.
+   */
+  function pickDeepRefreshTargets() {
     const withChildren = [];
-    const rest = [];
+    const childless = [];
+    const scanLimit = SYNC_DEEP_REFRESH_LIMIT * 8;
+    let scanned = 0;
     for (const p of allPosts) {
-      if (isChildPost(p) || skipIds.has(p.id)) continue;
-      if (postNeedsDeepRefresh(p)) withChildren.push(p);
-      else rest.push(p);
+      if (isChildPost(p)) continue;
+      if (++scanned > scanLimit) break;
+      if (!postNeedsDeepRefresh(p)) continue;
+      if (postHasKnownChildren(p)) withChildren.push(p);
+      else childless.push(p);
+      // Both buckets must fill before stopping — posts with children dominate the head of
+      // the feed, so an early break would leave the reserved childless slots empty.
       if (withChildren.length >= SYNC_DEEP_REFRESH_LIMIT
-        && withChildren.length + rest.length >= SYNC_DEEP_REFRESH_LIMIT * 2) break;
+        && childless.length >= SYNC_DEEP_CHILDLESS_SLOTS) break;
     }
-    const targets = [...withChildren, ...rest].slice(0, SYNC_DEEP_REFRESH_LIMIT);
+    const reserved = Math.min(SYNC_DEEP_CHILDLESS_SLOTS, childless.length);
+    const chosenParents = withChildren.slice(0, SYNC_DEEP_REFRESH_LIMIT - reserved);
+    const chosenChildless = childless.slice(0, SYNC_DEEP_REFRESH_LIMIT - chosenParents.length);
+    return [...chosenParents, ...chosenChildless];
+  }
+
+  /**
+   * post/get for recent parents — parallel fetch, serial apply. The TTL gate makes the
+   * batch rotate through the recent window instead of re-fetching the same top-24 on
+   * every single sync the way it used to.
+   */
+  async function refreshPostsViaGet(statusEl) {
+    const targets = pickDeepRefreshTargets();
     if (!targets.length) return 0;
 
-    const updated = [];
+    const writer = createIndexWriter();
+    const fetched = [];
+    let updatedCount = 0;
     let childSyncCount = 0;
     let done = 0;
 
+    // Fetch in parallel, then apply serially: applying inside the pool would let one
+    // worker's index mutation land between another worker's read and write.
     await runPool(targets, SYNC_DEEP_CONCURRENCY, async cached => {
       const remote = await fetchRemotePost(cached.id);
       done++;
       if (statusEl && done % 6 === 0) {
         setLoadStatus(`deep refresh… ${done}/${targets.length}`);
       }
-      if (!remote) return;
-      const merged = stampMetadataRefreshed(mergePostFromRemote(cached, remote));
-      const idx = idToIndex.get(cached.id);
-      if (idx !== undefined) allPosts[idx] = merged;
-      if (postMetadataChanged(cached, merged)) updated.push(merged);
-      childSyncCount += await propagateParentPromptToChildren(merged.id, merged.prompt);
-      const childStats = await syncChildRecordsForParent(remote, merged, idToIndex);
-      childSyncCount += childStats.added + childStats.updated + childStats.removed;
-      idToIndex = buildPostIdIndex();
+      if (remote) fetched.push({ id: cached.id, remote });
     });
 
-    if (updated.length > 0) await dbPutMany(updated);
-    if (updated.length > 0 || childSyncCount > 0) {
-      console.log(`[GrokSearch] Deep refresh: ${updated.length} parent(s), ${childSyncCount} child row change(s)`);
+    for (const { id, remote } of fetched) {
+      const cached = postById.get(id);
+      if (!cached) continue;
+      const previousPrompt = cached.prompt;
+      const merged = stampMetadataRefreshed(mergePostFromRemote(cached, remote));
+      const changed = postMetadataChanged(cached, merged);
+      const row = updatePostRow(merged) || cached;
+      writer.put(row);
+      if (changed) updatedCount++;
+      if (row.prompt !== previousPrompt) {
+        childSyncCount += propagateParentPromptToChildren(row.id, row.prompt, writer);
+      }
+      const childStats = syncChildRecordsForParent(remote, row, writer);
+      childSyncCount += childStats.added + childStats.updated + childStats.removed;
     }
-    return updated.length + childSyncCount;
+
+    await writer.flush();
+    if (updatedCount > 0 || childSyncCount > 0) {
+      console.log(`[GrokSearch] Deep refresh: ${updatedCount} parent(s), ${childSyncCount} child row change(s)`);
+    }
+    return updatedCount + childSyncCount;
   }
 
   function formatSyncStatusMessage(newCount, refreshedCount) {
@@ -669,34 +852,49 @@
     return `${parts.join(', ')} (${allPosts.length.toLocaleString()} total)`;
   }
 
-  async function runIncrementalSync(reason, options = {}) {
-    const { refreshRecent = true, quiet = false } = options;
-    if (!isImagineListPage()) return;
-    if (indexing || syncInProgress || !loaded) return;
+  function syncMinIntervalMs(reason) {
+    if (reason === 'focus') return SYNC_FOCUS_MIN_INTERVAL_MS;
+    if (reason === 'navigation') return SYNC_NAV_MIN_INTERVAL_MS;
+    return 0;
+  }
 
-    const now = Date.now();
-    if (reason === 'focus' && now - lastIncrementalSyncAt < SYNC_FOCUS_MIN_INTERVAL_MS) return;
+  async function runIncrementalSync(reason, options = {}) {
+    const { quiet = false } = options;
+    if (!isImagineListPage()) return;
+    if (indexing || !loaded) return;
+    // A trigger that arrives mid-sync is remembered, not dropped: returning from a post
+    // page right after generating an image is exactly when one tends to land.
+    if (syncInProgress) {
+      pendingSyncReason = reason;
+      return;
+    }
+    if (Date.now() - lastIncrementalSyncAt < syncMinIntervalMs(reason)) return;
 
     syncInProgress = true;
     const statusEl = document.getElementById('grok-stamp-status');
     try {
       if (!db) db = await openDB();
       if (!quiet && statusEl) statusEl.textContent = 'syncing…';
-      const { newCount, updatedCount: refreshedCount } = refreshRecent
-        ? await syncLikedFeed(statusEl)
-        : await fetchNewPostsOnly(statusEl);
+      const { newCount, updatedCount: refreshedCount, failed } = await syncLikedFeed(statusEl);
       lastIncrementalSyncAt = Date.now();
       if (!quiet && statusEl) {
-        statusEl.textContent = formatSyncStatusMessage(newCount, refreshedCount);
-        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
+        statusEl.textContent = failed
+          ? 'sync incomplete — check connection'
+          : formatSyncStatusMessage(newCount, refreshedCount);
+        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, failed ? 5000 : 3000);
       }
       if (newCount > 0 || refreshedCount > 0) applyFilter();
-      console.log(`[GrokSearch] Sync (${reason}): +${newCount} new, ${refreshedCount} metadata updated`);
+      console.log(`[GrokSearch] Sync (${reason}): +${newCount} new, ${refreshedCount} metadata updated${failed ? ' (incomplete)' : ''}`);
     } catch (e) {
       console.error(`[GrokSearch] Sync failed (${reason}):`, e);
       if (!quiet && statusEl) statusEl.textContent = 'sync failed';
     } finally {
       syncInProgress = false;
+      if (pendingSyncReason) {
+        const next = pendingSyncReason;
+        pendingSyncReason = null;
+        scheduleIncrementalSync(next, options);
+      }
     }
   }
 
@@ -713,7 +911,9 @@
     indexing = true;
     loaded = false;
     allPosts = [];
+    postById.clear();
     knownIds.clear();
+    selectedPostIds.clear();
     matchedPosts = [];
     currentPage = 0;
     if (reindexBtn) reindexBtn.disabled = true;
@@ -860,79 +1060,48 @@
     }
   }
 
-  function sortAllPostsNewestFirst() {
-    allPosts.sort((a, b) => {
-      const ta = a.createTime ? new Date(a.createTime).getTime() : 0;
-      const tb = b.createTime ? new Date(b.createTime).getTime() : 0;
-      return tb - ta;
-    });
+  function byCreatedDesc(a, b) {
+    return (b[RUNTIME_MS] ?? 0) - (a[RUNTIME_MS] ?? 0);
   }
 
-  /** New IDs only — no metadata refresh (fast path). */
-  async function fetchNewPostsOnly(statusEl) {
-    let cursor = null;
-    const newPosts = [];
-    while (true) {
-      const data = await fetchPage(cursor);
-      if (!data) break;
-      const posts = data.posts || [];
-      if (posts.length === 0) break;
-
-      let pageNew = 0;
-      for (const post of posts) {
-        const parsed = parsePost(post);
-        if (!parsed || knownIds.has(parsed.id)) continue;
-        newPosts.push(stampMetadataRefreshed(parsed));
-        for (const child of collectChildRecords(post, parsed)) {
-          if (!knownIds.has(child.id)) newPosts.push(child);
-        }
-        pageNew++;
-      }
-
-      if (pageNew === 0) break;
-      if (!data.nextCursor) break;
-      cursor = data.nextCursor;
-      if (statusEl) statusEl.textContent = `checking new… +${newPosts.length}`;
-      await sleep(SYNC_LIST_PAGE_DELAY_MS);
-    }
-
-    if (newPosts.length > 0) {
-      for (const p of newPosts) knownIds.add(p.id);
-      allPosts = [...newPosts, ...allPosts];
-      sortAllPostsNewestFirst();
-      await dbPutMany(newPosts);
-    }
-    return { newCount: newPosts.length, updatedCount: 0 };
+  function sortAllPostsNewestFirst() {
+    allPosts.sort(byCreatedDesc);
   }
 
   async function fetchFullIndex(statusEl) {
     const allFetched = [];
     let cursor = null;
+    let pageIndex = 0;
+    const seenCursors = new Set();
     while (true) {
-      const data = await fetchPage(cursor);
-      if (!data) break;
-      const posts = data.posts || [];
+      const page = await fetchPage(cursor);
+      if (!page.ok) break;
+      const posts = page.posts;
       for (const post of posts) {
         const parsed = parsePost(post);
         if (!parsed || knownIds.has(parsed.id)) continue;
-        allFetched.push(stampMetadataRefreshed(parsed));
-        knownIds.add(parsed.id);
+        allFetched.push(addPostRow(stampMetadataRefreshed(normalizePost(parsed))));
         for (const child of collectChildRecords(post, parsed)) {
           if (knownIds.has(child.id)) continue;
-          allFetched.push(child);
-          knownIds.add(child.id);
+          allFetched.push(addPostRow(child));
         }
       }
       if (statusEl) setLoadStatus(`indexing… ${allFetched.length.toLocaleString()}`);
-      cursor = data.nextCursor || null;
+      cursor = page.nextCursor;
       if (!cursor || posts.length === 0) break;
+      // A cursor that repeats (or a feed that never terminates) would otherwise loop forever.
+      if (seenCursors.has(cursor)) {
+        console.warn('[GrokSearch] Full index stopped: repeated cursor');
+        break;
+      }
+      seenCursors.add(cursor);
+      if (++pageIndex >= FULL_INDEX_MAX_PAGES) {
+        console.warn(`[GrokSearch] Full index stopped at ${FULL_INDEX_MAX_PAGES} pages`);
+        break;
+      }
+      await sleep(SYNC_LIST_PAGE_DELAY_MS);
     }
-    allFetched.sort((a, b) => {
-      const ta = a.createTime ? new Date(a.createTime).getTime() : 0;
-      const tb = b.createTime ? new Date(b.createTime).getTime() : 0;
-      return tb - ta;
-    });
-    for (const p of allFetched) allPosts.push(p);
+    sortAllPostsNewestFirst();
     const chunkSize = 500;
     for (let i = 0; i < allFetched.length; i += chunkSize) {
       await dbPutMany(allFetched.slice(i, i + chunkSize));
@@ -1073,12 +1242,9 @@
       db = await openDB();
       const cached = await dbGetAll();
       if (cached.length > 0) {
-        const seen = new Set();
         for (const p of cached) {
-          if (seen.has(p.id)) continue;
-          seen.add(p.id);
-          knownIds.add(p.id);
-          allPosts.push(normalizePost(p));
+          if (knownIds.has(p.id)) continue;
+          addPostRow(normalizePost(p));
         }
         sortAllPostsNewestFirst();
         const backfilled = backfillChildParentPrompts();
@@ -1091,11 +1257,13 @@
           setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2000);
         }
         setLoadStatus('syncing…');
-        const { newCount, updatedCount: refreshedCount } = await syncLikedFeed(statusEl);
+        const { newCount, updatedCount: refreshedCount, failed } = await syncLikedFeed(statusEl);
         lastIncrementalSyncAt = Date.now();
         if (statusEl) {
-          setLoadStatus(formatSyncStatusMessage(newCount, refreshedCount));
-          setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
+          setLoadStatus(failed
+            ? 'sync incomplete — check connection'
+            : formatSyncStatusMessage(newCount, refreshedCount));
+          setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, failed ? 5000 : 3000);
         }
       } else {
         setLoadStatus('first-time indexing…');
@@ -1114,6 +1282,8 @@
       indexing = false;
       if (loaded) {
         applyFilter();
+        // Second pass on the next frame: the first showResults() can bail when the results
+        // grid has nowhere to mount yet, and enforceDisplayMode() alone does not re-render.
         requestAnimationFrame(() => {
           applyFilter();
           scheduleEnforceDisplay();
@@ -1470,7 +1640,7 @@
 
   function getPostById(id) {
     if (!id) return null;
-    return matchedPosts.find(p => p.id === id) || allPosts.find(p => p.id === id) || null;
+    return postById.get(id) || null;
   }
 
   function postHasChildPosts(post) {
@@ -1495,11 +1665,7 @@
       }
     };
     walk(id);
-    out.sort((a, b) => {
-      const ta = a.createTime ? new Date(a.createTime).getTime() : 0;
-      const tb = b.createTime ? new Date(b.createTime).getTime() : 0;
-      return ta - tb;
-    });
+    out.sort((a, b) => -byCreatedDesc(a, b));
     return out;
   }
 
@@ -1768,10 +1934,13 @@
       .catch(() => flashStampStatus('download failed'));
   }
 
+  /**
+   * Drops only ids that left the index entirely. Pruning against the *match set* used to
+   * clear the selection as soon as the user typed another character.
+   */
   function pruneSelection() {
-    const validIds = new Set(matchedPosts.map(p => p.id));
     for (const id of selectedPostIds) {
-      if (!validIds.has(id)) selectedPostIds.delete(id);
+      if (!postById.has(id)) selectedPostIds.delete(id);
     }
   }
 
@@ -1796,8 +1965,15 @@
     syncDownloadSelectedButtons();
   }
 
+  /** Every selected row, in the current sort order — selections survive a filter change. */
   function getSelectedPostsInOrder() {
-    return matchedPosts.filter(p => selectedPostIds.has(p.id));
+    const posts = [];
+    for (const id of selectedPostIds) {
+      const post = postById.get(id);
+      if (post) posts.push(post);
+    }
+    posts.sort(byCreatedDesc);
+    return currentSort === 'oldest' ? posts.reverse() : posts;
   }
 
   async function pickDownloadFolder() {
@@ -2454,6 +2630,8 @@
     const queryLower = (currentQuery || '').toLowerCase().trim();
     const terms = queryLower ? queryLower.split(/\s+/).filter(Boolean) : [];
     const parentPromptById = terms.length > 0 ? buildParentPromptIndex() : null;
+    // Hoisted: these were recomputed per post, which meant two Date objects per row per pass.
+    const dateBounds = hasDateFilter() ? getDateFilterBounds() : null;
 
     matchedPosts = allPosts.filter(post => {
       if (filterHideChilds && isChildPost(post)) return false;
@@ -2462,17 +2640,15 @@
         const p = getSearchablePromptText(post, parentPromptById);
         if (!terms.every(t => p.includes(t))) return false;
       }
-      if (!matchesDateFilter(post)) return false;
+      if (dateBounds && !matchesDateBounds(post, dateBounds)) return false;
       if (!matchesVideoFilters(post)) return false;
       if (filterOnlyChildren && (post.childPostCount ?? 0) < filterMinChildren) return false;
       return true;
     });
 
-    matchedPosts.sort((a, b) => {
-      const ta = a.createTime ? new Date(a.createTime).getTime() : 0;
-      const tb = b.createTime ? new Date(b.createTime).getTime() : 0;
-      return currentSort === 'oldest' ? ta - tb : tb - ta;
-    });
+    matchedPosts.sort(currentSort === 'oldest'
+      ? (a, b) => -byCreatedDesc(a, b)
+      : byCreatedDesc);
 
     pruneSelection();
     syncResultsView();
@@ -2804,6 +2980,8 @@
   }
 
   function postCreatedMs(post) {
+    const cached = post[RUNTIME_MS];
+    if (typeof cached === 'number') return cached || null;
     if (!post.createTime) return null;
     const t = new Date(post.createTime).getTime();
     return Number.isNaN(t) ? null : t;
@@ -2868,15 +3046,14 @@
     return { startMs, endMs };
   }
 
-  function matchesDateFilter(post) {
-    if (!hasDateFilter()) return true;
-    const { startMs, endMs } = getDateFilterBounds();
+  function matchesDateBounds(post, { startMs, endMs }) {
     const ms = postCreatedMs(post);
     if (ms === null) return false;
     if (startMs !== null && ms < startMs) return false;
     if (endMs !== null && ms > endMs) return false;
     return true;
   }
+
 
   function updateClearButton() {
     const clearBtn = document.getElementById('grok-search-clear');
