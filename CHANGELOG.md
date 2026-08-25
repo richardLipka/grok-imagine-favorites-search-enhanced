@@ -3,6 +3,18 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## Unreleased
+
+Nothing here changes the installed userscripts — no version bump.
+
+### Tooling
+- Added a dependency-free test suite: `node test/run.js` (96 assertions across records, index
+  mutation, child sync, reconciliation, and results-grid reuse). The suite slices regions out of
+  `grokSearch.js` and runs the real functions against stubs, so it covers production code rather
+  than a copy of it — see [test/README.md](test/README.md).
+
+---
+
 ## [1.63.0] — 2026-08-25
 
 ### Added

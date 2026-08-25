@@ -24,9 +24,20 @@ user-facing control in detail — read it before changing UI behavior.
 
 ## Development workflow
 
-There is **no build, no package manager, no test suite, no linter**. The `.js` files are shipped
-verbatim and pasted into Tampermonkey. Do not introduce a bundler, modules, or a `node_modules`
-dependency without being asked — the userscript must stay a single self-contained file.
+There is **no build, no package manager, and no linter**. The `.js` files are shipped verbatim and
+pasted into Tampermonkey. Do not introduce a bundler, modules, or a `node_modules` dependency without
+being asked — the userscript must stay a single self-contained file.
+
+There **is** a dependency-free test suite:
+
+```bash
+node test/run.js
+```
+
+Run it after touching sync, index, or render logic — it is the only verification available without a
+browser. It slices regions out of `grokSearch.js` and runs the real functions against stubs, so a
+rename or reorder of an anchor function makes it throw `harness: start marker not found`; fix the
+markers in `test/harness.js` rather than deleting the suite. See [test/README.md](test/README.md).
 
 Editing loop:
 
@@ -42,8 +53,9 @@ Reset the index while testing, from the page console on `grok.com/imagine`:
 indexedDB.deleteDatabase('GrokSearchIndex');
 ```
 
-Nothing can be verified without a logged-in `grok.com` session and liked posts; there is no fixture or
-mock layer.
+Everything the suite cannot reach needs this manual pass: DOM injection into the live SPA, IndexedDB,
+`GM_xmlhttpRequest`, the folder picker, EXIF writing, and CSS. All of it requires a logged-in
+`grok.com` session with liked posts.
 
 ### Release convention
 
@@ -52,6 +64,9 @@ A behavior change bumps the version in **three** places, kept in lockstep:
 - the `// @version` line in the script header,
 - the "Current versions" line in `README.md`,
 - a new `## [x.y.z] — YYYY-MM-DD` section in `CHANGELOG.md` with `### Added` / `### Changed` / `### Fixed`.
+
+Changes that do not alter what users install (tests, docs, tooling) do **not** bump the version or get
+a tag — they go under `## Unreleased` in the changelog.
 
 Commit subjects are imperative with the version in parentheses, e.g.
 `Add context menu and lightbox downloads (v1.61)`. Releases are annotated tags named `vX.Y.Z`

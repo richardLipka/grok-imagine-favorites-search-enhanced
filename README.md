@@ -287,6 +287,19 @@ req.onsuccess = e => {
 
 ---
 
+## Development
+
+```bash
+node test/run.js
+```
+
+No dependencies and no build step — the `.js` files are what ships. The suite runs the real sync,
+index, and rendering logic from `grokSearch.js` against stubs; see [test/README.md](test/README.md).
+Anything needing a browser (IndexedDB, the folder picker, EXIF, CSS) still has to be checked by
+pasting the script into Tampermonkey.
+
+---
+
 ## Privacy
 
 Scripts run **only in your browser**. API calls go to **`grok.com`** (your session cookies). IndexedDB stays local. On first run, Tampermonkey may fetch **`piexifjs`** from **jsDelivr** (`cdn.jsdelivr.net`) for EXIF embedding. No other third-party analytics in these files.
