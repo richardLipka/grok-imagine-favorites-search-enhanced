@@ -22,6 +22,64 @@ Nothing here changes the installed userscripts — no version bump.
 
 ---
 
+## [1.65.0] — 2026-08-25
+
+Bulk downloads can now be stopped and resumed, downloaded images carry the whole index record
+rather than just the prompt, and a variation of a variation is finally indexed as one.
+
+No reindex is required. `rootId` is derived from the existing `parentId` when the index loads, and
+real tree edges are rewritten as each post is deep-refreshed.
+
+### Added
+- **Cancel** during a bulk download. It stops the run and aborts the request already in flight, so
+  it takes effect immediately rather than after the current file.
+- **Retry N files** after a run that did not finish. It downloads only what is left, into the
+  **same folder** — no second folder prompt. Everything still queued when Cancel landed goes into
+  the retry, including the file that was interrupted, so a large export can be stopped and resumed.
+- **Per-file retry.** Each file is attempted up to three times with a growing delay before it counts
+  as failed. A single flaky response no longer costs the image.
+- **WebP metadata.** A plain WebP is rewritten into the extended (VP8X) container so it has
+  somewhere to hold metadata, then given an `EXIF` chunk and an `XMP ` packet. Re-tagging an
+  already-tagged file replaces its metadata rather than appending a second copy.
+- **Full metadata in every downloaded image**, not just the prompt: `Software`, `Artist`, `Make`,
+  `Model`, the creation timestamps, `ImageUniqueID`, the Windows `XP*` tags that Explorer shows,
+  and a JSON blob in `UserComment` holding the entire record — ids, both ancestor prompts, model,
+  like state, child counts, media URL and the post permalink. PNG gains `Title`, `Author`,
+  `Software`, `Source`, `Creation Time`, `Comment`, plus the `prompt` and `parameters` keys AI
+  image tools read; prompts outside Latin-1 are written as `iTXt` instead of `tEXt`.
+- **Open original post** in the context menu, for a variation whose parent is itself a variation.
+
+### Changed
+- **Grandchildren keep their real parent (schema v5).** Every descendant used to be parented
+  straight onto the top-level post, so a variation of a variation claimed the original as its
+  parent. `parentId` is now the immediate parent and a new `rootId` names the post that owns the
+  tree. A mid-tree row also reports its own descendant counts, which is what makes **Download all**
+  and the variation badge work from it.
+- `rootPrompt` is stored on deeper descendants (only when it differs from `parentPrompt`, so a
+  first-generation variation costs nothing) and joins the search text, so searching the original
+  wording still finds variations several generations down.
+- Child pruning is scoped to the owning root rather than the immediate parent, so an orphaned
+  branch is removed as a whole.
+- The bulk-download confirm dialog mentions that the run can be cancelled and resumed.
+- The count row in both bars wraps instead of overflowing, since Cancel and Retry join it mid-run.
+
+### Fixed
+- **PNG text chunks had a wrong CRC.** The table-driven CRC32 shifted by 1 instead of 8, so every
+  `tEXt` chunk the script has ever written carried a bad checksum. Browsers ignore a bad CRC on an
+  ancillary chunk, which is why it went unnoticed, but strict readers drop the chunk — meaning the
+  prompt was silently unreadable in some tools. Found by the new test suite.
+- `backfillChildParentPrompts()` built its lookup from top-level posts only, so a grandchild's
+  parent prompt was unresolvable. It now indexes every row, and an orphan keeps the text it already
+  carries instead of having it blanked.
+- `getAllDescendantPosts()` guards against a cycle in the parent graph.
+
+### Tooling
+- 198 new assertions across three suites: image metadata (`metadata`), tree edges
+  (`grandchildren`), and downloads (`download`). 322 total. Five mutations were used to confirm
+  each suite fails when the behaviour it covers is broken.
+
+---
+
 ## [1.64.0] — 2026-08-25
 
 Grok no longer requires a like for media to stay in history, so the index now covers the whole

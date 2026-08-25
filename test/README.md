@@ -23,13 +23,21 @@ them with stubbed collaborators (`dbPutMany`, `fetchPage`, `setLoadStatus`, …)
 runs production code. Nothing here reimplements logic — a test that passed against a copy of
 the algorithm would be worthless.
 
-Three sandboxes:
+Six sandboxes:
 
 | Sandbox | Region | Covers |
 |---------|--------|--------|
-| `createIndexSandbox()` | `isVideoMediaType` → `formatSyncStatusMessage` | Record shape, index mutation, child sync, deep-refresh selection, reconciliation |
+| `createIndexSandbox()` | `isVideoMediaType` → `formatSyncStatusMessage` | Record shape, index mutation, child sync, tree edges, deep-refresh selection, reconciliation |
 | `createGridSandbox()` | `renderResultCards` | Keyed results-grid reconciliation, against the fake DOM in [`dom.js`](dom.js) |
 | `createLikeSandbox()` | `setAtPath` → `sendLikeRequest` | Like/unlike request templating (pure shaping, no network) |
+| `createMetadataSandbox()` | `PNG_CRC_TABLE` → `isDownloadableImagePost` | EXIF assembly, PNG text chunks, the WebP RIFF rebuild |
+| `createDownloadSandbox()` | `makeAbortError` → `PNG_CRC_TABLE`, plus `isDownloadableImagePost` → `downloadPostMedia` | Media fetch, the GM fallback, per-file retry and abort |
+| `createBulkDownloadSandbox()` | `cancelBulkDownload` → `downloadSelectedPosts` | The bulk loop: cancel, the failed queue, resuming into the same folder |
+
+`createMetadataSandbox()` takes a **stubbed `piexif`** — the real library is a jsDelivr `@require`
+and cannot be installed here. So the JPEG path is only checked for *how* it calls piexif, while the
+PNG and WebP container work, which is entirely hand-rolled, is verified byte for byte against an
+independent CRC32 and RIFF/PNG parser written in the suite.
 
 ## Adding a suite
 
@@ -60,6 +68,20 @@ deliberate — a loud, specific failure beats tests that quietly stop covering a
 
 ## What is not covered
 
-Anything that needs a browser: DOM injection into the live Grok SPA, IndexedDB itself,
-`GM_xmlhttpRequest`, the File System Access API, EXIF writing, and CSS. Those still need a
+Anything that needs a browser: DOM injection into the live Grok SPA, IndexedDB itself, the real
+`GM_xmlhttpRequest`, the File System Access API, the real `piexifjs`, and CSS. Those still need a
 manual pass in Tampermonkey — see the editing loop in [`../CLAUDE.md`](../CLAUDE.md).
+
+## Proving the suite can fail
+
+A green suite is only worth something if it goes red on a real regression. After adding a suite,
+break the thing it covers and check that the *right* assertions fail. Mutations used against the
+current suites, each caught:
+
+| Mutation | Fails |
+|----------|-------|
+| `pngCrc32` shifts by 1 instead of 8 | 2 in `metadata` |
+| `parseChildPost` sets `parentId` to the root again | 6 in `grandchildren` |
+| Cancel drops the remaining queue | 4 in `download` |
+| WebP re-tag appends instead of replacing | 2 in `metadata` |
+| Child pruning disabled | 9 across `child-sync` and `grandchildren` |

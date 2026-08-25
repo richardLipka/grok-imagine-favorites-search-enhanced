@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.64.0
-// @description  Search, filter, and paginate saved Grok media; lightbox, bulk folder download, EXIF prompt tags.
+// @version      1.65.0
+// @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
 // @supportURL   https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/issues
@@ -69,7 +69,9 @@
   const HTTP_MAX_RETRIES = 3;
   const HTTP_RETRY_BASE_MS = 800;
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
-  const INDEX_SCHEMA_VERSION = 4;
+  const INDEX_SCHEMA_VERSION = 5;
+  /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
+  const SCRIPT_VERSION = '1.65.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -127,6 +129,11 @@
   const SEARCH_DEBOUNCE_MAX_MS = 1000;
   /** Ask before bulk download when selection exceeds this count. */
   const BULK_DOWNLOAD_CONFIRM_ABOVE = 5;
+  /** Per-file attempts during a bulk download, so one flaky response does not lose the file. */
+  const DOWNLOAD_MAX_ATTEMPTS = 3;
+  const DOWNLOAD_RETRY_BASE_MS = 600;
+  /** Per-prompt cap for embedded image metadata; see buildPostMetadata() for why it is not larger. */
+  const METADATA_PROMPT_MAX = 4000;
 
   let allPosts = [];
   /** id → the live row object inside allPosts. Rows are updated in place, never by array index. */
@@ -167,6 +174,13 @@
   let contextMenuPostId = null;
   const selectedPostIds = new Set();
   let bulkDownloadInProgress = false;
+  /** Set by the Cancel button; the download loop checks it between files. */
+  let bulkDownloadCancelled = false;
+  /** Aborts the in-flight media request so Cancel takes effect mid-file, not after it. */
+  let bulkDownloadAbort = null;
+  /** Posts that failed in the last bulk run, plus the folder they were headed for. */
+  let lastFailedDownloads = [];
+  let lastDownloadDirHandle = null;
   let reconcileInProgress = false;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -410,14 +424,32 @@
     };
   }
 
-  /** Canonical index row — all fields persisted to IndexedDB and export. */
+  /**
+   * Canonical index row — all fields persisted to IndexedDB and export.
+   *
+   * `parentId` is the *immediate* parent; `rootId` is the top-level post that owns the whole
+   * tree. For a direct child the two are equal, and legacy rows written before grandchildren
+   * had true edges default `rootId` to `parentId` — which is exactly right for them, because
+   * back then every descendant was parented straight onto the root.
+   *
+   * `rootPrompt` is only stored when it differs from `parentPrompt`, so the common case
+   * (a direct child) pays nothing for it.
+   */
   function toStorageRecord(post) {
     const isChild = Boolean(post.isChild);
+    const parentId = isChild ? String(post.parentId || '') : null;
+    const rootId = isChild ? String(post.rootId || post.parentId || '') : null;
+    const parentPrompt = isChild ? String(post.parentPrompt || '') : null;
+    const rootPrompt = isChild && rootId && rootId !== parentId
+      ? String(post.rootPrompt || '')
+      : '';
     const row = {
       id: String(post.id || ''),
       prompt: String(post.prompt || ''),
-      parentPrompt: isChild ? String(post.parentPrompt || '') : null,
-      parentId: isChild ? String(post.parentId || '') : null,
+      parentPrompt,
+      parentId,
+      rootId,
+      rootPrompt: isChild ? rootPrompt : null,
       isChild,
       thumbnail: String(post.thumbnail || ''),
       mediaUrl: String(post.mediaUrl || ''),
@@ -449,12 +481,17 @@
     return Number.isNaN(t) ? 0 : t;
   }
 
-  /** Lowercased haystack for the text filter: own prompt, plus parent prompt for child rows. */
+  /**
+   * Lowercased haystack for the text filter: own prompt, plus the immediate parent's prompt and
+   * — for a grandchild, whose parent is itself a child — the original root prompt. Searching for
+   * the wording of a generation has to find everything descended from it, however deep.
+   */
   function computeSearchText(row) {
     const own = String(row.prompt || '').trim();
     if (!row.isChild) return own.toLowerCase();
     const parent = String(row.parentPrompt || '').trim();
-    const parts = [...new Set([own, parent].filter(Boolean))];
+    const root = String(row.rootPrompt || '').trim();
+    const parts = [...new Set([own, parent, root].filter(Boolean))];
     return parts.join(' ').toLowerCase();
   }
 
@@ -500,11 +537,13 @@
     return current;
   }
 
-  function buildParentPromptIndex() {
+  /**
+   * id → prompt for *every* row, not just top-level ones. A grandchild's parent is itself a
+   * child row, so restricting this to parents used to make its parent prompt unresolvable.
+   */
+  function buildPromptById() {
     const map = new Map();
-    for (const p of allPosts) {
-      if (!isChildPost(p)) map.set(p.id, String(p.prompt || ''));
-    }
+    for (const p of allPosts) map.set(p.id, String(p.prompt || ''));
     return map;
   }
 
@@ -561,7 +600,7 @@
    * Fulltext prompt search — child rows always include parentPrompt (cached field, or a
    * live parent lookup for rows whose parentPrompt has not been backfilled yet).
    */
-  function getSearchablePromptText(post, parentPromptById) {
+  function getSearchablePromptText(post, promptById) {
     const cached = post[RUNTIME_SEARCH];
     if (typeof cached === 'string' && (cached || !isChildPost(post))) return cached;
 
@@ -569,25 +608,41 @@
     if (!isChildPost(post)) return own.toLowerCase();
 
     let parent = String(post.parentPrompt || '').trim();
-    if (!parent && post.parentId && parentPromptById) {
-      parent = String(parentPromptById.get(post.parentId) || '').trim();
+    if (!parent && post.parentId && promptById) {
+      parent = String(promptById.get(post.parentId) || '').trim();
     }
-    const parts = [...new Set([own, parent].filter(Boolean))];
+    let root = String(post.rootPrompt || '').trim();
+    if (!root && post.rootId && post.rootId !== post.parentId && promptById) {
+      root = String(promptById.get(post.rootId) || '').trim();
+    }
+    const parts = [...new Set([own, parent, root].filter(Boolean))];
     return parts.join(' ').toLowerCase();
   }
 
-  function parseChildPost(parentRaw, childRaw, parentParsed) {
+  /**
+   * `parentRaw`/`parentParsed` are the child's *immediate* parent — which for a grandchild is
+   * itself a child row. `root` names the top-level post that owns the tree; it defaults to the
+   * immediate parent, so the common one-generation call is unchanged.
+   */
+  function parseChildPost(parentRaw, childRaw, parentParsed, root) {
     if (!childRaw?.id || !parentParsed?.id) return null;
     const parentPrompt = getParentPrompt(parentRaw, parentParsed);
+    const rootId = String(root?.id || parentParsed.id);
+    const rootPrompt = String(root?.prompt ?? parentPrompt).trim();
     const ownPrompt = String(childRaw.prompt || childRaw.originalPrompt || '').trim();
-    const prompt = ownPrompt || parentPrompt;
-    const isVideo = isVideoMediaType(childRaw.mediaType);
+    const prompt = ownPrompt || parentPrompt || rootPrompt;
+    // A child can have children of its own; those counts are what makes "Download all" and the
+    // variation badge work from a mid-tree row rather than only from the root.
+    // extractChildMediaCounts() already folds in whether this node is itself a video.
+    const counts = extractChildMediaCounts(childRaw);
     return normalizePost({
       id: String(childRaw.id),
       parentId: String(parentParsed.id),
+      rootId,
       isChild: true,
       prompt,
       parentPrompt,
+      rootPrompt,
       thumbnail: childRaw.thumbnailImageUrl || childRaw.thumbnail || childRaw.mediaUrl || '',
       mediaUrl: childRaw.mediaUrl || childRaw.hdMediaUrl || '',
       createTime: childRaw.createTime || childRaw.createdAt || childRaw.create_time
@@ -595,10 +650,10 @@
       model: childRaw.modelName || childRaw.model || parentParsed.model || '',
       mediaType: childRaw.mediaType || '',
       isLiked: detectLikedState(childRaw),
-      childPostCount: 0,
-      childImageCount: 0,
-      childVideoCount: 0,
-      videoCount: isVideo ? 1 : 0,
+      childPostCount: counts.childPostCount,
+      childImageCount: counts.childImageCount,
+      childVideoCount: counts.childVideoCount,
+      videoCount: counts.videoCount,
     });
   }
 
@@ -614,23 +669,48 @@
     return Boolean(existing && !existing.isChild);
   }
 
-  function collectChildRecords(parentRaw, parentParsed) {
+  /**
+   * Flattens a post's whole descendant tree into rows, keeping the real edges: a grandchild's
+   * `parentId` is the child it came from, while `rootId` stays the top-level post. Every row in
+   * the tree is still owned by that root, which is what the prune in
+   * `syncChildRecordsForParent()` keys on.
+   */
+  function collectChildRecords(rootRaw, rootParsed) {
     const records = [];
     const seen = new Set();
-    walkDescendantPosts(parentRaw, child => {
-      if (!child?.id || seen.has(child.id)) return;
-      seen.add(child.id);
-      if (shadowsExistingParent(String(child.id), parentParsed?.id)) return;
-      const parsed = parseChildPost(parentRaw, child, parentParsed);
-      if (parsed) records.push(stampMetadataRefreshed(parsed));
-    });
+    const rootId = String(rootParsed?.id || '');
+    const root = { id: rootId, prompt: getParentPrompt(rootRaw, rootParsed) };
+
+    const visit = (parentRaw, parentParsed) => {
+      for (const child of parentRaw?.childPosts || []) {
+        const childId = String(child?.id || '');
+        if (!childId || seen.has(childId)) continue;
+        seen.add(childId);
+        let childParsed;
+        if (shadowsExistingParent(childId, rootId)) {
+          // Indexed in its own right, so it must not be rewritten as a child row — but its own
+          // descendants still belong to this tree, so the walk continues through it.
+          childParsed = { id: childId, prompt: String(child.prompt || child.originalPrompt || '') };
+        } else {
+          childParsed = parseChildPost(parentRaw, child, parentParsed, root);
+          if (childParsed) records.push(stampMetadataRefreshed(childParsed));
+        }
+        visit(child, childParsed || parentParsed);
+      }
+    };
+    visit(rootRaw, rootParsed);
     return records;
   }
 
-  function removeChildrenOfParent(parentId, keepIds) {
+  /** Owning root of a child row; legacy rows predate `rootId` and were parented onto the root. */
+  function getRootIdOf(post) {
+    return String(post?.rootId || post?.parentId || '');
+  }
+
+  function removeDescendantsOfRoot(rootId, keepIds) {
     const removedIds = [];
     allPosts = allPosts.filter(p => {
-      if (p.parentId === parentId && p.isChild && !keepIds.has(p.id)) {
+      if (p.isChild && getRootIdOf(p) === rootId && !keepIds.has(p.id)) {
         removedIds.push(p.id);
         knownIds.delete(p.id);
         return false;
@@ -683,7 +763,7 @@
     }
     const childRecords = collectChildRecords(parentRaw, parentParsed);
     const keepIds = new Set(childRecords.map(c => c.id));
-    const removedIds = removeChildrenOfParent(parentParsed.id, keepIds);
+    const removedIds = removeDescendantsOfRoot(parentParsed.id, keepIds);
     for (const id of removedIds) writer.del(id);
 
     let added = 0;
@@ -812,18 +892,33 @@
       ...parsed,
       isChild: false,
       parentId: null,
+      rootId: null,
       parentPrompt: null,
+      rootPrompt: null,
     });
   }
 
-  /** Only worth running when the parent prompt actually changed — callers must check first. */
+  /**
+   * Only worth running when the parent prompt actually changed — callers must check first.
+   * A post's prompt is denormalized onto two fields: `parentPrompt` on its direct children and
+   * `rootPrompt` on every deeper descendant, so both have to be repaired here.
+   */
   function propagateParentPromptToChildren(parentId, parentPrompt, writer) {
     const pp = String(parentPrompt || '');
     let count = 0;
     for (const p of allPosts) {
-      if (!isChildPost(p) || p.parentId !== parentId) continue;
-      if ((p.parentPrompt || '') === pp) continue;
-      const row = stampMetadataRefreshed(normalizePost({ ...p, parentPrompt: pp }));
+      if (!isChildPost(p)) continue;
+      const isDirect = p.parentId === parentId;
+      const isRoot = getRootIdOf(p) === parentId && p.parentId !== parentId;
+      if (!isDirect && !isRoot) continue;
+      const nextParentPrompt = isDirect ? pp : (p.parentPrompt || '');
+      const nextRootPrompt = isRoot ? pp : (p.rootPrompt || '');
+      if (nextParentPrompt === (p.parentPrompt || '') && nextRootPrompt === (p.rootPrompt || '')) continue;
+      const row = stampMetadataRefreshed(normalizePost({
+        ...p,
+        parentPrompt: nextParentPrompt,
+        rootPrompt: nextRootPrompt,
+      }));
       writer.put(updatePostRow(row) || p);
       count++;
     }
@@ -844,44 +939,69 @@
       || Boolean(before.isChild) !== Boolean(after.isChild)
       || (before.parentId || '') !== (after.parentId || '')
       || (before.parentPrompt || '') !== (after.parentPrompt || '')
+      || (before.rootId || '') !== (after.rootId || '')
+      || (before.rootPrompt || '') !== (after.rootPrompt || '')
       || (before.isLiked ?? null) !== (after.isLiked ?? null);
   }
 
   function verifyIndexIntegrity() {
-    const parentPromptById = buildParentPromptIndex();
+    const promptById = buildPromptById();
     let orphans = 0;
     let missingParent = 0;
+    let missingRoot = 0;
     let emptySearchText = 0;
+    let grandchildren = 0;
     for (const p of allPosts) {
       if (!isChildPost(p)) continue;
       if (!p.parentId) orphans++;
-      else if (!parentPromptById.has(p.parentId)) missingParent++;
-      if (!getSearchablePromptText(p, parentPromptById).trim()) emptySearchText++;
+      else if (!promptById.has(p.parentId)) missingParent++;
+      const rootId = getRootIdOf(p);
+      if (rootId && rootId !== p.parentId) {
+        grandchildren++;
+        if (!promptById.has(rootId)) missingRoot++;
+      }
+      if (!getSearchablePromptText(p, promptById).trim()) emptySearchText++;
     }
     const children = allPosts.reduce((n, r) => n + (isChildPost(r) ? 1 : 0), 0);
     const summary = {
       total: allPosts.length,
       parents: allPosts.length - children,
       children,
+      grandchildren,
       orphans,
       childMissingParent: missingParent,
+      childMissingRoot: missingRoot,
       emptySearchText,
     };
     console.log('[GrokSearch] Index integrity:', summary);
     return summary;
   }
 
+  /**
+   * Repairs the denormalized prompts on child rows against the current index. The map covers
+   * every row, not just top-level ones, because a grandchild's parent is a child row.
+   */
   function backfillChildParentPrompts() {
-    const parentPromptById = new Map();
-    for (const p of allPosts) {
-      if (!isChildPost(p)) parentPromptById.set(p.id, p.prompt || '');
-    }
+    const promptById = buildPromptById();
     const updated = [];
     for (const p of allPosts) {
       if (!isChildPost(p) || !p.parentId) continue;
-      const nextParentPrompt = parentPromptById.get(p.parentId) || '';
-      if ((p.parentPrompt || '') === nextParentPrompt) continue;
-      const row = normalizePost({ ...p, parentPrompt: nextParentPrompt });
+      const rootId = getRootIdOf(p);
+      const hasRoot = Boolean(rootId) && rootId !== p.parentId;
+      // An orphan keeps whatever text it already carries — dropping it would make the row
+      // unsearchable, and a missing parent usually means a truncated sync, not a real deletion.
+      const nextParentPrompt = promptById.has(p.parentId)
+        ? (promptById.get(p.parentId) || '')
+        : (p.parentPrompt || '');
+      const nextRootPrompt = !hasRoot ? '' : (promptById.has(rootId)
+        ? (promptById.get(rootId) || '')
+        : (p.rootPrompt || ''));
+      if ((p.parentPrompt || '') === nextParentPrompt && (p.rootPrompt || '') === nextRootPrompt) continue;
+      const row = normalizePost({
+        ...p,
+        parentPrompt: nextParentPrompt,
+        rootPrompt: nextRootPrompt,
+      });
       updated.push(updatePostRow(row) || p);
     }
     return updated;
@@ -1232,11 +1352,14 @@
    * An index built before schema 4 only ever contained liked posts and has no like state, so it
    * cannot answer "show me everything" or "liked only". Nudge once rather than silently
    * presenting a partial library as complete.
+   *
+   * Schema 5 (true grandchild edges) needs no nudge: `rootId` is derived on load and the real
+   * edges are rewritten the next time each parent is deep-refreshed, so a v4 index self-heals.
    */
   function checkIndexSchemaFreshness() {
     const stored = Number(readStoredString(INDEX_VERSION_KEY, '0')) || 0;
     if (stored >= INDEX_SCHEMA_VERSION) return;
-    if (!allPosts.length) {
+    if (!allPosts.length || stored >= 4) {
       writeStoredString(INDEX_VERSION_KEY, String(INDEX_SCHEMA_VERSION));
       return;
     }
@@ -1451,7 +1574,7 @@
           children: childCount,
         },
         recordFields: [
-          'id', 'prompt', 'parentPrompt', 'parentId', 'isChild',
+          'id', 'prompt', 'parentPrompt', 'parentId', 'rootId', 'rootPrompt', 'isChild',
           'thumbnail', 'mediaUrl', 'createTime', 'model', 'mediaType',
           'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount', 'isLiked',
           METADATA_REFRESH_KEY,
@@ -1519,7 +1642,7 @@
         },
         filters: getActiveResultsFilters(),
         recordFields: [
-          'id', 'prompt', 'parentPrompt', 'parentId', 'isChild',
+          'id', 'prompt', 'parentPrompt', 'parentId', 'rootId', 'rootPrompt', 'isChild',
           'thumbnail', 'mediaUrl', 'createTime', 'model', 'mediaType',
           'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount', 'isLiked',
           METADATA_REFRESH_KEY,
@@ -2155,8 +2278,11 @@
       byParent.get(parentId).push(p);
     }
     const out = [];
+    const seen = new Set([id]);
     const walk = parentId => {
       for (const child of byParent.get(parentId) || []) {
+        if (seen.has(child.id)) continue;
+        seen.add(child.id);
         out.push(child);
         walk(child.id);
       }
@@ -2235,44 +2361,91 @@
     return `grok-${post.id}.${ext}`;
   }
 
-  function fetchPostMediaBlobGm(url) {
+  function makeAbortError() {
+    const err = new Error('aborted');
+    err.name = 'AbortError';
+    return err;
+  }
+
+  function isAbortError(err) {
+    return err?.name === 'AbortError';
+  }
+
+  function fetchPostMediaBlobGm(url, signal) {
     return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
+      if (signal?.aborted) {
+        reject(makeAbortError());
+        return;
+      }
+      // The listener has to be detached once the request settles: a bulk run shares one signal
+      // across every file, so leaving them attached would pile up thousands of them.
+      let onAbort = null;
+      const done = fn => (...args) => {
+        if (onAbort) signal.removeEventListener('abort', onAbort);
+        onAbort = null;
+        fn(...args);
+      };
+      const settleOk = done(resolve);
+      const settleErr = done(reject);
+
+      const handle = GM_xmlhttpRequest({
         method: 'GET',
         url,
         responseType: 'arraybuffer',
         timeout: 120000,
         onload(res) {
           if (res.status < 200 || res.status >= 300) {
-            reject(new Error(`HTTP ${res.status}`));
+            settleErr(new Error(`HTTP ${res.status}`));
             return;
           }
           const type = String(res.responseHeaders || '').match(/content-type:\s*([^\r\n]+)/i)?.[1]?.trim()
             || 'application/octet-stream';
-          resolve(new Blob([res.response], { type }));
+          settleOk(new Blob([res.response], { type }));
         },
         onerror() {
-          reject(new Error('network error'));
+          settleErr(new Error('network error'));
         },
         ontimeout() {
-          reject(new Error('timeout'));
+          settleErr(new Error('timeout'));
+        },
+        onabort() {
+          settleErr(makeAbortError());
         },
       });
+
+      // GM_xmlhttpRequest has no signal support, so Cancel has to reach it through the handle
+      // the call returns. Older managers return nothing — then the request simply runs out.
+      if (signal) {
+        onAbort = () => {
+          onAbort = null;
+          try { handle?.abort?.(); } catch { /* already finished */ }
+          reject(makeAbortError());
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
     });
   }
 
-  async function fetchPostMediaBlob(post) {
+  async function fetchPostMediaBlob(post, signal) {
     const url = getPostMediaUrl(post);
     if (!url) throw new Error('no url');
+    if (signal?.aborted) throw makeAbortError();
     try {
-      const res = await getPageWindow().fetch(url, { credentials: 'include' });
+      const res = await getPageWindow().fetch(url, { credentials: 'include', signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.blob();
     } catch (fetchErr) {
+      if (isAbortError(fetchErr) || signal?.aborted) throw fetchErr;
       console.warn('[GrokSearch] fetch failed, using GM_xmlhttpRequest:', fetchErr);
-      return fetchPostMediaBlobGm(url);
+      return fetchPostMediaBlobGm(url, signal);
     }
   }
+
+  // ─── Embedded image metadata ────────────────────────────────────────────────
+  // Everything the index knows about a post is written into the downloaded file, so an
+  // exported folder stays searchable after it leaves the browser: EXIF for JPEG and WebP,
+  // tEXt/iTXt for PNG, plus an XMP packet for WebP. Tagging is best-effort by design — a
+  // failure here must never cost the user the file itself.
 
   const PNG_CRC_TABLE = (() => {
     const table = new Uint32Array(256);
@@ -2287,7 +2460,10 @@
   function pngCrc32(bytes) {
     let crc = 0xFFFFFFFF;
     for (let i = 0; i < bytes.length; i++) {
-      crc = PNG_CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 1);
+      // `>>> 8` consumes the byte the table lookup just handled. This read `>>> 1` until
+      // v1.65.0, which produced a wrong checksum on every text chunk the script wrote —
+      // browsers ignore a bad CRC on an ancillary chunk, but strict readers drop it.
+      crc = PNG_CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
     }
     return (crc ^ 0xFFFFFFFF) >>> 0;
   }
@@ -2308,6 +2484,12 @@
     return bytes.buffer;
   }
 
+  function binaryStringToBytes(binary) {
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) & 0xff;
+    return bytes;
+  }
+
   function isJpegBytes(u8) {
     return u8.length >= 3 && u8[0] === 0xFF && u8[1] === 0xD8 && u8[2] === 0xFF;
   }
@@ -2317,68 +2499,333 @@
       && u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4E && u8[3] === 0x47;
   }
 
+  /** RIFF container with a WEBP form type. */
+  function isWebpBytes(u8) {
+    return u8.length >= 12
+      && u8[0] === 0x52 && u8[1] === 0x49 && u8[2] === 0x46 && u8[3] === 0x46
+      && u8[8] === 0x57 && u8[9] === 0x45 && u8[10] === 0x42 && u8[11] === 0x50;
+  }
+
   function truncateMetadataText(text, maxLen = 2000) {
     const s = String(text || '').trim();
     if (s.length <= maxLen) return s;
     return `${s.slice(0, maxLen - 1)}…`;
   }
 
-  function embedPromptInJpeg(buffer, prompt) {
-    if (typeof piexif === 'undefined') return buffer;
-    const text = truncateMetadataText(prompt);
-    if (!text) return buffer;
+  /**
+   * EXIF string fields are byte-oriented, so anything above U+00FF would be written as a
+   * mangled low byte. Accents are folded to their base letters and the rest is dropped; the
+   * untouched text still travels in XPComment (UCS-2) and in the JSON blob.
+   */
+  function toAsciiText(text) {
+    let s = String(text || '');
+    try { s = s.normalize('NFKD').replace(/[\u0300-\u036f]/g, ''); } catch { /* older engines */ }
+    return s.replace(/[^\x20-\x7e\n\r\t]/g, '').trim();
+  }
+
+  /** JSON with every non-ASCII character escaped, so it survives an ASCII-tagged EXIF field. */
+  function toAsciiJson(value) {
+    return JSON.stringify(value).replace(
+      /[\u007f-\uffff]/g,
+      c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`
+    );
+  }
+
+  /** EXIF wants "YYYY:MM:DD HH:MM:SS"; the index stores ISO-8601 UTC. */
+  function formatExifDateTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getUTCFullYear()}:${p(d.getUTCMonth() + 1)}:${p(d.getUTCDate())} `
+      + `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+  }
+
+  /** The PNG `Creation Time` keyword takes an RFC 1123 date. */
+  function formatPngCreationTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toUTCString();
+  }
+
+  /** Null-terminated UTF-16LE bytes, the encoding the Windows XP* EXIF tags use. */
+  function ucs2Bytes(text) {
+    const s = String(text || '');
+    const out = [];
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      out.push(c & 0xff, (c >> 8) & 0xff);
+    }
+    out.push(0, 0);
+    return out;
+  }
+
+  function getScriptVersion() {
+    try {
+      if (typeof GM_info !== 'undefined' && GM_info?.script?.version) return String(GM_info.script.version);
+    } catch { /* not running under a manager */ }
+    return SCRIPT_VERSION;
+  }
+
+  /**
+   * Everything the index holds about one post, in the shapes the writers need. `fields` is the
+   * full record (empty values dropped) and becomes the JSON blob; the rest are the short strings
+   * that map onto named EXIF/PNG tags.
+   */
+  function buildPostMetadata(post) {
+    const p = post || {};
+    // A JPEG APP1 segment caps out at 64 KB and the same text is written several times over
+    // (description, UCS-2 XPComment, JSON blob), so the per-prompt cap has to leave room.
+    const prompt = truncateMetadataText(p.prompt, METADATA_PROMPT_MAX);
+    const parentPrompt = truncateMetadataText(p.parentPrompt, METADATA_PROMPT_MAX);
+    const rootPrompt = truncateMetadataText(p.rootPrompt, METADATA_PROMPT_MAX);
+    const model = String(p.model || '').trim();
+    const createTime = String(p.createTime || '').trim();
+    const id = String(p.id || '');
+    const isChild = Boolean(p.isChild);
+    const isVideo = isVideoMediaType(p.mediaType);
+
+    const fields = {
+      id,
+      prompt,
+      parentPrompt: isChild ? parentPrompt : '',
+      rootPrompt: isChild ? rootPrompt : '',
+      parentId: isChild ? String(p.parentId || '') : '',
+      rootId: isChild ? String(p.rootId || p.parentId || '') : '',
+      isChild,
+      createTime,
+      model,
+      mediaType: String(p.mediaType || ''),
+      isLiked: typeof p.isLiked === 'boolean' ? p.isLiked : null,
+      childPostCount: p.childPostCount ?? 0,
+      childImageCount: p.childImageCount ?? 0,
+      childVideoCount: p.childVideoCount ?? 0,
+      videoCount: p.videoCount ?? 0,
+      mediaUrl: String(p.mediaUrl || ''),
+      postUrl: getPostDetailUrl(id),
+      source: 'Grok Imagine',
+      generator: 'xAI Grok Imagine',
+      taggedBy: `grokSearch.js v${getScriptVersion()}`,
+      taggedAt: new Date().toISOString(),
+    };
+    for (const key of Object.keys(fields)) {
+      const v = fields[key];
+      if (v === '' || v === null || v === undefined) delete fields[key];
+    }
+
+    const keywords = [
+      'Grok Imagine',
+      model,
+      isVideo ? 'video' : 'image',
+      isChild ? 'variation' : 'original',
+      p.isLiked === true ? 'liked' : '',
+    ].filter(Boolean).join('; ');
+
+    const title = truncateMetadataText(prompt || parentPrompt || rootPrompt || id, 120);
+    const software = model ? `Grok Imagine (${model})` : 'Grok Imagine';
+
+    return {
+      id,
+      prompt,
+      parentPrompt,
+      rootPrompt,
+      model,
+      createTime,
+      keywords,
+      title,
+      software,
+      postUrl: fields.postUrl || '',
+      exifDate: formatExifDateTime(createTime),
+      pngDate: formatPngCreationTime(createTime),
+      json: toAsciiJson(fields),
+      fields,
+    };
+  }
+
+  // ─── JPEG / raw EXIF ────────────────────────────────────────────────────────
+
+  function buildExifDicts(meta) {
+    const I = piexif.ImageIFD || {};
+    const E = piexif.ExifIFD || {};
+    const zeroth = {};
+    const exif = {};
+    // Tag ids differ between piexif builds, so a tag the bundled version does not know is
+    // skipped rather than written under `undefined`, which would break the whole dump.
+    const put = (dict, tag, value) => {
+      if (tag == null || value == null || value === '') return;
+      if (Array.isArray(value) && value.length <= 2) return;
+      dict[tag] = value;
+    };
+
+    put(zeroth, I.ImageDescription, toAsciiText(meta.prompt));
+    put(zeroth, I.Software, toAsciiText(meta.software));
+    put(zeroth, I.Artist, 'Grok Imagine');
+    put(zeroth, I.Make, 'xAI');
+    put(zeroth, I.Model, toAsciiText(meta.model));
+    put(zeroth, I.DateTime, meta.exifDate);
+    put(zeroth, I.XPTitle, ucs2Bytes(meta.title));
+    put(zeroth, I.XPComment, ucs2Bytes(meta.prompt));
+    put(zeroth, I.XPKeywords, ucs2Bytes(meta.keywords));
+    put(zeroth, I.XPSubject, ucs2Bytes(meta.parentPrompt || meta.rootPrompt));
+    put(zeroth, I.XPAuthor, ucs2Bytes('Grok Imagine'));
+
+    put(exif, E.DateTimeOriginal, meta.exifDate);
+    put(exif, E.DateTimeDigitized, meta.exifDate);
+    put(exif, E.ImageUniqueID, meta.id);
+    put(exif, E.UserComment, `ASCII\0\0\0${meta.json}`);
+
+    return { '0th': zeroth, Exif: exif, GPS: {}, Interop: {}, '1st': {}, thumbnail: null };
+  }
+
+  /** Minimal fallback used when the full tag set is rejected — the prompt is the part that matters. */
+  function buildMinimalExifDicts(meta) {
+    const I = piexif.ImageIFD || {};
+    const E = piexif.ExifIFD || {};
+    const zeroth = {};
+    const exif = {};
+    if (I.ImageDescription != null && meta.prompt) zeroth[I.ImageDescription] = toAsciiText(meta.prompt);
+    if (E.UserComment != null) exif[E.UserComment] = `ASCII\0\0\0${meta.json}`;
+    return { '0th': zeroth, Exif: exif, GPS: {}, Interop: {}, '1st': {}, thumbnail: null };
+  }
+
+  /** The APP1 segment as a binary string, or null when EXIF cannot be produced. */
+  function dumpExifSegment(meta) {
+    if (typeof piexif === 'undefined') return null;
+    try {
+      return piexif.dump(buildExifDicts(meta));
+    } catch (err) {
+      console.warn('[GrokSearch] full EXIF dump failed, falling back to prompt only:', err);
+    }
+    try {
+      return piexif.dump(buildMinimalExifDicts(meta));
+    } catch (err) {
+      console.warn('[GrokSearch] EXIF dump failed:', err);
+      return null;
+    }
+  }
+
+  /**
+   * The bare TIFF block, which is what a WebP `EXIF` chunk holds — piexif hands back a JPEG
+   * APP1 segment, so the marker, its length, and the "Exif\0\0" identifier come off the front.
+   */
+  function buildTiffExifBytes(meta) {
+    const segment = dumpExifSegment(meta);
+    if (!segment) return null;
+    let s = segment;
+    if (s.charCodeAt(0) === 0xFF && s.charCodeAt(1) === 0xE1) s = s.slice(4);
+    if (s.slice(0, 6) === 'Exif\0\0') s = s.slice(6);
+    return s.length ? binaryStringToBytes(s) : null;
+  }
+
+  function embedMetadataInJpeg(buffer, meta) {
+    const segment = dumpExifSegment(meta);
+    if (!segment) return buffer;
     try {
       const binary = arrayBufferToBinaryString(buffer);
-      const zeroth = {};
-      const exif = {};
-      zeroth[piexif.ImageIFD.ImageDescription] = text;
-      exif[piexif.ExifIFD.UserComment] = `ASCII\0\0\0${text}`;
-      const exifObj = {
-        '0th': zeroth,
-        Exif: exif,
-        GPS: {},
-        Interop: {},
-        '1st': {},
-        thumbnail: null,
-      };
-      const exifBytes = piexif.dump(exifObj);
-      const newBinary = piexif.insert(exifBytes, binary);
-      return binaryStringToArrayBuffer(newBinary);
+      return binaryStringToArrayBuffer(piexif.insert(segment, binary));
     } catch (err) {
       console.warn('[GrokSearch] JPEG EXIF embed failed:', err);
       return buffer;
     }
   }
 
-  function buildPngTextChunk(keyword, text) {
+  // ─── PNG text chunks ────────────────────────────────────────────────────────
+
+  function buildPngChunk(type, data) {
     const enc = new TextEncoder();
-    const keyBytes = enc.encode(keyword);
-    const textBytes = enc.encode(text);
-    const data = new Uint8Array(keyBytes.length + 1 + textBytes.length);
-    data.set(keyBytes, 0);
-    data[keyBytes.length] = 0;
-    data.set(textBytes, keyBytes.length + 1);
-    const type = enc.encode('tEXt');
+    const typeBytes = enc.encode(type);
     const chunk = new Uint8Array(4 + 4 + data.length + 4);
     const view = new DataView(chunk.buffer);
     view.setUint32(0, data.length, false);
-    chunk.set(type, 4);
+    chunk.set(typeBytes, 4);
     chunk.set(data, 8);
     view.setUint32(8 + data.length, pngCrc32(chunk.subarray(4, 8 + data.length)), false);
     return chunk;
   }
 
-  function embedPromptInPng(buffer, prompt) {
-    const text = truncateMetadataText(prompt);
-    if (!text) return buffer;
+  /** Latin-1 `tEXt`. Only valid when every character fits in a byte. */
+  function buildPngTextChunk(keyword, text) {
+    const keyBytes = [];
+    for (const ch of String(keyword)) keyBytes.push(ch.charCodeAt(0) & 0xff);
+    const textBytes = [];
+    for (let i = 0; i < text.length; i++) textBytes.push(text.charCodeAt(i) & 0xff);
+    const data = new Uint8Array(keyBytes.length + 1 + textBytes.length);
+    data.set(keyBytes, 0);
+    data[keyBytes.length] = 0;
+    data.set(textBytes, keyBytes.length + 1);
+    return buildPngChunk('tEXt', data);
+  }
+
+  /** UTF-8 `iTXt`, uncompressed, no language tag — for text `tEXt` cannot represent. */
+  function buildPngITxtChunk(keyword, text) {
+    const enc = new TextEncoder();
+    const keyBytes = enc.encode(keyword);
+    const textBytes = enc.encode(text);
+    const data = new Uint8Array(keyBytes.length + 1 + 2 + 1 + 1 + textBytes.length);
+    let off = 0;
+    data.set(keyBytes, off); off += keyBytes.length;
+    data[off++] = 0;   // keyword terminator
+    data[off++] = 0;   // compression flag: uncompressed
+    data[off++] = 0;   // compression method
+    data[off++] = 0;   // empty language tag
+    data[off++] = 0;   // empty translated keyword
+    data.set(textBytes, off);
+    return buildPngChunk('iTXt', data);
+  }
+
+  /** tEXt carries Latin-1 plus line breaks; anything else has to go in an iTXt chunk. */
+  function isLatin1Text(text) {
+    return /^[\x20-\x7e\xa0-\xff\n]*$/.test(text);
+  }
+
+  function pngMetadataChunks(meta) {
+    const entries = [
+      ['Title', meta.title],
+      ['Description', meta.prompt],
+      ['Author', 'Grok Imagine'],
+      ['Software', meta.software],
+      ['Source', meta.postUrl],
+      ['Creation Time', meta.pngDate],
+      ['prompt', meta.prompt],
+      ['parameters', meta.model ? `${meta.prompt}\nModel: ${meta.model}` : meta.prompt],
+      ['Comment', meta.json],
+    ];
+    const chunks = [];
+    for (const [keyword, raw] of entries) {
+      const text = String(raw || '');
+      if (!text) continue;
+      chunks.push(isLatin1Text(text)
+        ? buildPngTextChunk(keyword, text)
+        : buildPngITxtChunk(keyword, text));
+    }
+    return chunks;
+  }
+
+  /** Byte offset just past IHDR, where ancillary chunks may be inserted. */
+  function pngHeaderEnd(u8) {
+    if (u8.length < 16) return -1;
+    const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const length = view.getUint32(8, false);
+    const type = String.fromCharCode(u8[12], u8[13], u8[14], u8[15]);
+    if (type !== 'IHDR') return -1;
+    const end = 8 + 8 + length + 4;
+    return end <= u8.length ? end : -1;
+  }
+
+  function embedMetadataInPng(buffer, meta) {
     const u8 = new Uint8Array(buffer);
-    if (u8.length < 33) return buffer;
+    const insertAt = pngHeaderEnd(u8);
+    if (insertAt < 0) return buffer;
     try {
-      const chunk = buildPngTextChunk('Description', text);
-      const out = new Uint8Array(u8.length + chunk.length);
-      out.set(u8.subarray(0, 33), 0);
-      out.set(chunk, 33);
-      out.set(u8.subarray(33), 33 + chunk.length);
+      const chunks = pngMetadataChunks(meta);
+      if (!chunks.length) return buffer;
+      const extra = chunks.reduce((n, c) => n + c.length, 0);
+      const out = new Uint8Array(u8.length + extra);
+      out.set(u8.subarray(0, insertAt), 0);
+      let off = insertAt;
+      for (const chunk of chunks) { out.set(chunk, off); off += chunk.length; }
+      out.set(u8.subarray(insertAt), off);
       return out.buffer;
     } catch (err) {
       console.warn('[GrokSearch] PNG metadata embed failed:', err);
@@ -2386,12 +2833,168 @@
     }
   }
 
-  async function embedPromptInImageBlob(blob, prompt) {
+  // ─── WebP (RIFF) ────────────────────────────────────────────────────────────
+  // A plain WebP is RIFF/WEBP + one VP8 or VP8L chunk and has nowhere to put metadata. The
+  // extended format adds a leading VP8X chunk whose flag byte advertises the optional chunks,
+  // so tagging one means synthesizing that header — which needs the canvas size read out of
+  // the bitstream — and appending EXIF and XMP after the image data.
+
+  const WEBP_FLAG_ALPHA = 0x10;
+  const WEBP_FLAG_EXIF = 0x08;
+  const WEBP_FLAG_XMP = 0x04;
+
+  function readRiffChunks(u8) {
+    const chunks = [];
+    const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    let off = 12;
+    while (off + 8 <= u8.length) {
+      const fourcc = String.fromCharCode(u8[off], u8[off + 1], u8[off + 2], u8[off + 3]);
+      const size = view.getUint32(off + 4, true);
+      const start = off + 8;
+      if (size > u8.length - start) break;   // truncated file: keep what parsed cleanly
+      chunks.push({ fourcc, data: u8.subarray(start, start + size) });
+      off = start + size + (size % 2);       // chunks are padded to an even length
+    }
+    return chunks;
+  }
+
+  function buildRiffChunk(fourcc, data) {
+    const pad = data.length % 2;
+    const out = new Uint8Array(8 + data.length + pad);
+    for (let i = 0; i < 4; i++) out[i] = fourcc.charCodeAt(i) & 0xff;
+    new DataView(out.buffer).setUint32(4, data.length, true);
+    out.set(data, 8);
+    return out;
+  }
+
+  /** Canvas size from VP8X, or from the VP8 / VP8L bitstream header of a simple file. */
+  function readWebpCanvasSize(chunks) {
+    for (const c of chunks) {
+      const d = c.data;
+      if (c.fourcc === 'VP8X' && d.length >= 10) {
+        return {
+          width: (d[4] | (d[5] << 8) | (d[6] << 16)) + 1,
+          height: (d[7] | (d[8] << 8) | (d[9] << 16)) + 1,
+        };
+      }
+      if (c.fourcc === 'VP8 ' && d.length >= 10 && d[3] === 0x9D && d[4] === 0x01 && d[5] === 0x2A) {
+        return {
+          width: (d[6] | (d[7] << 8)) & 0x3fff,
+          height: (d[8] | (d[9] << 8)) & 0x3fff,
+        };
+      }
+      if (c.fourcc === 'VP8L' && d.length >= 5 && d[0] === 0x2F) {
+        const bits = (d[1] | (d[2] << 8) | (d[3] << 16) | (d[4] << 24)) >>> 0;
+        return {
+          width: (bits & 0x3fff) + 1,
+          height: ((bits >>> 14) & 0x3fff) + 1,
+        };
+      }
+    }
+    return null;
+  }
+
+  function webpHasAlpha(chunks) {
+    for (const c of chunks) {
+      if (c.fourcc === 'ALPH') return true;
+      if (c.fourcc === 'VP8L' && c.data.length >= 5 && c.data[0] === 0x2F) {
+        const bits = (c.data[1] | (c.data[2] << 8) | (c.data[3] << 16) | (c.data[4] << 24)) >>> 0;
+        if ((bits >>> 28) & 1) return true;
+      }
+    }
+    return false;
+  }
+
+  function buildXmpPacket(meta) {
+    const esc = s => String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '');
+    const keywords = meta.keywords
+      ? meta.keywords.split(';').map(k => k.trim()).filter(Boolean)
+      : [];
+    const bag = keywords.map(k => `<rdf:li>${esc(k)}</rdf:li>`).join('');
+    const created = meta.createTime ? `\n      <xmp:CreateDate>${esc(meta.createTime)}</xmp:CreateDate>` : '';
+    const identifier = meta.id ? `\n      <dc:identifier>${esc(meta.id)}</dc:identifier>` : '';
+    const source = meta.postUrl ? `\n      <dc:source>${esc(meta.postUrl)}</dc:source>` : '';
+    return `<?xpacket begin="\uFEFF" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+      <dc:title><rdf:Alt><rdf:li xml:lang="x-default">${esc(meta.title)}</rdf:li></rdf:Alt></dc:title>
+      <dc:description><rdf:Alt><rdf:li xml:lang="x-default">${esc(meta.prompt)}</rdf:li></rdf:Alt></dc:description>
+      <dc:creator><rdf:Seq><rdf:li>Grok Imagine</rdf:li></rdf:Seq></dc:creator>
+      <dc:subject><rdf:Bag>${bag}</rdf:Bag></dc:subject>${identifier}${source}${created}
+      <xmp:CreatorTool>${esc(meta.software)}</xmp:CreatorTool>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`;
+  }
+
+  function embedMetadataInWebp(buffer, meta) {
+    const u8 = new Uint8Array(buffer);
+    if (!isWebpBytes(u8)) return buffer;
+    try {
+      const chunks = readRiffChunks(u8);
+      if (!chunks.length) return buffer;
+      const size = readWebpCanvasSize(chunks);
+      if (!size || !size.width || !size.height) return buffer;
+
+      const exifBytes = buildTiffExifBytes(meta);
+      const xmpBytes = new TextEncoder().encode(buildXmpPacket(meta));
+      if (!exifBytes && !xmpBytes.length) return buffer;
+
+      // Replacing rather than appending: a second EXIF chunk is invalid, and re-tagging a file
+      // that already carries our metadata has to be idempotent.
+      const kept = chunks.filter(c => c.fourcc !== 'EXIF' && c.fourcc !== 'XMP ' && c.fourcc !== 'VP8X');
+      const existingVp8x = chunks.find(c => c.fourcc === 'VP8X');
+
+      let flags = existingVp8x && existingVp8x.data.length >= 1 ? existingVp8x.data[0] : 0;
+      if (!existingVp8x && webpHasAlpha(kept)) flags |= WEBP_FLAG_ALPHA;
+      if (exifBytes) flags |= WEBP_FLAG_EXIF;
+      if (xmpBytes.length) flags |= WEBP_FLAG_XMP;
+
+      const vp8x = new Uint8Array(10);
+      vp8x[0] = flags;
+      const w = size.width - 1;
+      const h = size.height - 1;
+      vp8x[4] = w & 0xff; vp8x[5] = (w >> 8) & 0xff; vp8x[6] = (w >> 16) & 0xff;
+      vp8x[7] = h & 0xff; vp8x[8] = (h >> 8) & 0xff; vp8x[9] = (h >> 16) & 0xff;
+
+      // Chunk order is fixed by the container spec: VP8X first, image data in its original
+      // order, then the metadata chunks.
+      const body = [buildRiffChunk('VP8X', vp8x)];
+      for (const c of kept) body.push(buildRiffChunk(c.fourcc, c.data));
+      if (exifBytes) body.push(buildRiffChunk('EXIF', exifBytes));
+      if (xmpBytes.length) body.push(buildRiffChunk('XMP ', xmpBytes));
+
+      const riffSize = 4 + body.reduce((n, b) => n + b.length, 0);
+      const out = new Uint8Array(8 + riffSize);
+      out.set([0x52, 0x49, 0x46, 0x46], 0);                       // 'RIFF'
+      new DataView(out.buffer).setUint32(4, riffSize, true);
+      out.set([0x57, 0x45, 0x42, 0x50], 8);                       // 'WEBP'
+      let off = 12;
+      for (const b of body) { out.set(b, off); off += b.length; }
+      return out.buffer;
+    } catch (err) {
+      console.warn('[GrokSearch] WebP metadata embed failed:', err);
+      return buffer;
+    }
+  }
+
+  // ─── Dispatch ───────────────────────────────────────────────────────────────
+
+  async function embedMetadataInImageBlob(blob, post) {
     const buf = await blob.arrayBuffer();
     const u8 = new Uint8Array(buf);
+    const meta = buildPostMetadata(post);
     let out = buf;
-    if (isJpegBytes(u8)) out = embedPromptInJpeg(buf, prompt);
-    else if (isPngBytes(u8)) out = embedPromptInPng(buf, prompt);
+    if (isJpegBytes(u8)) out = embedMetadataInJpeg(buf, meta);
+    else if (isPngBytes(u8)) out = embedMetadataInPng(buf, meta);
+    else if (isWebpBytes(u8)) out = embedMetadataInWebp(buf, meta);
     if (out === buf) return blob;
     return new Blob([out], { type: blob.type || 'application/octet-stream' });
   }
@@ -2402,15 +3005,36 @@
     return !/\.mp4(\?|$)/i.test(url);
   }
 
-  async function prepareDownloadBlob(post) {
-    const blob = await fetchPostMediaBlob(post);
+  async function prepareDownloadBlob(post, signal) {
+    const blob = await fetchPostMediaBlob(post, signal);
     if (!isDownloadableImagePost(post)) return blob;
     try {
-      return await embedPromptInImageBlob(blob, post.prompt);
+      return await embedMetadataInImageBlob(blob, post);
     } catch (err) {
       console.warn('[GrokSearch] metadata embed failed:', err);
       return blob;
     }
+  }
+
+  /**
+   * A bulk run is long enough that a single flaky response would otherwise cost a file for good,
+   * so each one gets a few attempts with backoff. Aborts are not retried — Cancel means stop.
+   */
+  async function prepareDownloadBlobWithRetry(post, signal) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= DOWNLOAD_MAX_ATTEMPTS; attempt++) {
+      if (signal?.aborted) throw makeAbortError();
+      try {
+        return await prepareDownloadBlob(post, signal);
+      } catch (err) {
+        if (isAbortError(err) || signal?.aborted) throw err;
+        lastErr = err;
+        if (attempt < DOWNLOAD_MAX_ATTEMPTS) {
+          await sleep(DOWNLOAD_RETRY_BASE_MS * (2 ** (attempt - 1)));
+        }
+      }
+    }
+    throw lastErr || new Error('download failed');
   }
 
   function downloadPostMedia(post) {
@@ -2561,7 +3185,8 @@
       const msg = document.getElementById('grok-bulk-download-confirm-message');
       const noun = count === 1 ? 'image' : 'images';
       if (msg) {
-        msg.textContent = `This will take some time. You selected ${count} ${noun}.`;
+        msg.textContent = `This will take some time. You selected ${count} ${noun}. `
+          + 'You can cancel while it runs and retry whatever is left.';
       }
       if (dlg) {
         dlg.hidden = false;
@@ -2570,16 +3195,35 @@
     });
   }
 
-  async function downloadPostsToFolder(posts) {
+  /** Stops the run between files, and aborts the request already in flight. */
+  function cancelBulkDownload() {
+    if (!bulkDownloadInProgress) return;
+    bulkDownloadCancelled = true;
+    setDownloadStatus('cancelling…', true);
+    try { bulkDownloadAbort?.abort(); } catch { /* already settled */ }
+    syncDownloadSelectedButtons();
+  }
+
+  function clearFailedDownloads() {
+    lastFailedDownloads = [];
+    lastDownloadDirHandle = null;
+    syncDownloadSelectedButtons();
+  }
+
+  /**
+   * `dirHandle` is passed on retry so the user is not asked for the folder a second time. The
+   * handle stays valid for the lifetime of the page, and the permission is re-checked anyway.
+   */
+  async function downloadPostsToFolder(posts, { dirHandle: existingHandle = null } = {}) {
     if (bulkDownloadInProgress) return;
     if (posts.length === 0) return;
-    if (posts.length > BULK_DOWNLOAD_CONFIRM_ABOVE) {
+    if (!existingHandle && posts.length > BULK_DOWNLOAD_CONFIRM_ABOVE) {
       const confirmed = await confirmBulkDownload(posts.length);
       if (!confirmed) return;
     }
-    let dirHandle;
+    let dirHandle = existingHandle;
     try {
-      dirHandle = await pickDownloadFolder();
+      if (!dirHandle) dirHandle = await pickDownloadFolder();
       await ensureDirWritePermission(dirHandle);
     } catch (err) {
       if (err?.name === 'AbortError') return;
@@ -2593,41 +3237,69 @@
     }
 
     bulkDownloadInProgress = true;
+    bulkDownloadCancelled = false;
+    bulkDownloadAbort = typeof AbortController === 'function' ? new AbortController() : null;
+    const signal = bulkDownloadAbort?.signal;
+    lastFailedDownloads = [];
+    lastDownloadDirHandle = null;
     syncDownloadSelectedButtons();
+
     let ok = 0;
-    let fail = 0;
+    const failed = [];
     const total = posts.length;
     try {
       setDownloadStatus(`downloading 0/${total}…`, true);
       for (let i = 0; i < posts.length; i++) {
+        if (bulkDownloadCancelled) break;
         const post = posts[i];
         const filename = getPostDownloadFilename(post);
         if (!filename) {
-          fail++;
+          failed.push(post);
           continue;
         }
         setDownloadStatus(`downloading ${i + 1}/${total}…`, true);
         try {
-          const blob = await prepareDownloadBlob(post);
+          const blob = await prepareDownloadBlobWithRetry(post, signal);
           await saveBlobToFolder(dirHandle, filename, blob);
           ok++;
         } catch (err) {
+          if (isAbortError(err) || bulkDownloadCancelled) {
+            // Cancelled mid-file: it did not fail, it never got its turn.
+            break;
+          }
           console.error('[GrokSearch] save failed:', post.id, err);
-          fail++;
+          failed.push(post);
         }
       }
-      setDownloadStatus(
-        fail === 0
-          ? `saved ${ok} file${ok === 1 ? '' : 's'}`
-          : `saved ${ok}, failed ${fail}`
-      );
+      // Everything still queued when Cancel landed counts as unfinished — including the file
+      // whose request was aborted — so Retry picks up exactly where the run stopped.
+      if (bulkDownloadCancelled) {
+        for (let i = ok + failed.length; i < posts.length; i++) failed.push(posts[i]);
+      }
+      lastFailedDownloads = failed;
+      lastDownloadDirHandle = failed.length ? dirHandle : null;
+      const savedText = `saved ${ok} file${ok === 1 ? '' : 's'}`;
+      if (bulkDownloadCancelled) {
+        setDownloadStatus(`cancelled — ${savedText}, ${failed.length} left`);
+      } else {
+        setDownloadStatus(failed.length === 0 ? savedText : `saved ${ok}, failed ${failed.length}`);
+      }
     } catch (err) {
       console.error('[GrokSearch] bulk download failed:', err);
       setDownloadStatus('download failed');
     } finally {
       bulkDownloadInProgress = false;
+      bulkDownloadCancelled = false;
+      bulkDownloadAbort = null;
       syncDownloadSelectedButtons();
     }
+  }
+
+  async function retryFailedDownloads() {
+    const posts = lastFailedDownloads.slice();
+    const dirHandle = lastDownloadDirHandle;
+    if (posts.length === 0) return;
+    await downloadPostsToFolder(posts, { dirHandle });
   }
 
   async function downloadSelectedPosts() {
@@ -2701,6 +3373,10 @@
     }
     if (isChildPost(post) && post.parentId) {
       items.push({ action: 'open-parent', label: 'Open parent post' });
+      // Only a grandchild has somewhere else to go — for a direct child the root *is* the parent.
+      if (getRootIdOf(post) !== post.parentId) {
+        items.push({ action: 'open-root', label: 'Open original post' });
+      }
     }
     return items;
   }
@@ -2759,6 +3435,11 @@
       case 'open-parent':
         if (post.parentId) window.open(getPostDetailUrl(post.parentId), '_blank');
         break;
+      case 'open-root': {
+        const rootId = getRootIdOf(post);
+        if (rootId) window.open(getPostDetailUrl(rootId), '_blank');
+        break;
+      }
       default:
         break;
     }
@@ -3156,7 +3837,7 @@
 
     const queryLower = (currentQuery || '').toLowerCase().trim();
     const terms = queryLower ? queryLower.split(/\s+/).filter(Boolean) : [];
-    const parentPromptById = terms.length > 0 ? buildParentPromptIndex() : null;
+    const parentPromptById = terms.length > 0 ? buildPromptById() : null;
     // Hoisted: these were recomputed per post, which meant two Date objects per row per pass.
     const dateBounds = hasDateFilter() ? getDateFilterBounds() : null;
 
@@ -3964,11 +4645,14 @@
         white-space: nowrap; font-variant-numeric: tabular-nums; flex-shrink: 0;
         line-height: 1;
       }
+      /* Cancel and Retry join this row mid-download, so it has to reflow rather than overflow
+         and paint over whatever sits next to it. */
       .grok-results-count-wrap {
         display: flex;
         align-items: center;
-        gap: 8px;
-        flex-shrink: 0;
+        flex-wrap: wrap;
+        gap: 6px 8px;
+        min-width: 0;
         line-height: 1;
       }
       #grok-search-count-wrap {
@@ -3977,7 +4661,9 @@
       .grok-download-results-btn,
       .grok-download-selected-btn,
       .grok-check-all-btn,
-      .grok-clear-selection-btn {
+      .grok-clear-selection-btn,
+      .grok-cancel-download-btn,
+      .grok-retry-download-btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -3985,6 +4671,26 @@
         padding: 3px 7px;
         line-height: 1;
         white-space: nowrap;
+      }
+      /* These rules set display, so the hidden attribute needs to outrank them. */
+      .grok-results-count-wrap [hidden] { display: none !important; }
+      .grok-cancel-download-btn:not(:disabled) {
+        border-color: rgba(248,113,113,0.45);
+        color: rgba(252,165,165,0.95);
+      }
+      .grok-cancel-download-btn:hover:not(:disabled) {
+        border-color: rgba(248,113,113,0.8);
+        background: rgba(248,113,113,0.15);
+        color: #fff;
+      }
+      .grok-retry-download-btn:not(:disabled) {
+        border-color: rgba(251,191,36,0.45);
+        color: rgba(253,224,71,0.95);
+      }
+      .grok-retry-download-btn:hover:not(:disabled) {
+        border-color: rgba(251,191,36,0.8);
+        background: rgba(251,191,36,0.15);
+        color: #fff;
       }
       #grok-stamp-status { font-size: 10px; color: rgba(255,255,255,0.22); white-space: nowrap; flex-shrink: 0; }
       #grok-search-clear,
@@ -5163,6 +5869,42 @@
       'Clear image selection'
     );
 
+    // Cancel and Retry live next to Download selected in both bars; they are hidden unless a
+    // run is active or the last run left something behind.
+    for (const wrap of [toolbarWrap, panelWrap]) {
+      appendSelectionToolbarButton(
+        wrap,
+        'grok-cancel-download-btn',
+        'Cancel',
+        'Stop the download after the current file'
+      );
+      appendSelectionToolbarButton(
+        wrap,
+        'grok-retry-download-btn',
+        'Retry failed',
+        'Download the files the last run did not finish'
+      );
+    }
+
+    document.querySelectorAll('.grok-cancel-download-btn').forEach(btn => {
+      if (btn.dataset.grokCancelDownloadBound) return;
+      btn.dataset.grokCancelDownloadBound = '1';
+      btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelBulkDownload();
+      });
+    });
+    document.querySelectorAll('.grok-retry-download-btn').forEach(btn => {
+      if (btn.dataset.grokRetryDownloadBound) return;
+      btn.dataset.grokRetryDownloadBound = '1';
+      btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        retryFailedDownloads();
+      });
+    });
+
     document.querySelectorAll('.grok-download-selected-btn').forEach(btn => {
       if (btn.dataset.grokDownloadSelectedBound) return;
       btn.dataset.grokDownloadSelectedBound = '1';
@@ -5215,6 +5957,18 @@
     });
     document.querySelectorAll('.grok-clear-selection-btn').forEach(btn => {
       btn.disabled = busy || count === 0;
+    });
+    document.querySelectorAll('.grok-cancel-download-btn').forEach(btn => {
+      btn.hidden = !busy;
+      btn.disabled = !busy || bulkDownloadCancelled;
+      btn.textContent = bulkDownloadCancelled ? 'Cancelling…' : 'Cancel';
+    });
+    const pending = lastFailedDownloads.length;
+    document.querySelectorAll('.grok-retry-download-btn').forEach(btn => {
+      btn.hidden = pending === 0;
+      btn.disabled = busy || pending === 0;
+      btn.textContent = `Retry ${pending} file${pending === 1 ? '' : 's'}`;
+      btn.title = `Download the ${pending} file${pending === 1 ? '' : 's'} the last run did not finish`;
     });
   }
 

@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.js` **v1.64.0** · `grokPostSidebar.js` **v1.3.0**  
+**Current versions:** `grokSearch.js` **v1.65.0** · `grokPostSidebar.js` **v1.3.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Fork lineage
@@ -14,7 +14,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | **Upstream GitHub fork** this project is based on |
-| **This repo** | Enhanced fork: `grokSearch.js` v1.64.0 + `grokPostSidebar.js` v1.3.0 |
+| **This repo** | Enhanced fork: `grokSearch.js` v1.65.0 + `grokPostSidebar.js` v1.3.0 |
 
 ## What is included
 
@@ -40,7 +40,7 @@ Both scripts share the same IndexedDB database: **`GrokSearchIndex`**.
 - **Chrome or Edge** recommended (bulk **Download selected** uses the folder picker API)
 - Firefox works for search/sync; folder bulk-download may be unavailable
 - [Tampermonkey](https://www.tampermonkey.net/) (v4+)
-- A Grok account with **liked** Imagine posts
+- A Grok account with Imagine posts
 - Logged in at `grok.com`
 - Network access to **jsDelivr** on first run (loads `piexifjs` for EXIF tagging)
 
@@ -132,8 +132,8 @@ Indexing time depends on library size. Leave the tab open until the status finis
 | **Clear** | Clears text, dates, model, liked, and media filters |
 | **Download selected** | In the match-count area — save checked images to a folder (Chrome/Edge) |
 | **Import JSON** | Merge a previously exported index file back in (adds and updates; never deletes) |
-| **Export JSON** | Download full index (schema v3, parents + children) |
-| **Verify** | Reconcile the index against your liked feed — removes unliked posts, adds posts liked after they were created |
+| **Export JSON** | Download full index (schema v5, parents + children) |
+| **Verify** | Reconcile the index against the feed — removes posts that are gone and repairs anything a truncated sync missed |
 | **Reindex** | Clear DB and rebuild from API (use after upgrades or bad cache) |
 
 ### Results panel header
@@ -162,11 +162,11 @@ Shown when **Results only** is on (default). These controls are **not** in the s
 ### Results
 
 - **Left-click** a card → **lightbox** over current matched results (←/→ inside lightbox, **Download** in footer, Esc to close).
-- **Right-click** a card → context menu: Open, open in new tab, copy prompt/URL, download image/video, download all child posts (parents with children), filter to date, open parent (child rows).
+- **Right-click** a card → context menu: Open, open in new tab, copy prompt/URL, download image/video, download all descendants, filter to date, open parent (child rows), open original (variations of a variation).
 - **Checkbox** (top-left, subtle until hover/selected) → select for **Download selected**.
 - **Date badge** (top center) → filter to that day (click again to clear).
 - **Parent** cards: video / descendant image badges (counts include **all generations** in `childPosts` tree).
-- **Child** cards: purple **child** icon (top-right), own date badge.
+- **Child** cards: purple **child** icon (top-right), own date badge. A variation that has variations of its own shows its **own** counts, so **Download all** works from it too.
 - **← / →** keys page results when the search box is not focused and the lightbox is closed.
 
 ### Downloads and metadata
@@ -174,14 +174,38 @@ Shown when **Results only** is on (default). These controls are **not** in the s
 | Action | Behavior |
 |--------|----------|
 | Context menu → **Download image** / **Download video** | Single file via browser download |
-| Context menu → **Download all** | All child/descendant posts to a folder (parents with children only) |
+| Context menu → **Download all** | Every descendant of the post to a folder — works from a variation too, not just the original |
 | Lightbox → **Download** | Same single-file download for the current image or video |
 | **Download selected** | Pick a folder once; files saved as `grok-{id}.{ext}` one by one; progress in toolbar and panel |
-| **> 5 selected** | Custom confirm dialog: *“This will take some time. You selected N images.”* |
-| Image downloads | Prompt embedded in **JPEG EXIF** (`ImageDescription`, `UserComment`) and **PNG** `Description` text chunk |
-| Videos | Downloaded without EXIF changes |
+| **> 5 selected** | Custom confirm dialog naming the count, and noting that you can cancel and resume |
+| **Cancel** | Appears while a bulk download runs. Stops it and aborts the file in flight |
+| **Retry N files** | Appears after a run that did not finish. Downloads only what is left, into the **same folder** — no second folder prompt |
+| Videos | Downloaded without metadata changes |
 
-Long prompts are trimmed (~2000 chars). WebP is not tagged yet. If tagging fails, the file still downloads.
+Each file is attempted up to **three times** with a growing delay before it counts as failed, so a
+single flaky response does not cost you the image. Cancelling is not a failure: everything still
+queued — including the file that was interrupted — goes into **Retry**, so a large export can be
+stopped and resumed.
+
+#### What is written into the file
+
+Downloaded images carry everything the index knows about the post, so an exported folder stays
+searchable after it leaves the browser.
+
+| Format | Where it goes |
+|--------|---------------|
+| **JPEG** | EXIF — `ImageDescription`, `UserComment` (full JSON), `Software`, `Artist`, `Make`, `Model`, `DateTime` / `DateTimeOriginal` / `DateTimeDigitized`, `ImageUniqueID`, and the Windows `XPTitle` / `XPComment` / `XPKeywords` / `XPSubject` / `XPAuthor` tags Explorer shows |
+| **PNG** | Text chunks — `Title`, `Description`, `Author`, `Software`, `Source`, `Creation Time`, `Comment` (full JSON), plus `prompt` and `parameters` for AI image tools. UTF-8 prompts use `iTXt`, the rest `tEXt` |
+| **WebP** | An `EXIF` chunk with the same tags as JPEG, plus an `XMP ` packet (`dc:description`, `dc:title`, `dc:creator`, `dc:subject`, `xmp:CreateDate`). A plain WebP is rewritten into the extended container so it has somewhere to put them |
+| **MP4 / video** | Untouched |
+
+The JSON blob in `UserComment` / `Comment` holds the whole record: post id, prompt, parent and
+original prompts, `parentId` / `rootId`, creation time, model, media type, like state, child
+counts, media URL, and the post's permalink.
+
+Long prompts are trimmed (~4000 chars, so the tags fit inside a JPEG's 64 KB EXIF segment). Re-tagging an already-tagged WebP
+replaces its metadata rather than appending to it. If tagging fails for any reason the file still
+downloads, untagged.
 
 ### Keyboard
 
@@ -282,8 +306,13 @@ storage** so a large index is not evicted under storage pressure.
 ## IndexedDB
 
 - **Database:** `GrokSearchIndex` / store `posts`
-- **Schema version (export):** 3  
-- **Typical fields:** `id`, `prompt`, `parentPrompt`, `parentId`, `isChild`, `thumbnail`, `mediaUrl`, `createTime`, `model`, `mediaType`, counts, optional `metadataRefreshedAt`
+- **Schema version (export):** 5
+- **Typical fields:** `id`, `prompt`, `parentPrompt`, `parentId`, `rootId`, `rootPrompt`, `isChild`, `thumbnail`, `mediaUrl`, `createTime`, `model`, `mediaType`, `isLiked`, counts, optional `metadataRefreshedAt`
+
+`parentId` is the post a variation came from directly; `rootId` is the original at the top of the
+tree. For a first-generation variation the two are the same. `rootPrompt` is only stored when it
+differs from `parentPrompt`, so searching the original wording still finds variations several
+generations deep.
 
 Clear index (browser console on Imagine):
 
@@ -322,8 +351,12 @@ req.onsuccess = e => {
 | **Verify** says *aborted — unexpected feed response* | It refused to delete more than half the index; check the console and retry later |
 | **Import JSON** fails | The file must be an index export (an object with a `posts` array, or a bare array of rows) |
 | **Download selected** does nothing / no folder picker | Use Chrome or Edge; must click the button (user gesture) |
+| A bulk download is taking too long | Click **Cancel**, then **Retry N files** later — it resumes into the same folder without re-prompting |
+| Some files failed | Click **Retry N files**. Each file already got three attempts, so a repeat failure usually means the media URL expired — run **Verify**, then retry |
+| **Retry** button disappeared | It only survives while the page is open; the queue is not persisted. Re-select and download again |
 | No **Check all** / **Download data** | Turn on **Results only** or use the results panel header |
-| EXIF not in downloaded file | JPEG/PNG only; check file type; see browser console for `[GrokSearch]` warnings |
+| No metadata in a downloaded file | JPEG, PNG and WebP only — videos are never tagged. Check the browser console for `[GrokSearch]` warnings |
+| A tool reads the prompt from JPEG but not PNG | Some readers only look at `tEXt`; a prompt with characters outside Latin-1 is written as `iTXt` instead. `exiftool` reads both |
 | `piexif` / CDN blocked | Allow `cdn.jsdelivr.net` or reinstall script so `@require` can load |
 | Video/child filters still show child cards | **With video** / **With child** are parents-only; **Video only** includes child video rows; use **Hide childs** to drop child rows |
 | Greasy Fork + this script | Use **one** search script to avoid conflicts |
@@ -337,9 +370,9 @@ node test/run.js
 ```
 
 No dependencies and no build step — the `.js` files are what ships. The suite runs the real sync,
-index, and rendering logic from `grokSearch.js` against stubs; see [test/README.md](test/README.md).
-Anything needing a browser (IndexedDB, the folder picker, EXIF, CSS) still has to be checked by
-pasting the script into Tampermonkey.
+index, rendering, download and image-metadata logic from `grokSearch.js` against stubs; see
+[test/README.md](test/README.md). Anything needing a browser (IndexedDB, the folder picker, the
+live SPA, CSS) still has to be checked by pasting the script into Tampermonkey.
 
 ---
 

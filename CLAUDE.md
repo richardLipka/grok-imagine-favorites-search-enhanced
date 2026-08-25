@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.js` (v1.64.0, ~5.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, EXIF tagging |
+| `grokSearch.js` (v1.65.0, ~5.9k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.js` (v1.3.0, ~530 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.js` owns the schema (it is the only
@@ -54,15 +54,16 @@ indexedDB.deleteDatabase('GrokSearchIndex');
 ```
 
 Everything the suite cannot reach needs this manual pass: DOM injection into the live SPA, IndexedDB,
-`GM_xmlhttpRequest`, the folder picker, EXIF writing, and CSS. All of it requires a logged-in
-`grok.com` session with liked posts.
+`GM_xmlhttpRequest`, the folder picker, the real `piexifjs`, and CSS. All of it requires a logged-in
+`grok.com` session.
 
 ### Release convention
 
-A behavior change bumps the version in **three** places, kept in lockstep:
+A behavior change bumps the version in **four** places, kept in lockstep:
 
 - the `// @version` line in the script header,
-- the "Current versions" line in `README.md`,
+- the `SCRIPT_VERSION` const (it is stamped into downloaded image metadata),
+- the "Current versions" line and the fork-lineage row in `README.md`,
 - a new `## [x.y.z] — YYYY-MM-DD` section in `CHANGELOG.md` with `### Added` / `### Changed` / `### Fixed`.
 
 Changes that do not alter what users install (tests, docs, tooling) do **not** bump the version or get
@@ -104,13 +105,30 @@ that as an empty result — conflating the two is what made a mid-walk `401` rep
 These are internal APIs and may change without notice, so the UI always degrades to the cached index
 rather than throwing.
 
-### Index model (schema v4)
+### Index model (schema v5)
 
-The nested `childPosts` tree is **flattened**: every descendant becomes its own row with
-`isChild: true`, `parentId`, and a denormalized `parentPrompt` (children have no prompt of their own, so
-`parentPrompt` is what makes them full-text searchable). Parent rows carry aggregate counts
-(`childPostCount`, `childImageCount`, `childVideoCount`, `videoCount`) computed over **all generations**
-via `walkDescendantPosts()`, not just direct children.
+The nested `childPosts` tree is **flattened**, but the edges are real: every descendant becomes its
+own row with `isChild: true`, `parentId` (the **immediate** parent) and `rootId` (the top-level post
+that owns the tree). For a direct child the two are equal. Rows carry aggregate counts
+(`childPostCount`, `childImageCount`, `childVideoCount`, `videoCount`) computed over **all
+generations** via `walkDescendantPosts()` — including child rows, which is what makes *Download all*
+and the variation badge work from a mid-tree row.
+
+Two rules follow from the split, and both exist to fix real bugs:
+
+- **Pruning is scoped to `rootId`, never to `parentId`.** `syncChildRecordsForParent()` refreshes a
+  whole tree at once, so `removeDescendantsOfRoot()` has to see every generation. Keying the prune
+  on the immediate parent would strand grandchildren whose branch was deleted. Legacy rows written
+  before v5 have no `rootId`; `getRootIdOf()` falls back to `parentId`, which is exactly right for
+  them because back then every descendant was parented straight onto the root.
+- **Anything resolving a child's parent must index *every* row, not just top-level ones.** A
+  grandchild's parent is itself a child row. `buildPromptById()` and `backfillChildParentPrompts()`
+  both got this wrong before v5, which left grandchildren with an unresolvable parent prompt.
+
+Prompts are denormalized twice: `parentPrompt` (the immediate parent's) and `rootPrompt` (the
+original's, stored **only when it differs**, so a first-generation child costs nothing). Both join
+`_search`, so searching the original wording finds descendants several generations deep. A prompt
+edit therefore has to propagate to two fields — see `propagateParentPromptToChildren()`.
 
 `toStorageRecord()` is the single canonical row shape — it defines what is persisted *and* what is
 exported. Add a field there, not ad hoc at call sites, and bump `INDEX_SCHEMA_VERSION` when the shape
@@ -140,8 +158,8 @@ covered by `test/suites/liked.test.js`.
 `allPosts` is paired with `postById` (id → the live row object). **Rows are updated in place, keyed by
 id — never by array position.** `updatePostRow()` mutates the existing object so every array slot and
 every reference held by `matchedPosts` or the lightbox stays valid; `addPostRow()` appends and
-registers. Only `removeChildrenOfParent()` changes the array's shape, and it calls `rebuildPostIndex()`
-itself.
+registers. Only `removeDescendantsOfRoot()` changes the array's shape, and it calls
+`rebuildPostIndex()` itself.
 
 This is not stylistic. The previous design passed an `id → array index` map through the sync, and a
 child removal mid-pass shifted every later index, so concurrent deep-refresh workers wrote posts into
@@ -268,18 +286,54 @@ To inspect toolbar layout without grok.com, render the real CSS and markup stand
 `ensure*()` functions inject at runtime, and open the result in a browser. Measuring
 `getBoundingClientRect()` for overlap and overflow is more reliable than eyeballing a screenshot.
 
-### Downloads and EXIF
+### Downloads
 
-`piexifjs` is pulled in via `@require` from jsDelivr — the only third-party dependency and the only
-non-`grok.com` network access. Media is fetched through `GM_xmlhttpRequest` (CORS), then
-`embedPromptInJpeg()` (EXIF `ImageDescription` + `UserComment`) or `embedPromptInPng()` (hand-rolled
-`tEXt` chunk with a local CRC32 table) writes the prompt into the file; video and WebP pass through
-untouched. Tagging failures must never block the download.
-
-Bulk "Download selected" uses the **File System Access API** (`showDirectoryPicker` via `unsafeWindow`),
+Media is fetched by page `fetch` first and falls back to `GM_xmlhttpRequest` (CORS). Bulk
+"Download selected" uses the **File System Access API** (`showDirectoryPicker` via `unsafeWindow`),
 so it is Chrome/Edge-only and must run inside a real user gesture. Files are written sequentially as
 `grok-{id}.{ext}`; above `BULK_DOWNLOAD_CONFIRM_ABOVE` (5) items a custom in-page confirm dialog is
 shown instead of native `confirm()`.
+
+Cancel and retry are threaded through the whole path and have three invariants:
+
+- **An abort is not a failure.** `prepareDownloadBlobWithRetry()` retries `DOWNLOAD_MAX_ATTEMPTS`
+  times with backoff, but rethrows an `AbortError` immediately. Anything that catches download
+  errors must check `isAbortError()` before counting a failure.
+- **Cancel reaches the request in flight.** The page `fetch` gets the `AbortController` signal;
+  `GM_xmlhttpRequest` has no signal support, so the handle it returns is aborted from an `abort`
+  listener. Older managers return nothing there — hence the optional chaining, and hence Cancel
+  degrading to "stops after this file" rather than failing.
+- **Whatever was still queued when Cancel landed goes into `lastFailedDownloads`**, including the
+  interrupted file, and `lastDownloadDirHandle` is kept so **Retry** resumes into the same folder
+  without a second picker prompt. The queue is in-memory only; a reload loses it.
+
+### Image metadata
+
+`piexifjs` is pulled in via `@require` from jsDelivr — the only third-party dependency and the only
+non-`grok.com` network access. `embedMetadataInImageBlob()` dispatches on magic bytes to a JPEG,
+PNG, or WebP writer; anything else (video included) passes through as the *same blob object*, which
+is what callers test for. Tagging failures must never block the download — every writer returns the
+original buffer on error.
+
+`buildPostMetadata()` is the single place that turns a row into tag values, so a new indexed field
+is added there rather than at each writer. Things worth knowing before editing this area:
+
+- **piexif tag ids differ between builds.** `buildExifDicts()` skips any tag whose id is
+  `undefined` instead of writing under the key `"undefined"`, which would poison the whole dump.
+  `dumpExifSegment()` falls back to a prompt-only dictionary if the full set is rejected.
+- **EXIF string fields are byte-oriented**, so `toAsciiText()` folds accents and drops the rest. The
+  untouched text still travels in the UCS-2 `XP*` tags and in the ASCII-escaped JSON blob.
+- **WebP is a RIFF container.** A plain file (`VP8 ` / `VP8L` only) has nowhere to put metadata, so
+  it is rewritten into the extended format: a synthesized `VP8X` header carrying the canvas size
+  read out of the bitstream and a flag byte, then the original image chunks in order, then `EXIF`
+  and `XMP `. Existing `EXIF`/`XMP ` chunks are **replaced, not appended** — a second copy is
+  invalid and re-tagging has to be idempotent. Chunk order is fixed by the spec, sizes are
+  little-endian, and every chunk is padded to an even length.
+- The WebP `EXIF` chunk holds **bare TIFF**. piexif returns a JPEG APP1 segment, so
+  `buildTiffExifBytes()` strips the marker, its length, and the `Exif\0\0` identifier.
+- **PNG `tEXt` is Latin-1 only.** Text that does not fit goes into a UTF-8 `iTXt` chunk instead.
+  `pngCrc32()` must shift by 8 per byte, not 1 — it shifted by 1 until v1.65.0 and silently wrote a
+  bad checksum into every text chunk the script produced.
 
 ### Durability and persisted state
 
