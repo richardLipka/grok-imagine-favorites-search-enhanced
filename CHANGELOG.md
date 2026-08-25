@@ -3,6 +3,44 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.66.0] — 2026-08-26
+
+Two reported bugs: images that were never liked still were not being indexed, and collapsing the
+search bar left the Grok page blank until a reload.
+
+### Fixed
+- **Collapsing the search bar left the page blank.** Un-hiding Grok's own grid re-derived the
+  element by searching for `[class*="media-post-masonry-card"]` — but React drops those cards while
+  their container is `display: none`, so the lookup found nothing, the un-hide was skipped, and the
+  inline `display: none !important` survived until a reload. Hidden elements now carry a marker and
+  are restored through it, so the restore cannot depend on finding them again. `updateDisplayMode()`
+  also drops every mode class while the bar is collapsed — `grok-custom-results-mode` alone keeps
+  the native grid hidden through CSS.
+- **The source probe kept choosing a likes-only source.** It ranked candidates by the newest
+  `createTime` in their first few items, which cannot work: the feed is ordered by *interaction*
+  time, so every candidate shows the same recently touched posts at its head and reports the same
+  newest date. It now samples 50 items, takes the liked feed as a baseline, and scores each
+  candidate on how many ids it returns that the liked feed does not — an actual test of "is this
+  broader than my likes".
+
+### Added
+- **`tools/capture-list.js`.** If no source enum reaches past your likes, guessing cannot fix it.
+  This records the request Grok's own library view sends and stores it as a template, which
+  `fetchPage()` then replays instead of guessing — the same "capture the real request, never invent
+  one" rule the like button follows. Response parsing became tolerant of different key names for
+  the post array and the cursor, since a captured request may hit a different endpoint.
+- **The script now says when the index can only hold likes**, in the console and in the status bar,
+  and names the tool to fix it. Silence is what made this so hard to see: everything looked
+  healthy, the feed simply did not contain the posts.
+
+### Tooling
+- 75 new assertions across two suites: `feed` (template replay, response shapes, probe ranking) and
+  `native-visibility` (hide/restore against an attribute-aware fake DOM). 397 total. Three
+  mutations — restoring the old un-hide, the old probe ranking, and ignoring the template — confirm
+  each suite fails when the behaviour it covers is broken.
+
+---
+
 ## Unreleased
 
 Nothing here changes the installed userscripts — no version bump.

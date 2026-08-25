@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.js` **v1.65.0** · `grokPostSidebar.js` **v1.3.0**  
+**Current versions:** `grokSearch.js` **v1.66.0** · `grokPostSidebar.js` **v1.3.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Fork lineage
@@ -14,7 +14,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | **Upstream GitHub fork** this project is based on |
-| **This repo** | Enhanced fork: `grokSearch.js` v1.65.0 + `grokPostSidebar.js` v1.3.0 |
+| **This repo** | Enhanced fork: `grokSearch.js` v1.66.0 + `grokPostSidebar.js` v1.3.0 |
 
 ## What is included
 
@@ -294,6 +294,35 @@ If it picks badly, force a re-probe with **Reindex**, or pin one by hand:
 localStorage.setItem('grokSearchMediaSource', 'MEDIA_POST_SOURCE_LIKED'); // or '(none)' for no filter
 ```
 
+### Capturing the library request
+
+`grokSearch.js` walks the same feed API Grok's own page uses, and asks it for the widest
+`filter.source` it can find. That enum is undocumented, so the script probes for it — and if the
+deployment only accepts likes-only values, **images you never liked cannot be reached at all**,
+however the probe ranks them. You will see this in the console and the status bar:
+
+```
+[GrokSearch] No media source reached anything beyond your likes...
+```
+
+The fix is to stop guessing and record what Grok's own view actually sends:
+
+1. Open `https://grok.com/imagine` and open DevTools (F12) → **Console**.
+2. Paste the contents of [`tools/capture-list.js`](tools/capture-list.js) and press Enter.
+3. **Scroll your library** so it loads more images. The tool keeps whichever request returned the
+   most posts and prints what it stored.
+4. Reload the page and click **Reindex**.
+
+From then on the script replays that exact request instead of guessing, and the console says
+`Replaying the library request captured by tools/capture-list.js`.
+
+The tool only observes — it sends nothing itself, and stops on its own after two minutes (or call
+`__grokFinishListCapture()` to stop sooner). To undo:
+
+```javascript
+localStorage.removeItem('grokSearchListRequest');
+```
+
 ### Backing up the index
 
 **Export JSON** writes the whole index to a file and **Import JSON** merges one back in — rows
@@ -344,7 +373,10 @@ req.onsuccess = e => {
 | Stale counts or missing children | Wait for sync, then click **Verify**; **Reindex** only if that does not help |
 | Unliked posts still in results | Click **Verify** — incremental sync never removes rows |
 | Like buttons disabled | Liking needs a one-time capture — run [`tools/capture-like.js`](tools/capture-like.js) once |
-| Only liked posts are indexed | Index predates v1.64.0 — click **Reindex** once to pick up the whole library |
+| Only liked posts are indexed | First click **Reindex**. If the console then says *No media source reached anything beyond your likes*, no enum works for your account — run [`tools/capture-list.js`](tools/capture-list.js), see [Capturing the library request](#capturing-the-library-request) |
+| Status bar says *likes only — see tools/capture-list.js* | Exactly the above: the feed the script can reach contains only your likes |
+| New images never appear, even after **Reindex** | Same cause. Check the console for the `Source probe` table — it lists every candidate and how many posts each returned beyond your likes |
+| Grok's own page is blank after hiding the search bar | Fixed in v1.66.0; update the script. As a workaround, reload the page |
 | **Liked only** hides posts you did like | Their like state is unknown (`null`) because the feed did not report it; **Reindex** refreshes it |
 | Recent posts missing, even after **Reindex** | Check the **Model** dropdown reads *All models* — it is a saved preference, so **Reindex** does not clear it and posts made with any other model stay hidden. **Clear** resets it. Then run [`tools/diagnose.js`](tools/diagnose.js) in the console if they are still missing |
 | A post you just liked is missing | If it is an older post it is not near the top of the feed; click **Verify** |

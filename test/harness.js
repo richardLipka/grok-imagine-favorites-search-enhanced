@@ -257,6 +257,108 @@ function createBulkDownloadSandbox(control = {}) {
   return new Function('control', `${prelude}\n${region}\n${epilogue}`)(control);
 }
 
+/**
+ * The feed request layer: the captured-template path, response extraction, and the source probe.
+ * `control.responses` maps a source name (or '(none)') to the posts that candidate returns, so a
+ * test can describe a deployment where, say, only the liked source works.
+ */
+function createFeedSandbox(control = {}) {
+  const src = readSource();
+  const region = sliceBetween(src, '  /** Writes `value` at a dotted/array path', '  function buildLikeRequest')
+    + sliceBetween(src, '  function readListTemplate', '  function isVideoMediaType');
+
+  const prelude = `
+    const LIST_REQUEST_KEY = 'grokSearchListRequest';
+    const ENDPOINT = 'https://grok.com/rest/media/post/list';
+    const MEDIA_SOURCE_LIKED = 'MEDIA_POST_SOURCE_LIKED';
+    const MEDIA_SOURCE_KEY = 'grokSearchMediaSource';
+    const MEDIA_SOURCE_PROBED_KEY = 'grokSearchMediaSourceProbedAt';
+    const MEDIA_SOURCE_REPROBE_MS = 7 * 24 * 60 * 60 * 1000;
+    const PROBE_SAMPLE_SIZE = 50;
+    const MEDIA_SOURCE_CANDIDATES = control.candidates || [
+      null, 'MEDIA_POST_SOURCE_ALL', 'MEDIA_POST_SOURCE_HISTORY', MEDIA_SOURCE_LIKED,
+    ];
+
+    let mediaSource = MEDIA_SOURCE_LIKED;
+    let mediaSourceResolved = false;
+
+    const store = Object.assign({}, control.storage);
+    const log = { requests: [], statuses: [], warnings: [] };
+
+    const localStorage = {
+      getItem: k => (Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null),
+      setItem: (k, v) => { store[k] = String(v); },
+      removeItem: k => { delete store[k]; },
+    };
+    const readStoredString = (k, fallback = '') => (localStorage.getItem(k) ?? fallback);
+    const writeStoredString = (k, v) => localStorage.setItem(k, v);
+    const sleep = () => Promise.resolve();
+    const setLoadStatus = t => { log.statuses.push(t); };
+    const document = { getElementById: () => null };
+    const console = {
+      log: () => {},
+      warn: m => { log.warnings.push(String(m)); },
+      error: () => {},
+    };
+
+    /** Answers from control.responses, keyed by the source the body actually carries. */
+    async function postJsonWithRetry(url, body, label, headers) {
+      log.requests.push({ url, body, label, headers });
+      if (control.respond) return control.respond({ url, body, label });
+      const source = body?.filter?.source ?? null;
+      const key = source === null ? '(none)' : source;
+      const posts = (control.responses || {})[key];
+      if (posts === undefined) return { ok: false, status: 400 };
+      return { ok: true, data: { posts, nextCursor: null } };
+    }
+  `;
+
+  const epilogue = `
+    return {
+      log, store,
+      get mediaSource() { return mediaSource; },
+      setMediaSource(v) { mediaSource = v; mediaSourceResolved = true; },
+      readListTemplate, hasCapturedListRequest, deleteAtPath, setAtPath,
+      buildListBody, extractListPage, fetchPage,
+      newestCreateTimeOf, idsOf, probeMediaSource, resolveMediaSource, warnIfLikesOnly,
+    };
+  `;
+
+  return new Function('control', `${prelude}\n${region}\n${epilogue}`)(control);
+}
+
+/**
+ * Hiding and restoring Grok's own grid, against the attribute-aware fake DOM. The point of the
+ * sandbox is that the "find the element" stubs can be made to return null after hiding, which is
+ * what React does to the masonry cards and what used to leave the page blank until a reload.
+ */
+function createNativeVisibilitySandbox({ document, grid = null, root = null }) {
+  const region = sliceBetween(readSource(), "  const HID_GRID_ATTR", '  function updateDisplayMode');
+
+  const prelude = `
+    let resultsOnly = true;
+    let showResults = true;
+    const lookups = { grid, root };
+    function getGrokGrid() { return lookups.grid; }
+    function getNativeSavedRoot() { return lookups.root; }
+    function shouldShowSearchResults() { return showResults; }
+  `;
+
+  const epilogue = `
+    return {
+      lookups,
+      setState(next) {
+        if ('resultsOnly' in next) resultsOnly = next.resultsOnly;
+        if ('showResults' in next) showResults = next.showResults;
+      },
+      setNativeGridVisible, setNativeSavedRootVisible, applyNativeVisibility,
+      HID_GRID_ATTR, HID_ROOT_ATTR,
+    };
+  `;
+
+  return new Function('document', 'grid', 'root', `${prelude}\n${region}\n${epilogue}`)(document, grid, root);
+}
+
 /** The like/unlike request templating helpers (no network, pure shaping). */
 function createLikeSandbox() {
   const region = sliceBetween(readSource(), '  /** Writes `value` at a dotted/array path', '  function sendLikeRequest');
@@ -286,4 +388,5 @@ module.exports = {
   SOURCE_PATH, readSource, sliceBetween,
   createIndexSandbox, createGridSandbox, createLikeSandbox, createMetadataSandbox,
   createDownloadSandbox, createBulkDownloadSandbox,
+  createFeedSandbox, createNativeVisibilitySandbox,
 };

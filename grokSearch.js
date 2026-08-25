@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.65.0
+// @version      1.66.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -71,7 +71,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.65.0';
+  const SCRIPT_VERSION = '1.66.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -82,6 +82,8 @@
   const MEDIA_SOURCE_KEY = 'grokSearchMediaSource';
   const MEDIA_SOURCE_PROBED_KEY = 'grokSearchMediaSourceProbedAt';
   const MEDIA_SOURCE_REPROBE_MS = 7 * 24 * 60 * 60 * 1000;
+  /** Probe page size. Big enough that "returns ids the liked feed does not" is a real signal. */
+  const PROBE_SAMPLE_SIZE = 50;
   /** `null` means "send no source filter at all", which some deployments treat as everything. */
   const MEDIA_SOURCE_CANDIDATES = [
     null,
@@ -105,6 +107,8 @@
   const LIKED_CONTAINER_FIELDS = ['viewerState', 'viewer', 'interaction', 'interactions', 'userState', 'state'];
   /** Request template for like/unlike, captured from Grok's own UI by tools/capture-like.js. */
   const LIKE_REQUEST_KEY = 'grokSearchLikeRequest';
+  /** Template recorded by tools/capture-list.js; when present it replaces the guessed source. */
+  const LIST_REQUEST_KEY = 'grokSearchListRequest';
   const FILTER_LIKED_KEY = 'grokSearchFilterLiked';
   const INDEX_VERSION_KEY = 'grokSearchIndexSchemaVersion';
   const DB_NAME = 'GrokSearchIndex';
@@ -266,12 +270,12 @@
     return HTTP_RETRY_BASE_MS * 2 ** attempt;
   }
 
-  function gmRequestOnce(url, body) {
+  function gmRequestOnce(url, body, headers) {
     return new Promise(resolve => {
       GM_xmlhttpRequest({
         method: 'POST',
         url,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...(headers || {}) },
         data: JSON.stringify(body),
         withCredentials: true,
         onload: res => resolve({ status: res.status, text: res.responseText, headers: res.responseHeaders }),
@@ -285,9 +289,9 @@
    * callers must not confuse that with an empty result — a 401/429 mid-walk used to look
    * exactly like the end of the feed.
    */
-  async function postJsonWithRetry(url, body, label) {
+  async function postJsonWithRetry(url, body, label, headers) {
     for (let attempt = 0; ; attempt++) {
-      const res = await gmRequestOnce(url, body);
+      const res = await gmRequestOnce(url, body, headers);
       if (res.status >= 200 && res.status < 300) {
         try {
           return { ok: true, data: JSON.parse(res.text) };
@@ -307,7 +311,58 @@
     }
   }
 
+  // ─── Feed request ─────────────────────────────────────────────────────────
+  /**
+   * The feed request has two forms.
+   *
+   * By default the script calls the known list endpoint and guesses `filter.source`, because the
+   * enum covering the whole library is undocumented. Guessing is unreliable: if every candidate
+   * the deployment accepts is likes-only, media you never liked is unreachable however the probe
+   * ranks them.
+   *
+   * So when tools/capture-list.js has recorded the request Grok's own library view sends, that
+   * template is replayed instead. Same rule the like button follows — capture the real request,
+   * never invent one. The template is the authoritative answer to what the library returns.
+   *
+   * Template shape: { url, method, body, cursorPath, limitPath?, headers? }
+   */
+  function readListTemplate() {
+    try {
+      const raw = localStorage.getItem(LIST_REQUEST_KEY);
+      if (!raw) return null;
+      const tpl = JSON.parse(raw);
+      return tpl && tpl.url && tpl.body && typeof tpl.body === 'object' ? tpl : null;
+    } catch { return null; }
+  }
+
+  function hasCapturedListRequest() {
+    return Boolean(readListTemplate());
+  }
+
+  /** Removes the value at a dotted/array path, leaving the containing objects in place. */
+  function deleteAtPath(obj, path) {
+    if (!path || !path.length) return obj;
+    let node = obj;
+    for (let i = 0; i < path.length - 1; i++) {
+      node = node?.[path[i]];
+      if (!node || typeof node !== 'object') return obj;
+    }
+    delete node[path[path.length - 1]];
+    return obj;
+  }
+
   function buildListBody(cursor, source = mediaSource, limit = 40) {
+    const tpl = readListTemplate();
+    if (tpl) {
+      const body = JSON.parse(JSON.stringify(tpl.body));
+      const cursorPath = tpl.cursorPath?.length ? tpl.cursorPath : ['cursor'];
+      if (tpl.limitPath?.length) setAtPath(body, tpl.limitPath, limit);
+      // The first page must carry no cursor key at all: an empty string is not the same thing
+      // as "start from the beginning" to every backend.
+      if (cursor) setAtPath(body, cursorPath, String(cursor));
+      else deleteAtPath(body, cursorPath);
+      return body;
+    }
     const filter = { safeForWork: false };
     if (source) filter.source = source;
     const body = { limit, filter };
@@ -315,10 +370,48 @@
     return body;
   }
 
+  const LIST_POSTS_KEYS = ['posts', 'mediaPosts', 'items', 'results', 'media', 'data'];
+  const LIST_CURSOR_KEYS = ['nextCursor', 'cursor', 'nextPageToken', 'pageToken', 'next', 'endCursor'];
+
+  /**
+   * Pulls one page out of a list response. A captured request may hit a different endpoint than
+   * the one hardcoded here and there is no contract on the key names, so both the post array and
+   * the cursor are looked up by candidate name, then one level of nesting down.
+   */
+  function extractListPage(data) {
+    if (!data || typeof data !== 'object') return { posts: [], nextCursor: null };
+
+    const findPosts = obj => {
+      for (const key of LIST_POSTS_KEYS) {
+        if (Array.isArray(obj[key])) return obj[key];
+      }
+      return null;
+    };
+    const findCursor = obj => {
+      for (const key of LIST_CURSOR_KEYS) {
+        const v = obj[key];
+        if (typeof v === 'string' && v) return v;
+      }
+      return null;
+    };
+
+    let posts = findPosts(data);
+    let nextCursor = findCursor(data);
+    if (!posts || !nextCursor) {
+      for (const v of Object.values(data)) {
+        if (!v || typeof v !== 'object' || Array.isArray(v)) continue;
+        if (!posts) posts = findPosts(v);
+        if (!nextCursor) nextCursor = findCursor(v);
+      }
+    }
+    return { posts: posts || [], nextCursor: nextCursor || null };
+  }
+
   async function fetchPage(cursor) {
-    const res = await postJsonWithRetry(ENDPOINT, buildListBody(cursor), 'list');
+    const tpl = readListTemplate();
+    const res = await postJsonWithRetry(tpl?.url || ENDPOINT, buildListBody(cursor), 'list', tpl?.headers);
     if (!res.ok) return { ok: false, status: res.status };
-    return { ok: true, posts: res.data?.posts || [], nextCursor: res.data?.nextCursor || null };
+    return { ok: true, ...extractListPage(res.data) };
   }
 
   function newestCreateTimeOf(posts) {
@@ -330,29 +423,68 @@
     return newest;
   }
 
+  function idsOf(posts) {
+    const out = new Set();
+    for (const p of posts) if (p?.id) out.add(String(p.id));
+    return out;
+  }
+
   /**
-   * Finds which source returns the fullest library. Grok no longer requires a like for media to
-   * stay in history, but the enum value covering everything is undocumented and has changed, so
-   * this probes cheaply (limit 5) and caches the winner. Read-only.
+   * Finds which source returns more than the liked feed does.
+   *
+   * Ranking candidates by their newest `createTime` does not work, and that is why the earlier
+   * probe kept settling on a likes-only source: the feed is ordered by *interaction* time, so
+   * every candidate shows the same handful of recently touched posts at its head and they all
+   * report the same newest date. What actually separates a broader source from likes-only is
+   * whether it returns ids the liked feed does not, so the liked feed is sampled first as a
+   * baseline and every candidate is scored against it. Read-only.
    */
   async function probeMediaSource() {
+    const sample = async candidate => {
+      const res = await postJsonWithRetry(ENDPOINT, buildListBody(null, candidate, PROBE_SAMPLE_SIZE), 'probe');
+      if (!res.ok) return null;
+      const { posts } = extractListPage(res.data);
+      return posts.length ? posts : null;
+    };
+
+    const likedIds = idsOf(await sample(MEDIA_SOURCE_LIKED) || []);
     const results = [];
     for (const candidate of MEDIA_SOURCE_CANDIDATES) {
-      const res = await postJsonWithRetry(ENDPOINT, buildListBody(null, candidate, 5), 'probe');
-      if (!res.ok) continue;
-      const posts = res.data?.posts || [];
-      if (!posts.length) continue;
-      results.push({ source: candidate, count: posts.length, newest: newestCreateTimeOf(posts) });
+      if (candidate === MEDIA_SOURCE_LIKED) continue;
       await sleep(80);
+      const posts = await sample(candidate);
+      if (!posts) continue;
+      const ids = idsOf(posts);
+      let beyondLikes = 0;
+      for (const id of ids) if (!likedIds.has(id)) beyondLikes++;
+      results.push({ source: candidate, count: ids.size, beyondLikes, newest: newestCreateTimeOf(posts) });
     }
-    if (!results.length) return MEDIA_SOURCE_LIKED;
-    // The source exposing the most recent media wins; it is the one that is not likes-only.
-    results.sort((a, b) => (b.newest || '').localeCompare(a.newest || ''));
-    console.log('[GrokSearch] Source probe:', results.map(r => `${r.source || '(none)'}→${r.newest || '?'}`).join(', '));
-    return results[0].source;
+
+    console.log(`[GrokSearch] Source probe (liked baseline: ${likedIds.size} posts):`);
+    for (const r of results) {
+      console.log(`  ${r.source || '(no source filter)'} → ${r.count} posts, `
+        + `${r.beyondLikes} beyond likes, newest ${r.newest || '?'}`);
+    }
+
+    results.sort((a, b) => (b.beyondLikes - a.beyondLikes)
+      || (b.count - a.count)
+      || (b.newest || '').localeCompare(a.newest || ''));
+    const best = results[0];
+    if (best && best.beyondLikes > 0) return best.source;
+    if (!likedIds.size && best) return best.source;
+    return MEDIA_SOURCE_LIKED;
   }
 
   async function resolveMediaSource({ force = false } = {}) {
+    // A captured request carries its own filter, so there is nothing left to guess at.
+    if (hasCapturedListRequest()) {
+      mediaSource = null;
+      if (!mediaSourceResolved || force) {
+        console.log('[GrokSearch] Replaying the library request captured by tools/capture-list.js');
+      }
+      mediaSourceResolved = true;
+      return mediaSource;
+    }
     if (mediaSourceResolved && !force) return mediaSource;
     const stored = readStoredString(MEDIA_SOURCE_KEY, '');
     const probedAt = Number(readStoredString(MEDIA_SOURCE_PROBED_KEY, '0')) || 0;
@@ -369,6 +501,24 @@
     writeStoredString(MEDIA_SOURCE_PROBED_KEY, String(Date.now()));
     console.log(`[GrokSearch] Using media source: ${mediaSource || '(no source filter)'}`);
     return mediaSource;
+  }
+
+  /**
+   * Says so, once, when the index can only ever contain likes. Silence here is what made the
+   * missing-images problem so hard to see: everything looked healthy, the feed simply did not
+   * contain the posts.
+   */
+  function warnIfLikesOnly() {
+    if (hasCapturedListRequest() || mediaSource !== MEDIA_SOURCE_LIKED) return;
+    console.warn('[GrokSearch] No media source reached anything beyond your likes, so the index '
+      + 'covers liked posts only. If images you never liked are missing, record the request '
+      + "Grok's own library view sends by pasting tools/capture-list.js into this console, then "
+      + 'click Reindex. See "Capturing the library request" in the README.');
+    setLoadStatus('likes only — see tools/capture-list.js');
+    const statusEl = document.getElementById('grok-stamp-status');
+    setTimeout(() => {
+      if (statusEl && statusEl.textContent.startsWith('likes only')) statusEl.textContent = '';
+    }, 12000);
   }
 
   function isVideoMediaType(mediaType) {
@@ -1911,6 +2061,7 @@
     // Outside the try/finally so `indexing` is already false and the guard lets it run.
     if (loaded) {
       checkIndexSchemaFreshness();
+      warnIfLikesOnly();
       maybeRunScheduledReconcile();
     }
   }
@@ -1951,28 +2102,47 @@
     return resultsOnly || hasActiveFilter();
   }
 
+  const HID_GRID_ATTR = 'data-grok-hid-grid';
+  const HID_ROOT_ATTR = 'data-grok-hid-root';
+
+  /**
+   * Hiding is recorded on the element, and un-hiding finds it back through that marker rather
+   * than re-deriving it.
+   *
+   * This is not defensive style, it is a fix: getGrokGrid() and getNativeSavedRoot() both
+   * locate the container by searching for `[class*="media-post-masonry-card"]`, and React drops
+   * those cards while their container is `display: none`. Once that happened the lookup
+   * returned null, the un-hide was skipped, and the inline `display: none !important` survived
+   * until a reload -- a blank Grok page behind a collapsed search bar.
+   */
+  function showNativeHidden(attr) {
+    document.querySelectorAll(`[${attr}]`).forEach(el => {
+      el.removeAttribute(attr);
+      if (attr === HID_ROOT_ATTR) delete el.dataset.grokNativeSavedRoot;
+      // The grid and the saved root can resolve to the same node; only the last marker to go
+      // may clear the inline styles.
+      if (el.hasAttribute(HID_GRID_ATTR) || el.hasAttribute(HID_ROOT_ATTR)) return;
+      el.style.removeProperty('display');
+      el.style.removeProperty('visibility');
+    });
+  }
+
+  function hideNativeElement(el, attr) {
+    if (!el) return;
+    el.setAttribute(attr, '1');
+    if (attr === HID_ROOT_ATTR) el.dataset.grokNativeSavedRoot = '1';
+    el.style.setProperty('display', 'none', 'important');
+    el.style.setProperty('visibility', 'hidden', 'important');
+  }
+
   function setNativeGridVisible(visible) {
-    const nativeGrid = getGrokGrid();
-    if (!nativeGrid) return;
-    if (visible) {
-      nativeGrid.style.removeProperty('display');
-      nativeGrid.style.removeProperty('visibility');
-    } else {
-      nativeGrid.style.setProperty('display', 'none', 'important');
-      nativeGrid.style.setProperty('visibility', 'hidden', 'important');
-    }
+    if (visible) showNativeHidden(HID_GRID_ATTR);
+    else hideNativeElement(getGrokGrid(), HID_GRID_ATTR);
   }
 
   function setNativeSavedRootVisible(visible) {
-    const root = getNativeSavedRoot();
-    if (!root) return;
-    if (visible) {
-      root.style.removeProperty('display');
-      delete root.dataset.grokNativeSavedRoot;
-    } else {
-      root.dataset.grokNativeSavedRoot = '1';
-      root.style.setProperty('display', 'none', 'important');
-    }
+    if (visible) showNativeHidden(HID_ROOT_ATTR);
+    else hideNativeElement(getNativeSavedRoot(), HID_ROOT_ATTR);
   }
 
   function applyNativeVisibility() {
@@ -1991,9 +2161,16 @@
   }
 
   function updateDisplayMode() {
-    document.documentElement.classList.toggle('grok-results-only-mode', resultsOnly);
-    document.documentElement.classList.toggle('grok-custom-results-mode', resultsOnly);
-    document.documentElement.classList.toggle('grok-filtered-inline-mode', hasActiveFilter() && !resultsOnly);
+    // A collapsed search bar means "get out of the way", so no mode class may survive it --
+    // `grok-custom-results-mode` alone keeps the native grid hidden through CSS, whatever the
+    // inline styles say.
+    const active = searchBarExpanded;
+    document.documentElement.classList.toggle('grok-results-only-mode', active && resultsOnly);
+    document.documentElement.classList.toggle('grok-custom-results-mode', active && resultsOnly);
+    document.documentElement.classList.toggle(
+      'grok-filtered-inline-mode',
+      active && hasActiveFilter() && !resultsOnly
+    );
   }
 
   function ensureInlineResultsViewport() {

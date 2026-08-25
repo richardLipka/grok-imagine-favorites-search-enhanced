@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.js` (v1.65.0, ~5.9k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokSearch.js` (v1.66.0, ~6k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.js` (v1.3.0, ~530 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.js` owns the schema (it is the only
@@ -93,9 +93,22 @@ session cookies authenticate the request:
   regardless of age and the incremental sync reaches it.
   The `filter.source` enum decides how much of the library is visible. It is undocumented and has
   changed (Grok used to require a like for media to persist), so `resolveMediaSource()` probes
-  `MEDIA_SOURCE_CANDIDATES` with 5-item queries, keeps whichever returns the newest media, and
-  caches it for `MEDIA_SOURCE_REPROBE_MS`. **Reindex forces a re-probe** — that is the escape hatch
-  when Grok changes the enum again. Never hardcode a source back into `fetchPage`.
+  `MEDIA_SOURCE_CANDIDATES` and caches the winner for `MEDIA_SOURCE_REPROBE_MS`. **Reindex forces a
+  re-probe.** Never hardcode a source back into `fetchPage`.
+
+  **Rank candidates on what they return, not on how recent it is.** The probe originally sorted by
+  the newest `createTime` in each candidate's first few items and consistently picked a likes-only
+  source, because the feed is ordered by *interaction* time: every candidate shows the same handful
+  of recently touched posts at its head and reports the same newest date. It now samples
+  `PROBE_SAMPLE_SIZE` items, treats the liked feed as a baseline, and scores each candidate on how
+  many ids it returns that the liked feed does not.
+
+  **When no enum works, capture instead of guessing.** `tools/capture-list.js` records the request
+  Grok's own library view sends; `readListTemplate()` returns it and `buildListBody()`/`fetchPage()`
+  replay it verbatim, cursor and limit written at the captured paths. That path bypasses the probe
+  entirely. Because a captured request may hit a different endpoint, `extractListPage()` looks the
+  post array and the cursor up by candidate key name plus one level of nesting rather than assuming
+  `posts`/`nextCursor`. Same rule as the like button: capture the real request, never invent one.
 - `POST /rest/media/post/get` — single post with the full child tree (used for deep refresh).
 
 Both go through `postJsonWithRetry()`, which retries `429`/`5xx` with exponential backoff and honours
@@ -266,6 +279,15 @@ This is the fragile part of the codebase and the usual source of bugs:
 - **The native grid is located by heuristic**, not a stable selector: `getGrokGrid()` /
   `getNativeSavedRoot()` find `[class*="media-post-masonry-card"]` and walk up a bounded number of
   parents. A Grok class-name change breaks hiding — keep those walks defensive and null-safe.
+- **Never re-derive an element in order to un-hide it.** Those heuristics return `null` once React
+  drops the masonry cards, which it does while their container is `display: none` — so the un-hide
+  silently did nothing and left the page blank until a reload. `hideNativeElement()` stamps
+  `HID_GRID_ATTR` / `HID_ROOT_ATTR`, and `showNativeHidden()` restores by querying that marker. The
+  two can resolve to the same node, so the inline styles are only cleared once the last marker is
+  gone. Anything else that hides part of Grok's UI must follow the same shape.
+- **No display-mode class may survive a collapsed search bar.** `grok-custom-results-mode` hides the
+  native grid through CSS on its own, so `updateDisplayMode()` gates all three classes on
+  `searchBarExpanded`; clearing the inline styles is not enough by itself.
 - **A `MutationObserver` on `document.body`** detects SPA URL changes (re-`init()` + sync) and re-asserts
   visibility/results after React re-renders, debounced ~350 ms via `scheduleEnforceDisplay()`. Because
   React can rewrite the DOM at any time, injected UI must be re-assertable.

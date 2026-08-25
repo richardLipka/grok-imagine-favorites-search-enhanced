@@ -23,7 +23,7 @@ them with stubbed collaborators (`dbPutMany`, `fetchPage`, `setLoadStatus`, …)
 runs production code. Nothing here reimplements logic — a test that passed against a copy of
 the algorithm would be worthless.
 
-Six sandboxes:
+Eight sandboxes:
 
 | Sandbox | Region | Covers |
 |---------|--------|--------|
@@ -33,6 +33,8 @@ Six sandboxes:
 | `createMetadataSandbox()` | `PNG_CRC_TABLE` → `isDownloadableImagePost` | EXIF assembly, PNG text chunks, the WebP RIFF rebuild |
 | `createDownloadSandbox()` | `makeAbortError` → `PNG_CRC_TABLE`, plus `isDownloadableImagePost` → `downloadPostMedia` | Media fetch, the GM fallback, per-file retry and abort |
 | `createBulkDownloadSandbox()` | `cancelBulkDownload` → `downloadSelectedPosts` | The bulk loop: cancel, the failed queue, resuming into the same folder |
+| `createFeedSandbox()` | `setAtPath` → `buildLikeRequest`, plus `readListTemplate` → `isVideoMediaType` | Captured-template replay, response-shape tolerance, source-probe ranking |
+| `createNativeVisibilitySandbox()` | `HID_GRID_ATTR` → `updateDisplayMode` | Hiding and restoring Grok's own grid, against the attribute-aware fake DOM |
 
 `createMetadataSandbox()` takes a **stubbed `piexif`** — the real library is a jsDelivr `@require`
 and cannot be installed here. So the JPEG path is only checked for *how* it calls piexif, while the
@@ -85,3 +87,6 @@ current suites, each caught:
 | Cancel drops the remaining queue | 4 in `download` |
 | WebP re-tag appends instead of replacing | 2 in `metadata` |
 | Child pruning disabled | 9 across `child-sync` and `grandchildren` |
+| Un-hiding re-derives the element instead of using its marker | 5 in `native-visibility` |
+| The source probe ranks on newest `createTime` again | 3 in `feed` |
+| A captured list template is ignored | 6 in `feed` |
