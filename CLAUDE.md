@@ -87,6 +87,11 @@ Two undocumented Grok REST endpoints, called with `GM_xmlhttpRequest` + `withCre
 session cookies authenticate the request:
 
 - `POST /rest/media/post/list` — liked feed, cursor-paginated, 40/page, includes a nested `childPosts` tree.
+  **Ordered by like time, not creation time** (a single page has been observed spanning 190 days of
+  `createTime`), and scoped to `MEDIA_POST_SOURCE_LIKED`. Two consequences: a post liked today shows
+  up at the head of the feed no matter how old it is, so incremental sync does reach it; and media
+  the user generated but never liked is not in this feed at all — it only enters the index as a
+  child row when its parent is liked.
 - `POST /rest/media/post/get` — single post with the full child tree (used for deep refresh).
 
 Both go through `postJsonWithRetry()`, which retries `429`/`5xx` with exponential backoff and honours
@@ -159,11 +164,15 @@ respect them when adding sync entry points. A trigger arriving mid-sync is store
 
 ### Reconciliation (`reconcileLikedIndex`)
 
-Incremental sync is additive: it never deletes, and it stops after a few pages. Two things are
-therefore structurally outside its reach — **unliked posts** (nothing else removes a parent row) and
-**posts liked long after they were created** (they never surface near the top of the feed). The
-reconcile sweep walks the entire feed for ids only, then makes the index match. It runs at most once
-per `RECONCILE_INTERVAL_MS` (timestamp in `localStorage`), or on demand from the **Verify** button.
+Incremental sync is additive: it never deletes, and it stops after a few pages. **Unliked posts** are
+therefore structurally outside its reach — nothing else removes a parent row. The reconcile sweep
+walks the entire feed for ids only, then makes the index match. It runs at most once per
+`RECONCILE_INTERVAL_MS` (timestamp in `localStorage`), or on demand from the **Verify** button.
+
+(An earlier version of this file claimed reconciliation was also needed for *posts liked long after
+they were created*. That was wrong: the feed is ordered by like time, so those arrive at the head and
+the incremental sync catches them. Removing unlikes, and repairing anything a truncated sync missed,
+is the real job.)
 
 It is the only destructive path in the codebase, so three rules hold it together:
 

@@ -25,6 +25,11 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 Both scripts share the same IndexedDB database: **`GrokSearchIndex`**.
 
+> **These scripts index your _liked_ media.** Grok's liked feed is ordered by when you liked
+> something, not when it was made, so anything you generate but never like is not indexed — it only
+> shows up as a **child** row underneath a parent post you did like. If recent generations are
+> missing, check that you actually liked them.
+
 ---
 
 ## Requirements
@@ -217,10 +222,10 @@ backoff (`rate limited — retrying…`).
 
 ### Verify (index reconciliation)
 
-Incremental sync only looks at the first few pages of the liked feed, so two things are outside
-its reach: posts you **unlike** (they would stay in the index forever) and posts you **like long
-after they were created** (they never appear near the top of the feed). **Verify** closes both
-gaps — it walks the whole feed collecting ids only, then makes the index match.
+Incremental sync only looks at the first few pages of the liked feed and never deletes, so posts you
+**unlike** would otherwise stay in the index forever. **Verify** closes that gap — it walks the whole
+feed collecting ids only, then makes the index match. It also repairs anything a sync that stopped
+early left behind.
 
 | | |
 |--|--|

@@ -7,6 +7,13 @@ Versions match the `@version` in each userscript header.
 
 Nothing here changes the installed userscripts — no version bump.
 
+### Corrected
+- The v1.63.0 notes said **Verify** was needed to find *posts liked long after they were created*.
+  That was based on a wrong assumption about feed ordering. Field data shows the liked feed is
+  ordered by **like time**, not creation time (one page spanned 190 days of `createTime`), so a
+  freshly liked old post arrives at the head of the feed and the incremental sync already catches it.
+  Verify's real job is removing unliked posts and repairing truncated syncs. Docs updated.
+
 ### Tooling
 - Added a dependency-free test suite: `node test/run.js` (96 assertions across records, index
   mutation, child sync, reconciliation, and results-grid reuse). The suite slices regions out of
@@ -27,6 +34,8 @@ Nothing here changes the installed userscripts — no version bump.
   the liked-feed API actually returns, which filter preferences are stored, and whether more than
   one search script is running. For working out whether missing posts are a fetch problem, an
   indexing problem, or a filter hiding them.
+- `tools/probe-sources.js` — probes which `MEDIA_POST_SOURCE_*` values the list endpoint accepts, to
+  find out whether media you generated but never liked is reachable at all.
 
 ### Note
 - If posts are missing after a **Reindex**, check the **Model** dropdown first. It is a saved
