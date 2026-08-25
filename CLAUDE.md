@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.js` (v1.62.1, ~4.7k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, EXIF tagging |
+| `grokSearch.js` (v1.63.0, ~5.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, EXIF tagging |
 | `grokPostSidebar.js` (v1.3.0, ~530 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.js` owns the schema (it is the only
@@ -51,10 +51,12 @@ A behavior change bumps the version in **three** places, kept in lockstep:
 
 - the `// @version` line in the script header,
 - the "Current versions" line in `README.md`,
-- a new `## [x.yy] — YYYY-MM-DD` section in `CHANGELOG.md` with `### Added` / `### Changed` / `### Fixed`.
+- a new `## [x.y.z] — YYYY-MM-DD` section in `CHANGELOG.md` with `### Added` / `### Changed` / `### Fixed`.
 
 Commit subjects are imperative with the version in parentheses, e.g.
-`Add context menu and lightbox downloads (v1.61)`. Branch is `main`; `origin` is the GitHub fork.
+`Add context menu and lightbox downloads (v1.61)`. Releases are annotated tags named `vX.Y.Z`
+(`git tag -a v1.63.0`); the repo does not use GitHub Releases. Branch is `main`; `origin` is the
+GitHub fork.
 
 ## Architecture of `grokSearch.js`
 
@@ -72,8 +74,12 @@ session cookies authenticate the request:
 - `POST /rest/media/post/list` — liked feed, cursor-paginated, 40/page, includes a nested `childPosts` tree.
 - `POST /rest/media/post/get` — single post with the full child tree (used for deep refresh).
 
-These are internal APIs and may change without notice — network failures resolve to `null` rather than
-throwing, and the UI degrades to the cached index.
+Both go through `postJsonWithRetry()`, which retries `429`/`5xx` with exponential backoff and honours
+`Retry-After`. It always resolves: `ok: false` means the request failed, and callers must never treat
+that as an empty result — conflating the two is what made a mid-walk `401` report "up to date".
+
+These are internal APIs and may change without notice, so the UI always degrades to the cached index
+rather than throwing.
 
 ### Index model (schema v3)
 
@@ -132,9 +138,31 @@ Two invariants govern which posts land in that batch, and both exist to fix real
 missing from it — so it first checks that the payload's id matches the post being refreshed. Keep that
 guard: a malformed response would otherwise delete every child the post has.
 
-The `indexing`, `syncInProgress`, and `loaded` guards prevent overlapping runs — respect them when
-adding sync entry points. A trigger arriving mid-sync is stored in `pendingSyncReason` and re-run
-rather than dropped.
+The `indexing`, `syncInProgress`, `reconcileInProgress`, and `loaded` guards prevent overlapping runs —
+respect them when adding sync entry points. A trigger arriving mid-sync is stored in
+`pendingSyncReason` and re-run rather than dropped.
+
+### Reconciliation (`reconcileLikedIndex`)
+
+Incremental sync is additive: it never deletes, and it stops after a few pages. Two things are
+therefore structurally outside its reach — **unliked posts** (nothing else removes a parent row) and
+**posts liked long after they were created** (they never surface near the top of the feed). The
+reconcile sweep walks the entire feed for ids only, then makes the index match. It runs at most once
+per `RECONCILE_INTERVAL_MS` (timestamp in `localStorage`), or on demand from the **Verify** button.
+
+It is the only destructive path in the codebase, so three rules hold it together:
+
+- **Ids come straight from the payload**, via `walkDescendantPosts`, *not* from
+  `collectChildRecords()` — that helper deliberately skips posts that already exist as parents, and
+  those ids must still count as present or the sweep would delete them.
+- **Deletions apply only when the walk completed.** A network failure, a repeated cursor, or the page
+  cap leaves `complete = false` and nothing is removed; a partial id set is indistinguishable from a
+  mass unlike.
+- **`RECONCILE_MAX_DELETE_RATIO` caps a single sweep.** If the feed claims more than half the index is
+  gone, that is treated as a bad response and logged, not obeyed.
+
+`removeRowsById()` is the only function that deletes parent rows; it also clears `knownIds` and
+`selectedPostIds` and rebuilds the id map.
 
 ### Render pipeline
 
@@ -148,7 +176,23 @@ This runs over the whole index on every keystroke, so keep per-post work out of 
 `applyFilter()` does with the date bounds) above the `filter()` callback.
 
 Selection (`selectedPostIds`) is independent of the match set — `pruneSelection()` drops only ids that
-left the index entirely, so a filter change never clears what the user checked.
+left the index entirely, so a filter change never clears what the user checked. Anything comparing a
+selection count against a match count has to count the *intersection* (see
+`syncDownloadSelectedButtons`), not `selectedPostIds.size`.
+
+`renderResultCards()` reconciles the grid against the page **by post id**, reusing card elements and
+patching only the fields that differ — notably assigning `img.src` only when it changed, so paging no
+longer makes the browser re-decode every thumbnail. Consequences for anyone editing card markup:
+
+- The skeleton is built once in `createResultCardElement()`; optional parts (child mark, date badge,
+  badges) always exist and are toggled with `[hidden]`. The card CSS sets `display: flex` on some of
+  them, so `.grok-result-card [hidden] { display: none !important; }` is what makes the attribute
+  work — don't drop it.
+- Cards persist across renders, so anything stateful must be set explicitly on every pass in
+  `renderResultCard()`. Nothing may rely on a fresh element.
+
+`syncModelFilterOptions()` rescans the index for distinct models, so it is gated on `indexRevision` —
+bumped by `addPostRow`/`rebuildPostIndex` — rather than running on every filter pass.
 
 Three display modes are toggled as classes on `<html>` by `updateDisplayMode()`:
 `grok-results-only-mode` / `grok-custom-results-mode` (panel over a hidden native grid),
@@ -184,13 +228,18 @@ so it is Chrome/Edge-only and must run inside a real user gesture. Files are wri
 `grok-{id}.{ext}`; above `BULK_DOWNLOAD_CONFIRM_ABOVE` (5) items a custom in-page confirm dialog is
 shown instead of native `confirm()`.
 
-### Persisted UI state
+### Durability and persisted state
 
-Every toggle, slider, and collapse state is a `localStorage` key declared as a `*_KEY` const at the top
-(`grokSearchResultsOnly`, `grokSearchFilterVideoOnly`, `grokSearchPageSize`, …). Renaming a filter means
-adding a migration that reads the old key — see `FILTER_VIDEO_KEY` (deprecated) migrating into
-`FILTER_WITH_VIDEO_KEY` in `loadVideoFiltersFromStorage()`. All `localStorage` access is wrapped in
-`try`/`catch`.
+Every toggle, slider, sort order, and collapse state is a `localStorage` key declared as a `*_KEY`
+const at the top (`grokSearchResultsOnly`, `grokSearchFilterVideoOnly`, `grokSearchPageSize`, …).
+Renaming a filter means adding a migration that reads the old key — see `FILTER_VIDEO_KEY`
+(deprecated) migrating into `FILTER_WITH_VIDEO_KEY` in `loadVideoFiltersFromStorage()`. All
+`localStorage` access goes through `readStoredString`/`writeStoredString` or a `try`/`catch`.
+
+The index itself is durable in two ways: `requestPersistentStorage()` asks the browser once not to
+evict IndexedDB, and `importDatabaseJson()` merges an exported file back in (rows in the file win for
+the ids it contains; nothing is deleted). Import runs rows through `normalizePost()` like any other
+write path, so the derived caches stay correct.
 
 ## `grokPostSidebar.js`
 

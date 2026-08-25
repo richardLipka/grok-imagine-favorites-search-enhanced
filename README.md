@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.js` **v1.62.1** · `grokPostSidebar.js` **v1.3.0**  
+**Current versions:** `grokSearch.js` **v1.63.0** · `grokPostSidebar.js` **v1.3.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Fork lineage
@@ -14,7 +14,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | **Upstream GitHub fork** this project is based on |
-| **This repo** | Enhanced fork: `grokSearch.js` v1.62.1 + `grokPostSidebar.js` v1.3.0 |
+| **This repo** | Enhanced fork: `grokSearch.js` v1.63.0 + `grokPostSidebar.js` v1.3.0 |
 
 ## What is included
 
@@ -116,12 +116,15 @@ Indexing time depends on library size. Leave the tab open until the status finis
 | **With video** | Parents only — image posts that have at least one video in child/descendant results |
 | **With child** | Parents only; min descendant count (full tree, not just first generation) |
 | **Hide childs** | Hide child post rows from results (show parents only) |
+| **Model** | Filter by generation model; the list is built from the models present in your index (hidden when none are recorded) |
 | **Per page / Size** | Pagination size (1–300) and thumbnail scale (10–200%) |
 | **Default** | Reset to 44 per page, 100% size |
-| **Sort** | Newest or oldest |
-| **Clear** | Clears text, dates, and media filters |
+| **Sort** | Newest or oldest (remembered between sessions) |
+| **Clear** | Clears text, dates, model, and media filters |
 | **Download selected** | In the match-count area — save checked images to a folder (Chrome/Edge) |
+| **Import JSON** | Merge a previously exported index file back in (adds and updates; never deletes) |
 | **Export JSON** | Download full index (schema v3, parents + children) |
+| **Verify** | Reconcile the index against your liked feed — removes unliked posts, adds posts liked after they were created |
 | **Reindex** | Clear DB and rebuild from API (use after upgrades or bad cache) |
 
 ### Results panel header
@@ -209,7 +212,31 @@ two ways: from the `childPosts` tree on the first few liked-list pages, and from
 refresh that re-reads recent posts via the post API. Each post is deep-refreshed at most once
 every 10 minutes, so a sync right after a quiet one issues no extra requests. If a status ever
 reads `sync incomplete — check connection`, the walk hit a network or auth error and stopped
-early — the next sync picks up where it left off.
+early — the next sync picks up where it left off. Rate-limited responses are retried with
+backoff (`rate limited — retrying…`).
+
+### Verify (index reconciliation)
+
+Incremental sync only looks at the first few pages of the liked feed, so two things are outside
+its reach: posts you **unlike** (they would stay in the index forever) and posts you **like long
+after they were created** (they never appear near the top of the feed). **Verify** closes both
+gaps — it walks the whole feed collecting ids only, then makes the index match.
+
+| | |
+|--|--|
+| Cost | One list request per 40 posts. No `post/get`, no metadata re-parsing. |
+| When | Automatically at most once every 24 hours, or on demand via the **Verify** button. |
+| Safety | Deletions apply only if the walk finishes; a sweep that would delete more than half the index is refused and logged instead. |
+
+Use **Reindex** only when you want everything rebuilt from scratch; **Verify** is the cheap
+routine option.
+
+### Backing up the index
+
+**Export JSON** writes the whole index to a file and **Import JSON** merges one back in — rows
+in the file win for the ids it contains, and nothing is deleted. Use it as a backup, or to move
+an index to another browser or machine. The script also asks the browser for **persistent
+storage** so a large index is not evicted under storage pressure.
 
 ---
 
@@ -246,7 +273,11 @@ req.onsuccess = e => {
 |-------|-----|
 | No search bar | Tampermonkey on? On `/imagine` not `/imagine/post/...`? Hard refresh |
 | Script errors / no API | Enable **Allow User Scripts** in Tampermonkey |
-| Stale counts or missing children | Wait for sync or click **Reindex** once |
+| Stale counts or missing children | Wait for sync, then click **Verify**; **Reindex** only if that does not help |
+| Unliked posts still in results | Click **Verify** — incremental sync never removes rows |
+| A post you just liked is missing | If it is an older post it is not near the top of the feed; click **Verify** |
+| **Verify** says *aborted — unexpected feed response* | It refused to delete more than half the index; check the console and retry later |
+| **Import JSON** fails | The file must be an index export (an object with a `posts` array, or a bare array of rows) |
 | **Download selected** does nothing / no folder picker | Use Chrome or Edge; must click the button (user gesture) |
 | No **Check all** / **Download data** | Turn on **Results only** or use the results panel header |
 | EXIF not in downloaded file | JPEG/PNG only; check file type; see browser console for `[GrokSearch]` warnings |

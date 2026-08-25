@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.62.1
+// @version      1.63.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, bulk folder download, EXIF prompt tags.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -52,6 +52,22 @@
   const SYNC_NAV_MIN_INTERVAL_MS = 15 * 1000;
   /** Hard stops for the full-reindex walk (defensive against a repeating cursor). */
   const FULL_INDEX_MAX_PAGES = 2000;
+  /**
+   * Reconciliation walks the whole liked feed for ids only — no post/get, no metadata
+   * re-parse. It is the only thing that removes unliked posts and the only thing that finds
+   * posts liked long after they were created (the incremental sync stops after a few pages).
+   */
+  const RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+  const RECONCILE_LAST_RUN_KEY = 'grokSearchLastReconcileAt';
+  /**
+   * Refuse to delete more than this share of the index in one sweep. A feed shape change or a
+   * half-authenticated response should not be able to wipe the library.
+   */
+  const RECONCILE_MAX_DELETE_RATIO = 0.5;
+  /** Retry budget for rate-limited / temporarily unavailable API responses. */
+  const HTTP_RETRY_STATUSES = [429, 500, 502, 503, 504];
+  const HTTP_MAX_RETRIES = 3;
+  const HTTP_RETRY_BASE_MS = 800;
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 3;
   const DB_NAME = 'GrokSearchIndex';
@@ -65,6 +81,8 @@
   const FILTER_CHILDREN_KEY = 'grokSearchFilterChildren';
   const FILTER_CHILDREN_MIN_KEY = 'grokSearchFilterChildrenMin';
   const FILTER_HIDE_CHILDS_KEY = 'grokSearchFilterHideChilds';
+  const FILTER_MODEL_KEY = 'grokSearchFilterModel';
+  const SORT_KEY = 'grokSearchSort';
   const PAGE_SIZE_KEY = 'grokSearchPageSize';
   const GRID_SIZE_PCT_KEY = 'grokSearchGridSizePct';
   const SEARCH_BAR_COLLAPSED_KEY = 'grokSearchBarCollapsed';
@@ -89,6 +107,7 @@
   let filterOnlyChildren = false;
   let filterHideChilds = false;
   let filterMinChildren = 1;
+  let filterModel = '';
   let pageSize = DEFAULT_PAGE_SIZE;
   let gridSizePercent = DEFAULT_GRID_SIZE_PCT;
   let currentPage = 0;
@@ -109,8 +128,20 @@
   let contextMenuPostId = null;
   const selectedPostIds = new Set();
   let bulkDownloadInProgress = false;
+  let reconcileInProgress = false;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  function readStoredString(key, fallback = '') {
+    try {
+      const v = localStorage.getItem(key);
+      return v === null ? fallback : v;
+    } catch { return fallback; }
+  }
+
+  function writeStoredString(key, value) {
+    try { localStorage.setItem(key, value); } catch { /* ignore */ }
+  }
 
   // IndexedDB functions (unchanged)
   function openDB() {
@@ -171,36 +202,64 @@
   }
 
   // ─── API & fetch ───────────────────────────────────────────────────────────
-  /**
-   * Always resolves. `ok:false` means the request failed — callers must not confuse that
-   * with the end of the feed, or a 401/429 mid-walk silently reports "up to date".
-   */
-  function fetchPage(cursor) {
+  function isRetryableStatus(status) {
+    return HTTP_RETRY_STATUSES.includes(status) || status === 0;
+  }
+
+  /** Exponential backoff, honouring Retry-After when the server sends one. */
+  function retryDelayMs(attempt, headers) {
+    const after = /retry-after:\s*(\d+)/i.exec(String(headers || ''))?.[1];
+    if (after) return Math.min(Number(after) * 1000, 30000);
+    return HTTP_RETRY_BASE_MS * 2 ** attempt;
+  }
+
+  function gmRequestOnce(url, body) {
     return new Promise(resolve => {
-      const body = { limit: 40, filter: { source: 'MEDIA_POST_SOURCE_LIKED', safeForWork: false } };
-      if (cursor) body.cursor = String(cursor);
       GM_xmlhttpRequest({
-        method: 'POST', url: ENDPOINT,
+        method: 'POST',
+        url,
         headers: { 'Content-Type': 'application/json' },
         data: JSON.stringify(body),
         withCredentials: true,
-        onload: res => {
-          if (res.status < 200 || res.status >= 300) {
-            console.warn(`[GrokSearch] list HTTP ${res.status}`);
-            resolve({ ok: false, status: res.status });
-            return;
-          }
-          try {
-            const data = JSON.parse(res.responseText);
-            resolve({ ok: true, posts: data?.posts || [], nextCursor: data?.nextCursor || null });
-          } catch {
-            console.warn('[GrokSearch] list response was not JSON');
-            resolve({ ok: false, status: res.status });
-          }
-        },
-        onerror: () => resolve({ ok: false, status: 0 }),
+        onload: res => resolve({ status: res.status, text: res.responseText, headers: res.responseHeaders }),
+        onerror: () => resolve({ status: 0, text: '', headers: '' }),
       });
     });
+  }
+
+  /**
+   * POST with backoff on 429/5xx. Always resolves: `ok:false` means the request failed and
+   * callers must not confuse that with an empty result — a 401/429 mid-walk used to look
+   * exactly like the end of the feed.
+   */
+  async function postJsonWithRetry(url, body, label) {
+    for (let attempt = 0; ; attempt++) {
+      const res = await gmRequestOnce(url, body);
+      if (res.status >= 200 && res.status < 300) {
+        try {
+          return { ok: true, data: JSON.parse(res.text) };
+        } catch {
+          console.warn(`[GrokSearch] ${label} response was not JSON`);
+          return { ok: false, status: res.status };
+        }
+      }
+      if (!isRetryableStatus(res.status) || attempt >= HTTP_MAX_RETRIES) {
+        console.warn(`[GrokSearch] ${label} HTTP ${res.status}`);
+        return { ok: false, status: res.status };
+      }
+      const wait = retryDelayMs(attempt, res.headers);
+      console.warn(`[GrokSearch] ${label} HTTP ${res.status} — retrying in ${wait}ms`);
+      setLoadStatus(`rate limited — retrying…`);
+      await sleep(wait);
+    }
+  }
+
+  async function fetchPage(cursor) {
+    const body = { limit: 40, filter: { source: 'MEDIA_POST_SOURCE_LIKED', safeForWork: false } };
+    if (cursor) body.cursor = String(cursor);
+    const res = await postJsonWithRetry(ENDPOINT, body, 'list');
+    if (!res.ok) return { ok: false, status: res.status };
+    return { ok: true, posts: res.data?.posts || [], nextCursor: res.data?.nextCursor || null };
   }
 
   function isVideoMediaType(mediaType) {
@@ -312,16 +371,21 @@
   }
 
   // ─── allPosts / postById maintenance ────────────────────────────────────────
+  /** Bumped whenever rows are added or removed, so index-derived UI can skip rescans. */
+  let indexRevision = 0;
+
   /** Full rebuild of the id map. Only needed after allPosts is replaced or filtered. */
   function rebuildPostIndex() {
     postById.clear();
     for (const p of allPosts) postById.set(p.id, p);
+    indexRevision++;
   }
 
   function addPostRow(row) {
     allPosts.push(row);
     postById.set(row.id, row);
     knownIds.add(row.id);
+    indexRevision++;
     return row;
   }
 
@@ -526,29 +590,11 @@
     return location.href.includes('/imagine') && !location.href.includes('/imagine/post/');
   }
 
-  function fetchRemotePost(id) {
-    return new Promise(resolve => {
-      GM_xmlhttpRequest({
-        method: 'POST',
-        url: POST_GET,
-        headers: { 'Content-Type': 'application/json' },
-        data: JSON.stringify({ id }),
-        withCredentials: true,
-        onload: res => {
-          if (res.status < 200 || res.status >= 300) {
-            resolve(null);
-            return;
-          }
-          try {
-            const data = JSON.parse(res.responseText);
-            resolve(data?.post ?? data?.mediaPost ?? data?.item ?? data);
-          } catch {
-            resolve(null);
-          }
-        },
-        onerror: () => resolve(null),
-      });
-    });
+  async function fetchRemotePost(id) {
+    const res = await postJsonWithRetry(POST_GET, { id }, 'post/get');
+    if (!res.ok) return null;
+    const data = res.data;
+    return data?.post ?? data?.mediaPost ?? data?.item ?? data;
   }
 
   function mergePostFromRemote(cached, remote) {
@@ -844,6 +890,144 @@
     return updatedCount + childSyncCount;
   }
 
+  /** Remove rows from memory and queue their deletion. Only reconciliation deletes parents. */
+  function removeRowsById(ids, writer) {
+    const doomed = new Set(ids);
+    if (!doomed.size) return 0;
+    allPosts = allPosts.filter(p => !doomed.has(p.id));
+    for (const id of doomed) {
+      knownIds.delete(id);
+      selectedPostIds.delete(id);
+      writer.del(id);
+    }
+    rebuildPostIndex();
+    return doomed.size;
+  }
+
+  /**
+   * Walks the entire liked feed collecting ids, then makes the index match it: rows that are
+   * no longer liked are deleted, and posts liked long after they were created (which the
+   * incremental sync never reaches, because it stops after a few pages) are added.
+   *
+   * Deliberately cheap: no post/get calls, and existing rows are left untouched — the regular
+   * sync owns metadata. Deletions are only applied when the walk completes, because a partial
+   * id set would look exactly like a mass unlike.
+   */
+  async function reconcileLikedIndex(statusEl) {
+    const remoteIds = new Set();
+    const writer = createIndexWriter();
+    const added = [];
+    const seenCursors = new Set();
+    let cursor = null;
+    let pageIndex = 0;
+    let complete = false;
+
+    while (true) {
+      const page = await fetchPage(cursor);
+      if (!page.ok) return { ok: false, reason: 'network', added: 0, removed: 0 };
+      const posts = page.posts;
+
+      for (const raw of posts) {
+        const parsed = parsePost(raw);
+        if (!parsed) continue;
+        // Collect ids straight from the payload: collectChildRecords() intentionally skips
+        // posts that already exist as parents, and those ids must still count as present.
+        remoteIds.add(parsed.id);
+        walkDescendantPosts(raw, c => { if (c?.id) remoteIds.add(String(c.id)); });
+
+        if (!knownIds.has(parsed.id)) {
+          added.push(addPostRow(stampMetadataRefreshed(normalizePost(parsed))));
+        }
+        for (const child of collectChildRecords(raw, postById.get(parsed.id) || parsed)) {
+          if (!knownIds.has(child.id)) added.push(addPostRow(child));
+        }
+      }
+
+      if (statusEl) setLoadStatus(`verifying… ${remoteIds.size.toLocaleString()}`);
+      cursor = page.nextCursor;
+      if (!cursor || posts.length === 0) { complete = true; break; }
+      if (seenCursors.has(cursor)) {
+        console.warn('[GrokSearch] Reconcile stopped: repeated cursor');
+        break;
+      }
+      seenCursors.add(cursor);
+      if (++pageIndex >= FULL_INDEX_MAX_PAGES) {
+        console.warn(`[GrokSearch] Reconcile stopped at ${FULL_INDEX_MAX_PAGES} pages`);
+        break;
+      }
+      await sleep(SYNC_LIST_PAGE_DELAY_MS);
+    }
+
+    let removed = 0;
+    let refusedDelete = 0;
+    if (complete) {
+      const stale = allPosts.filter(p => !remoteIds.has(p.id)).map(p => p.id);
+      const ratio = allPosts.length ? stale.length / allPosts.length : 0;
+      if (stale.length && ratio > RECONCILE_MAX_DELETE_RATIO) {
+        refusedDelete = stale.length;
+        console.warn(
+          `[GrokSearch] Reconcile refused to delete ${stale.length} of ${allPosts.length} rows `
+          + `(${Math.round(ratio * 100)}%) — treating as a bad feed response, not mass unliking`
+        );
+      } else {
+        removed = removeRowsById(stale, writer);
+      }
+    }
+
+    for (const row of added) writer.put(row);
+    if (added.length) sortAllPostsNewestFirst();
+    await writer.flush();
+
+    if (complete && !refusedDelete) writeStoredString(RECONCILE_LAST_RUN_KEY, String(Date.now()));
+    console.log(`[GrokSearch] Reconcile: +${added.length} added, -${removed} removed, `
+      + `${remoteIds.size} liked rows remote, complete=${complete}`);
+    return { ok: complete, reason: refusedDelete ? 'refused' : '', added: added.length, removed, refusedDelete };
+  }
+
+  function formatReconcileMessage(result) {
+    if (!result.ok && result.reason === 'network') return 'verify failed — check connection';
+    if (result.reason === 'refused') return 'verify aborted — unexpected feed response';
+    if (!result.ok) return 'verify incomplete';
+    const parts = [];
+    if (result.added > 0) parts.push(`+${result.added} added`);
+    if (result.removed > 0) parts.push(`-${result.removed} removed`);
+    return parts.length ? `verified (${parts.join(', ')})` : 'verified — index matches';
+  }
+
+  async function runReconcile({ manual = false } = {}) {
+    if (indexing || syncInProgress || reconcileInProgress || !loaded) return null;
+    reconcileInProgress = true;
+    const statusEl = document.getElementById('grok-stamp-status');
+    const btn = document.getElementById('grok-verify-btn');
+    if (btn) btn.disabled = true;
+    try {
+      if (!db) db = await openDB();
+      if (manual) setLoadStatus('verifying index…');
+      const result = await reconcileLikedIndex(statusEl);
+      if (result.added > 0 || result.removed > 0) applyFilter();
+      if (manual || result.added > 0 || result.removed > 0 || !result.ok) {
+        setLoadStatus(formatReconcileMessage(result));
+        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 5000);
+      }
+      return result;
+    } catch (e) {
+      console.error('[GrokSearch] Reconcile failed:', e);
+      setLoadStatus('verify failed');
+      return null;
+    } finally {
+      reconcileInProgress = false;
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  /** Background sweep, at most once per RECONCILE_INTERVAL_MS. */
+  async function maybeRunScheduledReconcile() {
+    const last = Number(readStoredString(RECONCILE_LAST_RUN_KEY, '0')) || 0;
+    if (Date.now() - last < RECONCILE_INTERVAL_MS) return;
+    console.log('[GrokSearch] Running scheduled index reconciliation');
+    await runReconcile({ manual: false });
+  }
+
   function formatSyncStatusMessage(newCount, refreshedCount) {
     const parts = [];
     if (newCount > 0) parts.push(`+${newCount} new`);
@@ -912,6 +1096,7 @@
     loaded = false;
     allPosts = [];
     postById.clear();
+    indexRevision++;
     knownIds.clear();
     selectedPostIds.clear();
     matchedPosts = [];
@@ -937,6 +1122,79 @@
       indexing = false;
       hideLoadingIndicator();
       if (reindexBtn) reindexBtn.disabled = false;
+    }
+  }
+
+  /**
+   * IndexedDB is evictable by default, so a large index can vanish under storage pressure and
+   * cost a full API rebuild. Asking once makes the browser treat it as durable storage.
+   */
+  async function requestPersistentStorage() {
+    try {
+      if (!navigator.storage?.persist) return;
+      if (await navigator.storage.persisted()) return;
+      const granted = await navigator.storage.persist();
+      console.log(`[GrokSearch] Persistent storage ${granted ? 'granted' : 'not granted'}`);
+    } catch (e) {
+      console.warn('[GrokSearch] Persistent storage request failed:', e);
+    }
+  }
+
+  /**
+   * Merges an exported index back in: rows in the file win for ids it contains, everything
+   * else is left alone. Nothing is deleted — use Verify for that.
+   */
+  async function importDatabaseJson(file) {
+    const statusEl = document.getElementById('grok-stamp-status');
+    const btn = document.getElementById('grok-import-json-btn');
+    if (btn) btn.disabled = true;
+    try {
+      setLoadStatus('reading import…');
+      const payload = JSON.parse(await file.text());
+      const rows = Array.isArray(payload) ? payload : payload?.posts;
+      if (!Array.isArray(rows)) throw new Error('no posts array in file');
+
+      const version = Number(payload?.schemaVersion ?? INDEX_SCHEMA_VERSION);
+      if (version > INDEX_SCHEMA_VERSION) {
+        console.warn(`[GrokSearch] Import schema v${version} is newer than v${INDEX_SCHEMA_VERSION}; unknown fields are dropped`);
+      }
+
+      if (!db) db = await openDB();
+      const writer = createIndexWriter();
+      let addedCount = 0;
+      let updatedCount = 0;
+      let skipped = 0;
+
+      for (const raw of rows) {
+        if (!raw?.id) { skipped++; continue; }
+        const row = normalizePost(raw);
+        const cached = postById.get(row.id);
+        if (!cached) {
+          writer.put(addPostRow(row));
+          addedCount++;
+          continue;
+        }
+        if (!postMetadataChanged(cached, row)) continue;
+        writer.put(updatePostRow(row) || cached);
+        updatedCount++;
+      }
+
+      if (addedCount) sortAllPostsNewestFirst();
+      await writer.flush();
+      backfillChildParentPrompts();
+      applyFilter();
+
+      const summary = `imported +${addedCount} new, ${updatedCount} updated`
+        + (skipped ? `, ${skipped} skipped` : '');
+      setLoadStatus(summary);
+      console.log(`[GrokSearch] Import: ${summary} (${rows.length} rows in file)`);
+      setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 5000);
+    } catch (e) {
+      console.error('[GrokSearch] Import failed:', e);
+      setLoadStatus('import failed — not a valid index export');
+      setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 5000);
+    } finally {
+      if (btn) btn.disabled = false;
     }
   }
 
@@ -1004,6 +1262,7 @@
       filterOnlyChildren,
       filterHideChilds,
       filterMinChildren,
+      filterModel,
       sort: currentSort,
       resultsOnly,
     };
@@ -1293,6 +1552,8 @@
         hideLoadingIndicator();
       }
     }
+    // Outside the try/finally so `indexing` is already false and the guard lets it run.
+    if (loaded) maybeRunScheduledReconcile();
   }
 
   // ─── Results ───────────────────────────────────────────────────────────────
@@ -2367,6 +2628,7 @@
     bits.push(`${lightboxIndex + 1} / ${matchedPosts.length.toLocaleString()}`);
     const dateStr = formatPostDate(post.createTime);
     if (dateStr) bits.push(dateStr);
+    if (post.model) bits.push(post.model);
     if (isChildPost(post)) bits.push('Child post');
     subEl.textContent = bits.join(' · ');
 
@@ -2553,33 +2815,7 @@
       return;
     }
 
-    container.innerHTML = page.map(post => {
-      const dateKey = formatPostDateKey(post.createTime);
-      const dateStr = formatPostDate(post.createTime);
-      const dateActive = dateKey && isFilteredToSingleDay(dateKey) ? ' grok-result-date-active' : '';
-      const childCard = isChildPost(post);
-      const selected = selectedPostIds.has(post.id);
-      const cardClass = childCard ? ' grok-result-card--child' : '';
-      const selectedClass = selected ? ' grok-result-card--selected' : '';
-      const childMark = childCard
-        ? `<span class="grok-result-child-mark" title="Child post">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
-              <path d="M6 3v12"/><circle cx="6" cy="18" r="2"/><path d="M18 7v14"/><circle cx="18" cy="5" r="2"/>
-            </svg>
-           </span>`
-        : '';
-      return `
-      <div class="grok-result-card${cardClass}${selectedClass}" data-id="${escapeHtml(post.id)}" data-media="${escapeHtml(post.mediaUrl)}" title="${escapeHtml(post.prompt)}">
-        <label class="grok-result-select" title="Select for download">
-          <input type="checkbox" class="grok-result-select-input" data-id="${escapeHtml(post.id)}"${selected ? ' checked' : ''} />
-        </label>
-        ${childMark}
-        ${dateStr ? `<div class="grok-result-date${dateActive}" data-date="${escapeHtml(dateKey)}" title="Filter to ${escapeHtml(dateStr)} (click again to clear)">${escapeHtml(dateStr)}</div>` : ''}
-        <img src="${escapeHtml(post.thumbnail)}" alt="${escapeHtml(post.prompt)}" loading="lazy" style="width:100%; display:block; border-radius:14px; aspect-ratio:3/4; object-fit:cover;" />
-        <div class="grok-result-prompt">${escapeHtml(post.prompt)}</div>
-        ${renderResultBadges(post)}
-      </div>`;
-    }).join('');
+    renderResultCards(container, page);
 
     bindResultsGridInteractions(container);
 
@@ -2626,6 +2862,7 @@
     if (inputEl) currentQuery = inputEl.value;
 
     updateDisplayMode();
+    syncModelFilterOptions();
 
     const queryLower = (currentQuery || '').toLowerCase().trim();
     const terms = queryLower ? queryLower.split(/\s+/).filter(Boolean) : [];
@@ -2641,6 +2878,7 @@
         if (!terms.every(t => p.includes(t))) return false;
       }
       if (dateBounds && !matchesDateBounds(post, dateBounds)) return false;
+      if (!matchesModelFilter(post)) return false;
       if (!matchesVideoFilters(post)) return false;
       if (filterOnlyChildren && (post.childPostCount ?? 0) < filterMinChildren) return false;
       return true;
@@ -2731,15 +2969,14 @@
     return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  function renderResultBadges(post) {
+  function renderResultBadgesInner(post) {
     if (isChildPost(post)) {
       const videos = post.videoCount ?? 0;
       if (videos > 0) {
-        return `<div class="grok-result-badges">
+        return `
           <span class="grok-badge grok-badge-video" title="Video">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
-          </span>
-        </div>`;
+          </span>`;
       }
       return '';
     }
@@ -2760,8 +2997,111 @@
         <span>${childImages}</span>
       </span>`);
     }
-    if (!parts.length) return '';
-    return `<div class="grok-result-badges">${parts.join('')}</div>`;
+    return parts.join('');
+  }
+
+  const CHILD_MARK_SVG = `
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+      <path d="M6 3v12"/><circle cx="6" cy="18" r="2"/><path d="M18 7v14"/><circle cx="18" cy="5" r="2"/>
+    </svg>`;
+
+  /** Skeleton built once per card; renderResultCard() patches the parts that vary. */
+  function createResultCardElement() {
+    const card = document.createElement('div');
+    card.className = 'grok-result-card';
+    card.innerHTML = `
+      <label class="grok-result-select" title="Select for download">
+        <input type="checkbox" class="grok-result-select-input" />
+      </label>
+      <span class="grok-result-child-mark" title="Child post" hidden>${CHILD_MARK_SVG}</span>
+      <div class="grok-result-date" hidden></div>
+      <img loading="lazy" style="width:100%; display:block; border-radius:14px; aspect-ratio:3/4; object-fit:cover;" />
+      <div class="grok-result-prompt"></div>
+      <div class="grok-result-badges" hidden></div>`;
+    return card;
+  }
+
+  /**
+   * Patches an existing card in place. Assigning `img.src` only when it differs is the whole
+   * point: rebuilding the grid with innerHTML made the browser re-decode every thumbnail on
+   * each page change, filter change, and sort.
+   */
+  function renderResultCard(card, post) {
+    const childCard = isChildPost(post);
+    const selected = selectedPostIds.has(post.id);
+    const dateKey = formatPostDateKey(post.createTime);
+    const dateStr = formatPostDate(post.createTime);
+    const mediaUrl = post.mediaUrl || '';
+    const prompt = post.prompt || '';
+
+    if (card.dataset.id !== post.id) card.dataset.id = post.id;
+    if (card.dataset.media !== mediaUrl) card.dataset.media = mediaUrl;
+    if (card.title !== prompt) card.title = prompt;
+    card.classList.toggle('grok-result-card--child', childCard);
+    card.classList.toggle('grok-result-card--selected', selected);
+
+    const input = card.querySelector('.grok-result-select-input');
+    if (input) {
+      if (input.dataset.id !== post.id) input.dataset.id = post.id;
+      if (input.checked !== selected) input.checked = selected;
+    }
+
+    const mark = card.querySelector('.grok-result-child-mark');
+    if (mark) mark.hidden = !childCard;
+
+    const dateEl = card.querySelector('.grok-result-date');
+    if (dateEl) {
+      dateEl.hidden = !dateStr;
+      if (dateStr) {
+        if (dateEl.textContent !== dateStr) dateEl.textContent = dateStr;
+        if (dateEl.dataset.date !== dateKey) dateEl.dataset.date = dateKey;
+        dateEl.title = `Filter to ${dateStr} (click again to clear)`;
+        dateEl.classList.toggle('grok-result-date-active', Boolean(dateKey) && isFilteredToSingleDay(dateKey));
+      }
+    }
+
+    const img = card.querySelector('img');
+    if (img) {
+      const thumb = post.thumbnail || '';
+      if (img.getAttribute('src') !== thumb) img.setAttribute('src', thumb);
+      if (img.alt !== prompt) img.alt = prompt;
+    }
+
+    const promptEl = card.querySelector('.grok-result-prompt');
+    if (promptEl && promptEl.textContent !== prompt) promptEl.textContent = prompt;
+
+    const badges = card.querySelector('.grok-result-badges');
+    if (badges) {
+      const html = renderResultBadgesInner(post);
+      if (badges.dataset.sig !== html) {
+        badges.dataset.sig = html;
+        badges.innerHTML = html;
+      }
+      badges.hidden = !html;
+    }
+  }
+
+  /** Reconciles the grid against `page`, reusing cards by id and dropping the leftovers. */
+  function renderResultCards(container, page) {
+    const byId = new Map();
+    const leftovers = new Set(container.children);
+    for (const el of container.children) {
+      const id = el.dataset?.id;
+      if (id && !byId.has(id)) byId.set(id, el);
+    }
+
+    let cursor = container.firstElementChild;
+    for (const post of page) {
+      let card = byId.get(post.id);
+      if (card) byId.delete(post.id);
+      else card = createResultCardElement();
+      leftovers.delete(card);
+      if (card === cursor) cursor = cursor.nextElementSibling;
+      else container.insertBefore(card, cursor);
+      renderResultCard(card, post);
+    }
+
+    for (const el of leftovers) el.remove();
   }
 
   function formatPostDateKey(createTime) {
@@ -3024,7 +3364,8 @@
 
   function hasActiveFilter() {
     return Boolean(
-      currentQuery.trim() || hasDateFilter() || filterVideoOnly || filterWithVideo || filterOnlyChildren || filterHideChilds
+      currentQuery.trim() || hasDateFilter() || filterVideoOnly || filterWithVideo
+      || filterOnlyChildren || filterHideChilds || filterModel
     );
   }
 
@@ -3397,6 +3738,9 @@
         border-color: rgba(239,68,68,0.75) !important;
         color: #fca5a5 !important;
       }
+      /* Card parts are built once and reused across pages, so optional parts are toggled
+         with [hidden] — which needs to beat the display:flex rules below. */
+      .grok-result-card [hidden] { display: none !important; }
       .grok-result-date {
         position: absolute;
         top: 8px;
@@ -3962,6 +4306,14 @@
       .grok-filter-min-select:disabled {
         opacity: 0.35; cursor: default;
       }
+      .grok-filter-model-select {
+        font-size: 11px; padding: 2px 6px; margin: 0;
+        max-width: 160px;
+        border-radius: 4px; border: 1px solid rgba(255,255,255,0.15);
+        background: rgba(0,0,0,0.35); color: rgba(255,255,255,0.85);
+        cursor: pointer; flex-shrink: 0;
+      }
+      .grok-filter-model-select[hidden] { display: none; }
     `;
     document.head.appendChild(s);
   }
@@ -4119,6 +4471,74 @@
     if (resultsRow.childElementCount > 0) wrap.insertBefore(resultsRow, bar);
     ensureDateNavButtons();
     bindMediaFilterListeners();
+  }
+
+  /** Distinct model names present in the index, for the model filter dropdown. */
+  function collectIndexModels() {
+    const models = new Set();
+    for (const p of allPosts) {
+      const m = String(p.model || '').trim();
+      if (m) models.add(m);
+    }
+    return [...models].sort((a, b) => a.localeCompare(b));
+  }
+
+  function ensureModelFilterSelect() {
+    if (document.getElementById('grok-filter-model')) return;
+    const filters = getFiltersRow();
+    if (!filters) return;
+    const sel = document.createElement('select');
+    sel.id = 'grok-filter-model';
+    sel.className = 'grok-filter-model-select';
+    sel.title = 'Filter by generation model';
+    sel.setAttribute('aria-label', 'Filter by model');
+    sel.addEventListener('change', () => {
+      filterModel = sel.value;
+      writeStoredString(FILTER_MODEL_KEY, filterModel);
+      currentPage = 0;
+      updateClearButton();
+      applyFilter();
+    });
+    const hideChilds = document.getElementById('grok-filter-hide-childs-label');
+    if (hideChilds) hideChilds.insertAdjacentElement('afterend', sel);
+    else filters.appendChild(sel);
+    syncModelFilterOptions();
+  }
+
+  /** Rebuilds the option list from the index, preserving the stored selection. */
+  let modelOptionsRevision = -1;
+
+  function syncModelFilterOptions() {
+    const sel = document.getElementById('grok-filter-model');
+    if (!sel) return;
+    if (sel.dataset.grokModels !== undefined && modelOptionsRevision === indexRevision) return;
+    modelOptionsRevision = indexRevision;
+    const models = collectIndexModels();
+    const wanted = filterModel;
+    const signature = models.join('|');
+    if (sel.dataset.grokModels === signature) {
+      if (sel.value !== wanted) sel.value = models.includes(wanted) ? wanted : '';
+      return;
+    }
+    sel.dataset.grokModels = signature;
+    sel.innerHTML = `<option value="">All models</option>`
+      + models.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
+    // A stored model that is no longer present would silently match nothing.
+    if (wanted && !models.includes(wanted)) {
+      filterModel = '';
+      writeStoredString(FILTER_MODEL_KEY, '');
+    }
+    sel.value = filterModel;
+    sel.hidden = models.length === 0;
+  }
+
+  function loadModelFilterFromStorage() {
+    filterModel = readStoredString(FILTER_MODEL_KEY, '');
+  }
+
+  function matchesModelFilter(post) {
+    if (!filterModel) return true;
+    return String(post.model || '') === filterModel;
   }
 
   function ensureMediaMinSelect(selectId, labelEl) {
@@ -4427,6 +4847,48 @@
     });
   }
 
+  function ensureImportJsonButton() {
+    if (document.getElementById('grok-import-json-btn')) return;
+    const actions = getActionsRow();
+    if (!actions) return;
+    const input = document.createElement('input');
+    input.id = 'grok-import-json-input';
+    input.type = 'file';
+    input.accept = 'application/json,.json';
+    input.hidden = true;
+    input.addEventListener('change', () => {
+      const file = input.files?.[0];
+      input.value = '';
+      if (file) importDatabaseJson(file);
+    });
+
+    const btn = document.createElement('button');
+    btn.id = 'grok-import-json-btn';
+    btn.className = 'grok-toolbar-btn';
+    btn.type = 'button';
+    btn.textContent = 'Import JSON';
+    btn.title = 'Merge a previously exported index file into the local database';
+    btn.addEventListener('click', () => input.click());
+
+    actions.prepend(input);
+    actions.prepend(btn);
+  }
+
+  function ensureVerifyButton() {
+    if (document.getElementById('grok-verify-btn')) return;
+    const actions = getActionsRow();
+    if (!actions) return;
+    const btn = document.createElement('button');
+    btn.id = 'grok-verify-btn';
+    btn.className = 'grok-toolbar-btn';
+    btn.type = 'button';
+    btn.textContent = 'Verify';
+    btn.title = 'Walk the whole liked feed and reconcile the index: '
+      + 'removes posts you have unliked and adds posts liked after they were created';
+    btn.addEventListener('click', () => runReconcile({ manual: true }));
+    actions.appendChild(btn);
+  }
+
   function ensureExportJsonButton() {
     if (document.getElementById('grok-export-json-btn')) return;
     const actions = getActionsRow();
@@ -4540,9 +5002,12 @@
     if (document.getElementById('grok-search-wrap')) {
       migrateSearchBarLayout();
       ensurePageJumpInput();
+      ensureImportJsonButton();
       ensureExportJsonButton();
+      ensureVerifyButton();
       ensureReindexButton();
       ensureMediaFilterCheckboxes();
+      ensureModelFilterSelect();
       ensureDisplayControls();
       ensureDateNavButtons();
       ensureSearchBarToggle();
@@ -4679,11 +5144,15 @@
       loadVideoFiltersFromStorage();
       filterOnlyChildren = localStorage.getItem(FILTER_CHILDREN_KEY) === '1';
       loadHideChildsFilterFromStorage();
+      loadModelFilterFromStorage();
+      currentSort = localStorage.getItem(SORT_KEY) === 'oldest' ? 'oldest' : 'newest';
       filterMinChildren = parseMediaMin(localStorage.getItem(FILTER_CHILDREN_MIN_KEY));
       pageSize = clampPageSize(localStorage.getItem(PAGE_SIZE_KEY));
       gridSizePercent = clampGridSizePercent(localStorage.getItem(GRID_SIZE_PCT_KEY));
     } catch { /* ignore */ }
     syncMediaMinSelects();
+    ensureModelFilterSelect();
+    if (sortSel) sortSel.value = currentSort;
     bindDisplayControlListeners();
     bindMediaFilterListeners();
     ensureDateNavButtons();
@@ -4728,13 +5197,17 @@
       filterOnlyChildren = false;
       filterHideChilds = false;
       filterMinChildren = 1;
+      filterModel = '';
       syncMediaMinSelects();
+      const modelSel = document.getElementById('grok-filter-model');
+      if (modelSel) modelSel.value = '';
       try {
         localStorage.setItem(FILTER_VIDEO_ONLY_KEY, '0');
         localStorage.setItem(FILTER_WITH_VIDEO_KEY, '0');
         localStorage.setItem(FILTER_CHILDREN_KEY, '0');
         localStorage.setItem(FILTER_HIDE_CHILDS_KEY, '0');
         localStorage.setItem(FILTER_CHILDREN_MIN_KEY, '1');
+        localStorage.setItem(FILTER_MODEL_KEY, '');
       } catch { /* ignore */ }
       currentPage = 0;
       updateClearButton();
@@ -4744,6 +5217,7 @@
 
     sortSel.addEventListener('change', () => {
       currentSort = sortSel.value; currentPage = 0;
+      writeStoredString(SORT_KEY, currentSort);
       applyFilter();
     });
 
@@ -4810,6 +5284,7 @@
     if (initiated) return;
     initiated = true;
     injectStyles();
+    requestPersistentStorage();
     buildSearchBar();
     loadAllPosts();
   }

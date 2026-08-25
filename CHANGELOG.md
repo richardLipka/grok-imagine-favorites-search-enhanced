@@ -3,6 +3,39 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.63.0] — 2026-08-25
+
+### Added
+- **Verify** button — walks the entire liked feed collecting ids only (no `post/get`, no
+  metadata re-parse) and reconciles the index against it. This is the only thing that
+  **removes posts you have unliked**, and the only thing that finds **posts liked long after
+  they were created**, which the incremental sync never reaches because it stops after a few
+  pages. Runs automatically at most once every 24 hours; the button forces it.
+  - Deletions are applied only when the walk completes — a partial id set would look exactly
+    like a mass unlike.
+  - The sweep refuses to delete more than half the index at once and logs a warning instead,
+    so a feed shape change cannot wipe the library.
+- **Import JSON** — merges a previously exported index file back into the local database.
+  Rows in the file win for the ids it contains; nothing is deleted. Makes **Export JSON** an
+  actual backup and lets an index move between browsers or machines.
+- **Persistent storage request** — IndexedDB is evictable by default, so a large index could
+  be discarded under storage pressure and cost a full API rebuild. The script now asks the
+  browser once to treat it as durable.
+- **Model filter** — a dropdown listing the generation models present in your index. The
+  `model` field was already stored on every row but was never shown or filterable in the
+  search UI. The model also now appears in the lightbox metadata line.
+- **Retry with backoff** on `429` and `5xx` for both API endpoints, honouring `Retry-After`,
+  with a `rate limited — retrying…` status. Previously a rate-limited response just ended the
+  sync.
+
+### Changed
+- **Sort order is now remembered** between sessions, like every other display setting.
+- The results grid **reuses card elements instead of rebuilding `innerHTML`**. Paging,
+  filtering, and sorting no longer destroy and recreate every `<img>`, so thumbnails are not
+  re-decoded on each change. Cards are matched by post id and patched in place.
+
+---
+
 ## [1.62.1] — 2026-08-25
 
 ### Fixed
