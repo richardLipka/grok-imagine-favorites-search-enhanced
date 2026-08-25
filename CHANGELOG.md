@@ -15,6 +15,26 @@ Nothing here changes the installed userscripts — no version bump.
 
 ---
 
+## [1.63.2] — 2026-08-25
+
+### Fixed
+- A **model filter** naming a model that is not in the index stayed active instead of being
+  cleared, silently matching nothing. The reset only ran when the dropdown's option list changed,
+  so it was skipped on the common path.
+
+### Added
+- `tools/diagnose.js` — a read-only console script that reports what the index holds per day, what
+  the liked-feed API actually returns, which filter preferences are stored, and whether more than
+  one search script is running. For working out whether missing posts are a fetch problem, an
+  indexing problem, or a filter hiding them.
+
+### Note
+- If posts are missing after a **Reindex**, check the **Model** dropdown first. It is a saved
+  preference, so **Reindex** does not clear it, and every post made with a different model stays
+  hidden. **Clear** resets it.
+
+---
+
 ## [1.63.1] — 2026-08-25
 
 ### Fixed

@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.js` **v1.63.1** · `grokPostSidebar.js` **v1.3.0**  
+**Current versions:** `grokSearch.js` **v1.63.2** · `grokPostSidebar.js` **v1.3.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Fork lineage
@@ -14,7 +14,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | **Upstream GitHub fork** this project is based on |
-| **This repo** | Enhanced fork: `grokSearch.js` v1.63.1 + `grokPostSidebar.js` v1.3.0 |
+| **This repo** | Enhanced fork: `grokSearch.js` v1.63.2 + `grokPostSidebar.js` v1.3.0 |
 
 ## What is included
 
@@ -275,6 +275,7 @@ req.onsuccess = e => {
 | Script errors / no API | Enable **Allow User Scripts** in Tampermonkey |
 | Stale counts or missing children | Wait for sync, then click **Verify**; **Reindex** only if that does not help |
 | Unliked posts still in results | Click **Verify** — incremental sync never removes rows |
+| Recent posts missing, even after **Reindex** | Check the **Model** dropdown reads *All models* — it is a saved preference, so **Reindex** does not clear it and posts made with any other model stay hidden. **Clear** resets it. Then run [`tools/diagnose.js`](tools/diagnose.js) in the console if they are still missing |
 | A post you just liked is missing | If it is an older post it is not near the top of the feed; click **Verify** |
 | **Verify** says *aborted — unexpected feed response* | It refused to delete more than half the index; check the console and retry later |
 | **Import JSON** fails | The file must be an index export (an object with a `posts` array, or a bare array of rows) |

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.63.1
+// @version      1.63.2
 // @description  Search, filter, and paginate saved Grok media; lightbox, bulk folder download, EXIF prompt tags.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -4525,18 +4525,21 @@
     const models = collectIndexModels();
     const wanted = filterModel;
     const signature = models.join('|');
+    // A stored model that is not in the index matches nothing, which looks exactly like
+    // "my newest posts are missing" if they were generated with a newer model. Clear it
+    // before either exit path, not just when the option list is rebuilt.
+    if (wanted && !models.includes(wanted)) {
+      console.warn(`[GrokSearch] Model filter "${wanted}" is not present in the index — clearing it`);
+      filterModel = '';
+      writeStoredString(FILTER_MODEL_KEY, '');
+    }
     if (sel.dataset.grokModels === signature) {
-      if (sel.value !== wanted) sel.value = models.includes(wanted) ? wanted : '';
+      if (sel.value !== filterModel) sel.value = filterModel;
       return;
     }
     sel.dataset.grokModels = signature;
     sel.innerHTML = `<option value="">All models</option>`
       + models.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
-    // A stored model that is no longer present would silently match nothing.
-    if (wanted && !models.includes(wanted)) {
-      filterModel = '';
-      writeStoredString(FILTER_MODEL_KEY, '');
-    }
     sel.value = filterModel;
     sel.hidden = models.length === 0;
   }
