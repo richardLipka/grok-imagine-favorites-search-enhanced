@@ -50,6 +50,8 @@ function createIndexSandbox() {
     const FULL_INDEX_MAX_PAGES = 2000;
     const RECONCILE_MAX_DELETE_RATIO = 0.5;
     const RECONCILE_LAST_RUN_KEY = 'grokSearchLastReconcileAt';
+    const LIKED_BOOLEAN_FIELDS = ['isLiked','liked','hasLiked','isFavorite','isFavorited','favorited','likedByUser','isLikedByUser','userLiked','viewerHasLiked'];
+    const LIKED_CONTAINER_FIELDS = ['viewerState','viewer','interaction','interactions','userState','state'];
 
     let allPosts = [];
     const postById = new Map();
@@ -97,12 +99,19 @@ function createIndexSandbox() {
       createIndexWriter, collectChildRecords, syncChildRecordsForParent,
       propagateParentPromptToChildren, backfillChildParentPrompts,
       parsePost, parseChildPost, getSearchablePromptText, postMetadataChanged,
-      postNeedsDeepRefresh, postHasKnownChildren, stampMetadataRefreshed,
+      postNeedsDeepRefresh, postHasKnownChildren, stampMetadataRefreshed, detectLikedState,
       pickDeepRefreshTargets, removeRowsById, reconcileLikedIndex, verifyIndexIntegrity,
     };
   `;
 
   return new Function(`${prelude}\n${region}\n${epilogue}`)();
+}
+
+/** The like/unlike request templating helpers (no network, pure shaping). */
+function createLikeSandbox() {
+  const region = sliceBetween(readSource(), '  /** Writes `value` at a dotted/array path', '  function sendLikeRequest');
+  return new Function(`${region}
+return { setAtPath, buildLikeRequest };`)();
 }
 
 /** The keyed results-grid reconciler, driven against the fake DOM in ./dom.js. */
@@ -123,4 +132,4 @@ function createGridSandbox({ createElement, onRender }) {
   return factory(createElement, onRender);
 }
 
-module.exports = { SOURCE_PATH, readSource, sliceBetween, createIndexSandbox, createGridSandbox };
+module.exports = { SOURCE_PATH, readSource, sliceBetween, createIndexSandbox, createGridSandbox, createLikeSandbox };

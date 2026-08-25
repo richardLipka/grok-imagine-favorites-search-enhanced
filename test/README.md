@@ -23,12 +23,13 @@ them with stubbed collaborators (`dbPutMany`, `fetchPage`, `setLoadStatus`, …)
 runs production code. Nothing here reimplements logic — a test that passed against a copy of
 the algorithm would be worthless.
 
-Two sandboxes:
+Three sandboxes:
 
 | Sandbox | Region | Covers |
 |---------|--------|--------|
 | `createIndexSandbox()` | `isVideoMediaType` → `formatSyncStatusMessage` | Record shape, index mutation, child sync, deep-refresh selection, reconciliation |
 | `createGridSandbox()` | `renderResultCards` | Keyed results-grid reconciliation, against the fake DOM in [`dom.js`](dom.js) |
+| `createLikeSandbox()` | `setAtPath` → `sendLikeRequest` | Like/unlike request templating (pure shaping, no network) |
 
 ## Adding a suite
 

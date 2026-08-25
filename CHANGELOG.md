@@ -22,6 +22,35 @@ Nothing here changes the installed userscripts — no version bump.
 
 ---
 
+## [1.64.0] — 2026-08-25
+
+Grok no longer requires a like for media to stay in history, so the index now covers the whole
+library and likes become a filter rather than a precondition.
+
+**Upgrading: click Reindex once.** An index built before this release contains liked posts only and
+carries no like state. The script detects the older schema and says so.
+
+### Added
+- **Whole-library indexing.** The list source is no longer hardcoded to `MEDIA_POST_SOURCE_LIKED`.
+  On first run and on every **Reindex** the script probes the candidate sources with a 5-item query
+  each, keeps whichever returns the most recent media, and caches that for a week. Pin one by hand
+  with `localStorage.setItem('grokSearchMediaSource', …)` if needed.
+- **Liked only** filter, and `isLiked` on every indexed row (schema v4). A post whose like state the
+  feed does not report is stored as `null` — unknown, never silently "not liked" — and is excluded
+  from *Liked only* rather than guessed at.
+- **Like / unlike from every view**: a heart on each result card (visible on hover, always visible
+  when liked), a **Like** button in the lightbox, and a **Like/Unlike** entry in the right-click
+  menu. The toggle is optimistic and reverts if the request fails.
+- `tools/capture-like.js` — records the like request Grok's own UI sends and stores it as a
+  template, so the script replays a real request instead of an invented endpoint. Liking stays
+  disabled, and says so, until this has been run once.
+
+### Changed
+- Index schema is **v4** (adds `isLiked`); the JSON export includes it.
+- **Clear** also resets the liked filter.
+
+---
+
 ## [1.63.2] — 2026-08-25
 
 ### Fixed

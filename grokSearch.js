@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.63.2
+// @version      1.64.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, bulk folder download, EXIF prompt tags.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -69,7 +69,42 @@
   const HTTP_MAX_RETRIES = 3;
   const HTTP_RETRY_BASE_MS = 800;
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
-  const INDEX_SCHEMA_VERSION = 3;
+  const INDEX_SCHEMA_VERSION = 4;
+  /**
+   * Grok stopped requiring a like for media to stay in history, so the index covers the whole
+   * library rather than only likes. The enum value for "everything" is not documented, so the
+   * working source is resolved once by probing and then cached; MEDIA_SOURCE_LIKED remains the
+   * fallback because it is the one value known to exist.
+   */
+  const MEDIA_SOURCE_LIKED = 'MEDIA_POST_SOURCE_LIKED';
+  const MEDIA_SOURCE_KEY = 'grokSearchMediaSource';
+  const MEDIA_SOURCE_PROBED_KEY = 'grokSearchMediaSourceProbedAt';
+  const MEDIA_SOURCE_REPROBE_MS = 7 * 24 * 60 * 60 * 1000;
+  /** `null` means "send no source filter at all", which some deployments treat as everything. */
+  const MEDIA_SOURCE_CANDIDATES = [
+    null,
+    'MEDIA_POST_SOURCE_ALL',
+    'MEDIA_POST_SOURCE_HISTORY',
+    'MEDIA_POST_SOURCE_OWN',
+    'MEDIA_POST_SOURCE_SELF',
+    'MEDIA_POST_SOURCE_MINE',
+    'MEDIA_POST_SOURCE_USER',
+    'MEDIA_POST_SOURCE_CREATED',
+    'MEDIA_POST_SOURCE_GENERATED',
+    'MEDIA_POST_SOURCE_PROFILE',
+    'MEDIA_POST_SOURCE_UNSPECIFIED',
+    MEDIA_SOURCE_LIKED,
+  ];
+  /** Payload fields that have been seen to carry the viewer's like state. */
+  const LIKED_BOOLEAN_FIELDS = [
+    'isLiked', 'liked', 'hasLiked', 'isFavorite', 'isFavorited', 'favorited',
+    'likedByUser', 'isLikedByUser', 'userLiked', 'viewerHasLiked',
+  ];
+  const LIKED_CONTAINER_FIELDS = ['viewerState', 'viewer', 'interaction', 'interactions', 'userState', 'state'];
+  /** Request template for like/unlike, captured from Grok's own UI by tools/capture-like.js. */
+  const LIKE_REQUEST_KEY = 'grokSearchLikeRequest';
+  const FILTER_LIKED_KEY = 'grokSearchFilterLiked';
+  const INDEX_VERSION_KEY = 'grokSearchIndexSchemaVersion';
   const DB_NAME = 'GrokSearchIndex';
   const DB_VERSION = 1;
   const STORE_NAME = 'posts';
@@ -108,6 +143,10 @@
   let filterHideChilds = false;
   let filterMinChildren = 1;
   let filterModel = '';
+  let filterLikedOnly = false;
+  /** Resolved liked-feed source; null means "send no source filter". */
+  let mediaSource = MEDIA_SOURCE_LIKED;
+  let mediaSourceResolved = false;
   let pageSize = DEFAULT_PAGE_SIZE;
   let gridSizePercent = DEFAULT_GRID_SIZE_PCT;
   let currentPage = 0;
@@ -254,12 +293,68 @@
     }
   }
 
-  async function fetchPage(cursor) {
-    const body = { limit: 40, filter: { source: 'MEDIA_POST_SOURCE_LIKED', safeForWork: false } };
+  function buildListBody(cursor, source = mediaSource, limit = 40) {
+    const filter = { safeForWork: false };
+    if (source) filter.source = source;
+    const body = { limit, filter };
     if (cursor) body.cursor = String(cursor);
-    const res = await postJsonWithRetry(ENDPOINT, body, 'list');
+    return body;
+  }
+
+  async function fetchPage(cursor) {
+    const res = await postJsonWithRetry(ENDPOINT, buildListBody(cursor), 'list');
     if (!res.ok) return { ok: false, status: res.status };
     return { ok: true, posts: res.data?.posts || [], nextCursor: res.data?.nextCursor || null };
+  }
+
+  function newestCreateTimeOf(posts) {
+    let newest = '';
+    for (const p of posts) {
+      const d = p?.createTime || p?.createdAt || p?.create_time || '';
+      if (d > newest) newest = d;
+    }
+    return newest;
+  }
+
+  /**
+   * Finds which source returns the fullest library. Grok no longer requires a like for media to
+   * stay in history, but the enum value covering everything is undocumented and has changed, so
+   * this probes cheaply (limit 5) and caches the winner. Read-only.
+   */
+  async function probeMediaSource() {
+    const results = [];
+    for (const candidate of MEDIA_SOURCE_CANDIDATES) {
+      const res = await postJsonWithRetry(ENDPOINT, buildListBody(null, candidate, 5), 'probe');
+      if (!res.ok) continue;
+      const posts = res.data?.posts || [];
+      if (!posts.length) continue;
+      results.push({ source: candidate, count: posts.length, newest: newestCreateTimeOf(posts) });
+      await sleep(80);
+    }
+    if (!results.length) return MEDIA_SOURCE_LIKED;
+    // The source exposing the most recent media wins; it is the one that is not likes-only.
+    results.sort((a, b) => (b.newest || '').localeCompare(a.newest || ''));
+    console.log('[GrokSearch] Source probe:', results.map(r => `${r.source || '(none)'}→${r.newest || '?'}`).join(', '));
+    return results[0].source;
+  }
+
+  async function resolveMediaSource({ force = false } = {}) {
+    if (mediaSourceResolved && !force) return mediaSource;
+    const stored = readStoredString(MEDIA_SOURCE_KEY, '');
+    const probedAt = Number(readStoredString(MEDIA_SOURCE_PROBED_KEY, '0')) || 0;
+    const fresh = Date.now() - probedAt < MEDIA_SOURCE_REPROBE_MS;
+    if (!force && stored && fresh) {
+      mediaSource = stored === '(none)' ? null : stored;
+      mediaSourceResolved = true;
+      return mediaSource;
+    }
+    setLoadStatus('checking library source…');
+    mediaSource = await probeMediaSource();
+    mediaSourceResolved = true;
+    writeStoredString(MEDIA_SOURCE_KEY, mediaSource === null ? '(none)' : mediaSource);
+    writeStoredString(MEDIA_SOURCE_PROBED_KEY, String(Date.now()));
+    console.log(`[GrokSearch] Using media source: ${mediaSource || '(no source filter)'}`);
+    return mediaSource;
   }
 
   function isVideoMediaType(mediaType) {
@@ -333,6 +428,7 @@
       childImageCount: post.childImageCount ?? 0,
       childVideoCount: post.childVideoCount ?? 0,
       videoCount: post.videoCount ?? 0,
+      isLiked: typeof post.isLiked === 'boolean' ? post.isLiked : null,
     };
     if (post[METADATA_REFRESH_KEY] != null) {
       row[METADATA_REFRESH_KEY] = post[METADATA_REFRESH_KEY];
@@ -416,6 +512,25 @@
     return Boolean(post?.isChild);
   }
 
+  /**
+   * Reads the viewer's like state off a raw payload. Returns null when the payload carries no
+   * recognisable flag, so an unknown state is never mistaken for "not liked".
+   */
+  function detectLikedState(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    for (const field of LIKED_BOOLEAN_FIELDS) {
+      if (typeof raw[field] === 'boolean') return raw[field];
+    }
+    for (const container of LIKED_CONTAINER_FIELDS) {
+      const nested = raw[container];
+      if (!nested || typeof nested !== 'object') continue;
+      for (const field of LIKED_BOOLEAN_FIELDS) {
+        if (typeof nested[field] === 'boolean') return nested[field];
+      }
+    }
+    return null;
+  }
+
   function parsePost(post) {
     if (!post.id) return null;
     const prompt = post.prompt || post.originalPrompt || '';
@@ -431,6 +546,7 @@
       isChild: false,
       parentId: null,
       parentPrompt: null,
+      isLiked: detectLikedState(post),
       ...counts,
     };
   }
@@ -478,6 +594,7 @@
         || parentParsed.createTime || '',
       model: childRaw.modelName || childRaw.model || parentParsed.model || '',
       mediaType: childRaw.mediaType || '',
+      isLiked: detectLikedState(childRaw),
       childPostCount: 0,
       childImageCount: 0,
       childVideoCount: 0,
@@ -586,6 +703,96 @@
     return { added, updated, removed: removedIds.length };
   }
 
+  // ─── Like / unlike ─────────────────────────────────────────────────────────
+  /**
+   * Liking is done by replaying the exact request Grok's own UI sends, captured once by
+   * tools/capture-like.js and stored as a template. Nothing is guessed: if no template has been
+   * captured the buttons say so instead of firing an invented endpoint at the account.
+   *
+   * Template shape:
+   *   { url, method, body, idPath: ["postId"], likedPath: ["isLiked"] | null,
+   *     unlikeUrl?, headers? }
+   */
+  function readLikeTemplate() {
+    try {
+      const raw = localStorage.getItem(LIKE_REQUEST_KEY);
+      if (!raw) return null;
+      const tpl = JSON.parse(raw);
+      return tpl && tpl.url ? tpl : null;
+    } catch { return null; }
+  }
+
+  function hasLikeSupport() {
+    return Boolean(readLikeTemplate());
+  }
+
+  /** Writes `value` at a dotted/array path inside a cloned body. */
+  function setAtPath(obj, path, value) {
+    if (!path || !path.length) return obj;
+    let node = obj;
+    for (let i = 0; i < path.length - 1; i++) {
+      const key = path[i];
+      if (typeof node[key] !== 'object' || node[key] === null) node[key] = {};
+      node = node[key];
+    }
+    node[path[path.length - 1]] = value;
+    return obj;
+  }
+
+  function buildLikeRequest(tpl, postId, liked) {
+    const body = tpl.body ? JSON.parse(JSON.stringify(tpl.body)) : {};
+    setAtPath(body, tpl.idPath || ['postId'], postId);
+    if (tpl.likedPath) setAtPath(body, tpl.likedPath, liked);
+    const url = (!liked && tpl.unlikeUrl) ? tpl.unlikeUrl : tpl.url;
+    return { url: url.replace('{id}', encodeURIComponent(postId)), body, method: tpl.method || 'POST' };
+  }
+
+  function sendLikeRequest(tpl, postId, liked) {
+    const req = buildLikeRequest(tpl, postId, liked);
+    return new Promise(resolve => {
+      GM_xmlhttpRequest({
+        method: req.method,
+        url: req.url,
+        headers: { 'Content-Type': 'application/json', ...(tpl.headers || {}) },
+        data: req.method === 'GET' ? undefined : JSON.stringify(req.body),
+        withCredentials: true,
+        onload: res => resolve({ ok: res.status >= 200 && res.status < 300, status: res.status, text: res.responseText }),
+        onerror: () => resolve({ ok: false, status: 0 }),
+      });
+    });
+  }
+
+  /** Optimistic toggle: flips the row, reverts if the request fails. */
+  async function setPostLiked(post, liked) {
+    if (!post?.id) return false;
+    const tpl = readLikeTemplate();
+    if (!tpl) {
+      flashStampStatus('liking not set up — see tools/capture-like.js');
+      console.warn('[GrokSearch] No like request template stored. Run tools/capture-like.js once to record one.');
+      return false;
+    }
+    const previous = post.isLiked ?? null;
+    const writer = createIndexWriter();
+    writer.put(updatePostRow(normalizePost({ ...post, isLiked: liked })) || post);
+    applyFilter();
+
+    const res = await sendLikeRequest(tpl, post.id, liked);
+    if (!res.ok) {
+      writer.put(updatePostRow(normalizePost({ ...post, isLiked: previous })) || post);
+      applyFilter();
+      flashStampStatus(`like failed (${res.status || 'network'})`);
+      console.warn('[GrokSearch] Like request failed', res.status, res.text?.slice(0, 200));
+      return false;
+    }
+    await writer.flush();
+    flashStampStatus(liked ? 'liked' : 'unliked');
+    return true;
+  }
+
+  async function togglePostLiked(post) {
+    return setPostLiked(post, !(post?.isLiked === true));
+  }
+
   function isImagineListPage() {
     return location.href.includes('/imagine') && !location.href.includes('/imagine/post/');
   }
@@ -636,7 +843,8 @@
       || (before.mediaType || '') !== (after.mediaType || '')
       || Boolean(before.isChild) !== Boolean(after.isChild)
       || (before.parentId || '') !== (after.parentId || '')
-      || (before.parentPrompt || '') !== (after.parentPrompt || '');
+      || (before.parentPrompt || '') !== (after.parentPrompt || '')
+      || (before.isLiked ?? null) !== (after.isLiked ?? null);
   }
 
   function verifyIndexIntegrity() {
@@ -1020,6 +1228,25 @@
     }
   }
 
+  /**
+   * An index built before schema 4 only ever contained liked posts and has no like state, so it
+   * cannot answer "show me everything" or "liked only". Nudge once rather than silently
+   * presenting a partial library as complete.
+   */
+  function checkIndexSchemaFreshness() {
+    const stored = Number(readStoredString(INDEX_VERSION_KEY, '0')) || 0;
+    if (stored >= INDEX_SCHEMA_VERSION) return;
+    if (!allPosts.length) {
+      writeStoredString(INDEX_VERSION_KEY, String(INDEX_SCHEMA_VERSION));
+      return;
+    }
+    console.warn(`[GrokSearch] Index was built with schema v${stored || '<4'}; it covers liked posts only `
+      + 'and has no like state. Click Reindex to pick up your whole library.');
+    setLoadStatus('older index — click Reindex for your full library');
+    const statusEl = document.getElementById('grok-stamp-status');
+    setTimeout(() => { if (statusEl && statusEl.textContent.startsWith('older index')) statusEl.textContent = ''; }, 12000);
+  }
+
   /** Background sweep, at most once per RECONCILE_INTERVAL_MS. */
   async function maybeRunScheduledReconcile() {
     const last = Number(readStoredString(RECONCILE_LAST_RUN_KEY, '0')) || 0;
@@ -1105,10 +1332,13 @@
     showLoadingIndicator('Reindexing saved posts…');
     try {
       if (!db) db = await openDB();
+      // Reindex is the moment to re-detect the source: Grok has changed it before.
+      await resolveMediaSource({ force: true });
       await dbClear();
       setLoadStatus('reindexing…');
       const count = await fetchFullIndex(statusEl);
       loaded = true;
+      writeStoredString(INDEX_VERSION_KEY, String(INDEX_SCHEMA_VERSION));
       console.log(`[GrokSearch] Reindex done: ${count} posts`);
       if (statusEl) {
         setLoadStatus(`${count.toLocaleString()} reindexed`);
@@ -1223,7 +1453,7 @@
         recordFields: [
           'id', 'prompt', 'parentPrompt', 'parentId', 'isChild',
           'thumbnail', 'mediaUrl', 'createTime', 'model', 'mediaType',
-          'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount',
+          'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount', 'isLiked',
           METADATA_REFRESH_KEY,
         ],
         posts,
@@ -1263,6 +1493,7 @@
       filterHideChilds,
       filterMinChildren,
       filterModel,
+      filterLikedOnly,
       sort: currentSort,
       resultsOnly,
     };
@@ -1290,7 +1521,7 @@
         recordFields: [
           'id', 'prompt', 'parentPrompt', 'parentId', 'isChild',
           'thumbnail', 'mediaUrl', 'createTime', 'model', 'mediaType',
-          'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount',
+          'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount', 'isLiked',
           METADATA_REFRESH_KEY,
         ],
         posts,
@@ -1499,6 +1730,7 @@
     showLoadingIndicator(DEFAULT_LOADING_MESSAGE);
     try {
       db = await openDB();
+      await resolveMediaSource();
       const cached = await dbGetAll();
       if (cached.length > 0) {
         for (const p of cached) {
@@ -1528,6 +1760,7 @@
         setLoadStatus('first-time indexing…');
         const count = await fetchFullIndex(statusEl);
         loaded = true;
+        writeStoredString(INDEX_VERSION_KEY, String(INDEX_SCHEMA_VERSION));
         console.log(`[GrokSearch] Full index done: ${count} posts`);
         if (statusEl) {
           setLoadStatus(`${count.toLocaleString()} indexed`);
@@ -1553,7 +1786,10 @@
       }
     }
     // Outside the try/finally so `indexing` is already false and the guard lets it run.
-    if (loaded) maybeRunScheduledReconcile();
+    if (loaded) {
+      checkIndexSchemaFreshness();
+      maybeRunScheduledReconcile();
+    }
   }
 
   // ─── Results ───────────────────────────────────────────────────────────────
@@ -2453,6 +2689,11 @@
       { action: 'copy-url', label: 'Copy URL' },
       { action: 'download', label: downloadLabel },
       { action: 'download-all', label: 'Download all', disabled: !postHasChildPosts(post) },
+      {
+        action: 'toggle-like',
+        label: post.isLiked === true ? 'Unlike' : 'Like',
+        disabled: !hasLikeSupport(),
+      },
     ];
     const dateKey = formatPostDateKey(post.createTime);
     if (dateKey) {
@@ -2507,6 +2748,9 @@
       case 'download-all':
         await downloadAllChildPosts(post);
         break;
+      case 'toggle-like':
+        await togglePostLiked(post);
+        break;
       case 'filter-date': {
         const dateKey = formatPostDateKey(post.createTime);
         if (dateKey) applyDateFilterForDay(dateKey);
@@ -2542,6 +2786,43 @@
     btn.title = 'Download current image or video';
     actions.appendChild(btn);
     bindLightboxDownloadButton();
+    ensureLightboxLikeButton(lb);
+  }
+
+  function ensureLightboxLikeButton(lb) {
+    const actions = lb?.querySelector('.grok-lightbox-actions');
+    if (!actions || document.getElementById('grok-lightbox-like')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'grok-toolbar-btn grok-lightbox-like-btn';
+    btn.id = 'grok-lightbox-like';
+    btn.textContent = 'Like';
+    actions.insertBefore(btn, actions.firstChild);
+    btn.addEventListener('click', async e => {
+      e.preventDefault();
+      e.stopPropagation();
+      const post = matchedPosts[lightboxIndex];
+      if (!post) return;
+      btn.disabled = true;
+      await togglePostLiked(post);
+      btn.disabled = false;
+      syncLightboxLikeButton();
+    });
+  }
+
+  function syncLightboxLikeButton() {
+    const btn = document.getElementById('grok-lightbox-like');
+    if (!btn) return;
+    const post = matchedPosts[lightboxIndex];
+    if (!post) { btn.hidden = true; return; }
+    const liked = post.isLiked === true;
+    btn.hidden = false;
+    btn.disabled = !hasLikeSupport();
+    btn.classList.toggle('is-liked', liked);
+    btn.textContent = liked ? '♥ Liked' : '♡ Like';
+    btn.title = hasLikeSupport()
+      ? (liked ? 'Unlike this post' : 'Like this post')
+      : 'Liking is not set up yet — run tools/capture-like.js once';
   }
 
   function ensureResultLightbox() {
@@ -2632,6 +2913,7 @@
     if (isChildPost(post)) bits.push('Child post');
     subEl.textContent = bits.join(' · ');
 
+    syncLightboxLikeButton();
     if (prevBtn) prevBtn.disabled = lightboxIndex <= 0;
     if (nextBtn) nextBtn.disabled = lightboxIndex >= matchedPosts.length - 1;
     lb.hidden = false;
@@ -2762,6 +3044,14 @@
         e.stopPropagation();
         return;
       }
+      const likeBtn = e.target.closest('.grok-result-like');
+      if (likeBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        const post = getPostById(likeBtn.closest('.grok-result-card')?.dataset.id);
+        if (post) togglePostLiked(post);
+        return;
+      }
       if (e.target.closest('.grok-result-date')) {
         e.preventDefault();
         e.stopPropagation();
@@ -2879,6 +3169,7 @@
       }
       if (dateBounds && !matchesDateBounds(post, dateBounds)) return false;
       if (!matchesModelFilter(post)) return false;
+      if (!matchesLikedFilter(post)) return false;
       if (!matchesVideoFilters(post)) return false;
       if (filterOnlyChildren && (post.childPostCount ?? 0) < filterMinChildren) return false;
       return true;
@@ -3000,6 +3291,11 @@
     return parts.join('');
   }
 
+  const HEART_SVG = `
+    <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+      <path d="M12 21s-7.5-4.7-9.4-9A5.3 5.3 0 0 1 12 6.3 5.3 5.3 0 0 1 21.4 12c-1.9 4.3-9.4 9-9.4 9z"/>
+    </svg>`;
+
   const CHILD_MARK_SVG = `
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
       <path d="M6 3v12"/><circle cx="6" cy="18" r="2"/><path d="M18 7v14"/><circle cx="18" cy="5" r="2"/>
@@ -3014,6 +3310,7 @@
         <input type="checkbox" class="grok-result-select-input" />
       </label>
       <span class="grok-result-child-mark" title="Child post" hidden>${CHILD_MARK_SVG}</span>
+      <button type="button" class="grok-result-like" aria-pressed="false">${HEART_SVG}</button>
       <div class="grok-result-date" hidden></div>
       <img loading="lazy" style="width:100%; display:block; border-radius:14px; aspect-ratio:3/4; object-fit:cover;" />
       <div class="grok-result-prompt"></div>
@@ -3048,6 +3345,17 @@
 
     const mark = card.querySelector('.grok-result-child-mark');
     if (mark) mark.hidden = !childCard;
+
+    const like = card.querySelector('.grok-result-like');
+    if (like) {
+      const liked = post.isLiked === true;
+      const unknown = post.isLiked == null;
+      like.classList.toggle('is-liked', liked);
+      like.classList.toggle('is-unknown', unknown);
+      if (like.getAttribute('aria-pressed') !== String(liked)) like.setAttribute('aria-pressed', String(liked));
+      const title = liked ? 'Unlike' : (unknown ? 'Like (current state unknown)' : 'Like');
+      if (like.title !== title) like.title = title;
+    }
 
     const dateEl = card.querySelector('.grok-result-date');
     if (dateEl) {
@@ -3365,7 +3673,7 @@
   function hasActiveFilter() {
     return Boolean(
       currentQuery.trim() || hasDateFilter() || filterVideoOnly || filterWithVideo
-      || filterOnlyChildren || filterHideChilds || filterModel
+      || filterOnlyChildren || filterHideChilds || filterModel || filterLikedOnly
     );
   }
 
@@ -4315,6 +4623,23 @@
       .grok-filter-min-select:disabled {
         opacity: 0.35; cursor: default;
       }
+      .grok-result-like {
+        position: absolute; bottom: 8px; left: 8px; z-index: 4;
+        display: flex; align-items: center; justify-content: center;
+        width: 26px; height: 26px; padding: 0;
+        border: none; border-radius: 50%;
+        background: rgba(0,0,0,0.45); cursor: pointer;
+        color: rgba(255,255,255,0.75);
+        opacity: 0; transition: opacity 0.15s, color 0.15s, background 0.15s, transform 0.12s;
+      }
+      .grok-result-card:hover .grok-result-like,
+      .grok-result-like:focus-visible { opacity: 1; }
+      .grok-result-like svg { fill: none; stroke: currentColor; stroke-width: 2; }
+      .grok-result-like:hover { background: rgba(0,0,0,0.7); color: #ff6b8a; transform: scale(1.08); }
+      .grok-result-like.is-liked { opacity: 1; color: #ff4d6d; }
+      .grok-result-like.is-liked svg { fill: currentColor; stroke: currentColor; }
+      .grok-result-like.is-unknown { color: rgba(255,255,255,0.45); }
+      .grok-lightbox-like-btn.is-liked { color: #ff4d6d; border-color: rgba(255,77,109,0.5); }
       .grok-filter-model-select {
         font-size: 11px; padding: 2px 6px; margin: 0;
         max-width: 160px;
@@ -4492,6 +4817,30 @@
     return [...models].sort((a, b) => a.localeCompare(b));
   }
 
+  function ensureLikedFilterCheckbox() {
+    if (document.getElementById('grok-filter-liked-label')) return;
+    const filters = getFiltersRow();
+    if (!filters) return;
+    const label = document.createElement('label');
+    label.id = 'grok-filter-liked-label';
+    label.className = 'grok-filter-check-label';
+    label.title = 'Show only posts you have liked';
+    label.innerHTML = '<input type="checkbox" id="grok-filter-liked" /> Liked only';
+    const hideChilds = document.getElementById('grok-filter-hide-childs-label');
+    if (hideChilds) hideChilds.insertAdjacentElement('afterend', label);
+    else filters.appendChild(label);
+
+    const input = label.querySelector('input');
+    input.checked = filterLikedOnly;
+    input.addEventListener('change', () => {
+      filterLikedOnly = input.checked;
+      writeStoredString(FILTER_LIKED_KEY, filterLikedOnly ? '1' : '0');
+      currentPage = 0;
+      updateClearButton();
+      applyFilter();
+    });
+  }
+
   function ensureModelFilterSelect() {
     if (document.getElementById('grok-filter-model')) return;
     const filters = getFiltersRow();
@@ -4546,6 +4895,16 @@
 
   function loadModelFilterFromStorage() {
     filterModel = readStoredString(FILTER_MODEL_KEY, '');
+  }
+
+  /** Unknown like state (null) never counts as liked, so it is not silently included. */
+  function matchesLikedFilter(post) {
+    if (!filterLikedOnly) return true;
+    return post.isLiked === true;
+  }
+
+  function loadLikedFilterFromStorage() {
+    filterLikedOnly = readStoredString(FILTER_LIKED_KEY, '0') === '1';
   }
 
   function matchesModelFilter(post) {
@@ -5019,6 +5378,7 @@
       ensureVerifyButton();
       ensureReindexButton();
       ensureMediaFilterCheckboxes();
+      ensureLikedFilterCheckbox();
       ensureModelFilterSelect();
       ensureDisplayControls();
       ensureDateNavButtons();
@@ -5157,12 +5517,14 @@
       filterOnlyChildren = localStorage.getItem(FILTER_CHILDREN_KEY) === '1';
       loadHideChildsFilterFromStorage();
       loadModelFilterFromStorage();
+      loadLikedFilterFromStorage();
       currentSort = localStorage.getItem(SORT_KEY) === 'oldest' ? 'oldest' : 'newest';
       filterMinChildren = parseMediaMin(localStorage.getItem(FILTER_CHILDREN_MIN_KEY));
       pageSize = clampPageSize(localStorage.getItem(PAGE_SIZE_KEY));
       gridSizePercent = clampGridSizePercent(localStorage.getItem(GRID_SIZE_PCT_KEY));
     } catch { /* ignore */ }
     syncMediaMinSelects();
+    ensureLikedFilterCheckbox();
     ensureModelFilterSelect();
     if (sortSel) sortSel.value = currentSort;
     bindDisplayControlListeners();
@@ -5210,6 +5572,9 @@
       filterHideChilds = false;
       filterMinChildren = 1;
       filterModel = '';
+      filterLikedOnly = false;
+      const likedEl = document.getElementById('grok-filter-liked');
+      if (likedEl) likedEl.checked = false;
       syncMediaMinSelects();
       const modelSel = document.getElementById('grok-filter-model');
       if (modelSel) modelSel.value = '';
@@ -5220,6 +5585,7 @@
         localStorage.setItem(FILTER_HIDE_CHILDS_KEY, '0');
         localStorage.setItem(FILTER_CHILDREN_MIN_KEY, '1');
         localStorage.setItem(FILTER_MODEL_KEY, '');
+        localStorage.setItem(FILTER_LIKED_KEY, '0');
       } catch { /* ignore */ }
       currentPage = 0;
       updateClearButton();

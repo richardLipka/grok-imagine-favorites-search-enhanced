@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.js` (v1.63.2, ~5.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, EXIF tagging |
+| `grokSearch.js` (v1.64.0, ~5.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, EXIF tagging |
 | `grokPostSidebar.js` (v1.3.0, ~530 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.js` owns the schema (it is the only
@@ -86,12 +86,15 @@ one template literal) → search-bar builders → `init()`.
 Two undocumented Grok REST endpoints, called with `GM_xmlhttpRequest` + `withCredentials` so the user's
 session cookies authenticate the request:
 
-- `POST /rest/media/post/list` — liked feed, cursor-paginated, 40/page, includes a nested `childPosts` tree.
-  **Ordered by like time, not creation time** (a single page has been observed spanning 190 days of
-  `createTime`), and scoped to `MEDIA_POST_SOURCE_LIKED`. Two consequences: a post liked today shows
-  up at the head of the feed no matter how old it is, so incremental sync does reach it; and media
-  the user generated but never liked is not in this feed at all — it only enters the index as a
-  child row when its parent is liked.
+- `POST /rest/media/post/list` — media feed, cursor-paginated, 40/page, includes a nested
+  `childPosts` tree. **Ordered by interaction time, not creation time** (a single page has been
+  observed spanning 190 days of `createTime`), so a post that resurfaces today appears at the head
+  regardless of age and the incremental sync reaches it.
+  The `filter.source` enum decides how much of the library is visible. It is undocumented and has
+  changed (Grok used to require a like for media to persist), so `resolveMediaSource()` probes
+  `MEDIA_SOURCE_CANDIDATES` with 5-item queries, keeps whichever returns the newest media, and
+  caches it for `MEDIA_SOURCE_REPROBE_MS`. **Reindex forces a re-probe** — that is the escape hatch
+  when Grok changes the enum again. Never hardcode a source back into `fetchPage`.
 - `POST /rest/media/post/get` — single post with the full child tree (used for deep refresh).
 
 Both go through `postJsonWithRetry()`, which retries `429`/`5xx` with exponential backoff and honours
@@ -101,7 +104,7 @@ that as an empty result — conflating the two is what made a mid-walk `401` rep
 These are internal APIs and may change without notice, so the UI always degrades to the cached index
 rather than throwing.
 
-### Index model (schema v3)
+### Index model (schema v4)
 
 The nested `childPosts` tree is **flattened**: every descendant becomes its own row with
 `isChild: true`, `parentId`, and a denormalized `parentPrompt` (children have no prompt of their own, so
@@ -115,6 +118,22 @@ changes. `normalizePost()` wraps it and attaches two cached derived fields (`_ms
 filter and sort read on every pass; because `toStorageRecord()` whitelists, they never reach IndexedDB
 or the export. Anything placed into `allPosts` must go through `normalizePost()` or those caches go
 stale.
+
+`isLiked` is tri-state: `true`, `false`, or **`null` for unknown**. `detectLikedState()` sniffs a
+list of candidate field names because the payload shape is not contractual; when it finds nothing it
+returns `null`. Treat unknown as unknown — *Liked only* excludes it rather than assuming `false`,
+and nothing should coerce it with `!!`.
+
+### Liking
+
+`setPostLiked()` never invents a request. It replays a template captured from Grok's own UI by
+`tools/capture-like.js` and stored under `LIKE_REQUEST_KEY`: `{ url, method, body, idPath,
+likedPath, unlikeUrl? }`, where the paths say where to write the post id and the boolean. With no
+template stored, the like controls are disabled and say so. If you ever feel tempted to hardcode an
+endpoint here, don't — a wrong guess fires writes at the user's account.
+
+`buildLikeRequest()` deep-clones the template body, so repeated calls cannot accumulate state; it is
+covered by `test/suites/liked.test.js`.
 
 ### Index mutation rules
 

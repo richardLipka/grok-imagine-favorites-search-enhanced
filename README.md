@@ -1,11 +1,11 @@
 # Grok Imagine Favorites Search (Enhanced Fork)
 
-Tampermonkey userscripts that add **full-text search**, **filters**, **downloads**, and **offline indexing** to your liked media on [Grok Imagine](https://grok.com/imagine), plus an optional **post detail sidebar**.
+Tampermonkey userscripts that add **full-text search**, **filters**, **downloads**, and **offline indexing** to your media library on [Grok Imagine](https://grok.com/imagine), plus an optional **post detail sidebar**.
 
 This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.js` **v1.63.2** · `grokPostSidebar.js` **v1.3.0**  
+**Current versions:** `grokSearch.js` **v1.64.0** · `grokPostSidebar.js` **v1.3.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Fork lineage
@@ -14,7 +14,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | **Upstream GitHub fork** this project is based on |
-| **This repo** | Enhanced fork: `grokSearch.js` v1.63.2 + `grokPostSidebar.js` v1.3.0 |
+| **This repo** | Enhanced fork: `grokSearch.js` v1.64.0 + `grokPostSidebar.js` v1.3.0 |
 
 ## What is included
 
@@ -25,10 +25,13 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 Both scripts share the same IndexedDB database: **`GrokSearchIndex`**.
 
-> **These scripts index your _liked_ media.** Grok's liked feed is ordered by when you liked
-> something, not when it was made, so anything you generate but never like is not indexed — it only
-> shows up as a **child** row underneath a parent post you did like. If recent generations are
-> missing, check that you actually liked them.
+> **Since v1.64.0 the index covers your whole library, not just likes.** Grok no longer requires a
+> like for media to stay in history, so the script resolves the widest media source it can reach and
+> indexes everything. Likes become a **filter** (*Liked only*) rather than a precondition, and you
+> can like or unlike straight from the results grid, the lightbox, and the right-click menu.
+>
+> **Upgrading from an older version: click Reindex once.** An index built before v1.64.0 contains
+> liked posts only and has no like state; the script detects this and says so.
 
 ---
 
@@ -121,11 +124,12 @@ Indexing time depends on library size. Leave the tab open until the status finis
 | **With video** | Parents only — image posts that have at least one video in child/descendant results |
 | **With child** | Parents only; min descendant count (full tree, not just first generation) |
 | **Hide childs** | Hide child post rows from results (show parents only) |
+| **Liked only** | Show only posts you have liked (posts whose like state is unknown are excluded) |
 | **Model** | Filter by generation model; the list is built from the models present in your index (hidden when none are recorded) |
 | **Per page / Size** | Pagination size (1–300) and thumbnail scale (10–200%) |
 | **Default** | Reset to 44 per page, 100% size |
 | **Sort** | Newest or oldest (remembered between sessions) |
-| **Clear** | Clears text, dates, model, and media filters |
+| **Clear** | Clears text, dates, model, liked, and media filters |
 | **Download selected** | In the match-count area — save checked images to a folder (Chrome/Edge) |
 | **Import JSON** | Merge a previously exported index file back in (adds and updates; never deletes) |
 | **Export JSON** | Download full index (schema v3, parents + children) |
@@ -236,6 +240,36 @@ early left behind.
 Use **Reindex** only when you want everything rebuilt from scratch; **Verify** is the cheap
 routine option.
 
+### Liking from the script
+
+Every result card shows a **heart** on hover (always visible when the post is liked); the lightbox
+has a **Like** button and the right-click menu a **Like/Unlike** entry. Clicking updates the card
+immediately and reverts if the request fails.
+
+**Liking needs a one-time setup.** Rather than guess at an undocumented endpoint, the script replays
+the exact request Grok's own UI sends — so you have to record it once:
+
+1. Open `https://grok.com/imagine` and open DevTools → Console.
+2. Paste [`tools/capture-like.js`](tools/capture-like.js) and press Enter.
+3. Click **Grok's own** like button on any image (not the script's heart).
+4. It prints `✓ Captured` and stops. Reload the page.
+
+The capture only observes — it sends nothing itself. Until it has run, the like controls are
+disabled and say so. To undo: `localStorage.removeItem('grokSearchLikeRequest')`.
+
+### Which media source is used
+
+Grok's list endpoint takes a `source` filter, and the value covering your whole library is
+undocumented and has changed over time. On first run (and on every **Reindex**) the script probes the
+candidates with a 5-item query each and keeps whichever returns the most recent media, caching the
+result for a week. The choice is logged to the console as `Using media source: …`.
+
+If it picks badly, force a re-probe with **Reindex**, or pin one by hand:
+
+```javascript
+localStorage.setItem('grokSearchMediaSource', 'MEDIA_POST_SOURCE_LIKED'); // or '(none)' for no filter
+```
+
 ### Backing up the index
 
 **Export JSON** writes the whole index to a file and **Import JSON** merges one back in — rows
@@ -280,6 +314,9 @@ req.onsuccess = e => {
 | Script errors / no API | Enable **Allow User Scripts** in Tampermonkey |
 | Stale counts or missing children | Wait for sync, then click **Verify**; **Reindex** only if that does not help |
 | Unliked posts still in results | Click **Verify** — incremental sync never removes rows |
+| Like buttons disabled | Liking needs a one-time capture — run [`tools/capture-like.js`](tools/capture-like.js) once |
+| Only liked posts are indexed | Index predates v1.64.0 — click **Reindex** once to pick up the whole library |
+| **Liked only** hides posts you did like | Their like state is unknown (`null`) because the feed did not report it; **Reindex** refreshes it |
 | Recent posts missing, even after **Reindex** | Check the **Model** dropdown reads *All models* — it is a saved preference, so **Reindex** does not clear it and posts made with any other model stay hidden. **Clear** resets it. Then run [`tools/diagnose.js`](tools/diagnose.js) in the console if they are still missing |
 | A post you just liked is missing | If it is an older post it is not near the top of the feed; click **Verify** |
 | **Verify** says *aborted — unexpected feed response* | It refused to delete more than half the index; check the console and retry later |
