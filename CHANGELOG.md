@@ -15,6 +15,18 @@ Nothing here changes the installed userscripts — no version bump.
 
 ---
 
+## [1.63.1] — 2026-08-25
+
+### Fixed
+- **Toolbar controls overlapped each other.** The bottom row was `flex-wrap: nowrap` while every
+  control inside it is `flex-shrink: 0`, so once v1.63.0 added the model dropdown and the
+  Import/Verify buttons the filter group's box shrank to ~416 px while its contents still needed
+  ~829 px — the overflow painted straight over the action buttons, putting *All models* on top of
+  **Export JSON**. Both groups now wrap, so the bar grows a line instead of overlapping. Verified
+  clear of overlap and overflow from 320 px to 1280 px.
+
+---
+
 ## [1.63.0] — 2026-08-25
 
 ### Added

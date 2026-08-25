@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.63.0
+// @version      1.63.1
 // @description  Search, filter, and paginate saved Grok media; lightbox, bulk folder download, EXIF prompt tags.
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -3580,25 +3580,34 @@
         gap: 8px;
         width: 100%;
       }
+      /* Filters and actions both wrap: their children are flex-shrink:0, so a nowrap row
+         overflows its own box and paints over the neighbouring group instead of reflowing. */
       .grok-bar-bottom {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         justify-content: space-between;
-        gap: 12px;
+        gap: 8px 12px;
         width: 100%;
+        flex-wrap: wrap;
       }
       .grok-bar-filters {
         display: flex;
         align-items: center;
-        gap: 8px;
-        flex-wrap: nowrap;
+        gap: 6px 8px;
+        flex-wrap: wrap;
+        flex: 1 1 auto;
         min-width: 0;
       }
       .grok-bar-actions {
         display: flex;
         align-items: center;
         gap: 6px;
-        flex-shrink: 0;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        /* Must be shrinkable, or on a narrow bar the group keeps its max-content width and
+           the last buttons hang outside the panel instead of wrapping. */
+        min-width: 0;
+        margin-left: auto;
       }
       .grok-date-input {
         background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.15);

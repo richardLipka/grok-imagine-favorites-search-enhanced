@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.js` (v1.63.0, ~5.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, EXIF tagging |
+| `grokSearch.js` (v1.63.1, ~5.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, EXIF tagging |
 | `grokPostSidebar.js` (v1.3.0, ~530 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.js` owns the schema (it is the only
@@ -229,6 +229,16 @@ This is the fragile part of the codebase and the usual source of bugs:
   to the `buildSearchBar()` HTML template also needs an `ensure*` function, or users upgrading in place
   will not get it.
 - **Everything injected is namespaced `grok-*`** (ids and classes) and styled only from `injectStyles()`.
+- **The toolbar's filter and action groups must stay `flex-wrap: wrap` with a shrinkable
+  `min-width: 0`.** Their children are all `flex-shrink: 0`, so a `nowrap` group whose box gets
+  squeezed overflows and paints over its neighbour rather than reflowing — that is how v1.63.0 put
+  the model dropdown on top of **Export JSON**. Adding another control to either group means
+  re-checking the layout.
+
+To inspect toolbar layout without grok.com, render the real CSS and markup standalone: extract the
+`injectStyles()` template and the `buildSearchBar()` `wrap.innerHTML` template, add the controls the
+`ensure*()` functions inject at runtime, and open the result in a browser. Measuring
+`getBoundingClientRect()` for overlap and overflow is more reliable than eyeballing a screenshot.
 
 ### Downloads and EXIF
 
