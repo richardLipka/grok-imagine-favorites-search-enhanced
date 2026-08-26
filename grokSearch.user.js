@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.68.4
+// @version      1.68.5
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
-// @author       AnnaLynn (original), Richard Lipka (enhanced fork)
+// @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
 // @supportURL   https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/issues
+// @license      GPL-3.0-only
 // @updateURL    https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokSearch.user.js
 // @downloadURL  https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokSearch.user.js
 // @match        https://grok.com/imagine*
@@ -16,6 +17,20 @@
 // @run-at       document-idle
 // @require      https://cdn.jsdelivr.net/npm/piexifjs@1.0.6/piexif.js
 // ==/UserScript==
+
+// Grok Imagine Favorites Search — search, index and manage your Grok Imagine library
+// Copyright (C) 2026 Richard Lipka
+// Copyright (C) 2026 IronSniper1 — https://github.com/ironsniper1/Grok-imagine-favorite-image-search
+//
+// This program is free software: you can redistribute it and/or modify it under the terms of
+// the GNU General Public License, version 3, as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+// See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with this program.
+// If not, see <https://www.gnu.org/licenses/>.
 
 (function () {
   'use strict';
@@ -111,7 +126,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.68.4';
+  const SCRIPT_VERSION = '1.68.5';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the

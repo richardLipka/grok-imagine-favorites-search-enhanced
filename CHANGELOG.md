@@ -203,6 +203,29 @@ have the same trigger: *Results only* being off.
 
 ---
 
+## [1.68.5] — 2026-08-26
+
+`grokPostSidebar.user.js` goes to 1.3.2 for the same change. No behaviour change; the version bump
+exists so Tampermonkey ships the new licence headers.
+
+### Changed
+- **Relicensed to GPL-3.0.** This project was forked from
+  [ironsniper1/Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search),
+  which declares **two different licences**: its `LICENSE` file is the full GPL-3.0 text (what
+  GitHub reports), while its README says "MIT — do whatever you want with it". Where they
+  disagree this project follows the **stricter** of the two rather than the more convenient one.
+  `LICENSE` is now the verbatim GNU GPLv3, both userscripts carry `@license GPL-3.0-only` plus the
+  standard notice, and the copyright credits IronSniper1 alongside Richard Lipka.
+- **Corrected the lineage.** The README described the Greasy Fork script as the original with
+  IronSniper1 downstream of it. That was backwards: IronSniper1's repo was created 2026-03-07, the
+  Greasy Fork script on 2026-03-20, and that script states it was *"Forked from IronSniper1"*. The
+  Credits table now reflects what each source actually says, and links back to Strapples' GitHub as
+  their script asks.
+- The `@author` header said "AnnaLynn (original), Richard Lipka (enhanced fork)"; it now reads
+  "Richard Lipka, based on IronSniper1".
+
+---
+
 ## Unreleased
 
 Nothing here changes the installed userscripts — no version bump.

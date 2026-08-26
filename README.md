@@ -2,24 +2,29 @@
 
 Tampermonkey userscripts that add **full-text search**, **filters**, **downloads**, and **offline indexing** to your media library on [Grok Imagine](https://grok.com/imagine), plus an optional **post detail sidebar**.
 
-A standalone project by **Richard Lipka**, grown from the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea by **AnnaLynn** and extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, deletion, and much else — see [Credits and origins](#credits-and-origins).
+A standalone project by **Richard Lipka**, grown from [IronSniper1's](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) base script and extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, deletion, and much else — see [Credits and origins](#credits-and-origins).
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.user.js` **v1.68.4** · `grokPostSidebar.user.js` **v1.3.1**  
+**Current versions:** `grokSearch.user.js` **v1.68.5** · `grokPostSidebar.user.js` **v1.3.2**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Credits and origins
 
 This is now a **standalone repository**, but it began as a fork and the earlier work deserves the
-credit:
+credit.
 
-| Source | Contribution |
-|--------|--------------|
-| [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | The original userscript and the idea (Greasy Fork) |
-| [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | The GitHub fork this project was started from |
-| **This repo** | Everything since: `grokSearch.user.js` v1.68.4 + `grokPostSidebar.user.js` v1.3.1 |
+| Source | Created | Contribution |
+|--------|---------|--------------|
+| [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | 2026-03-07 | **The base this repository was forked from.** |
+| [Strapples — Grok Imagine Favorites Search (Greasy Fork)](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) · [GrokImagineSearchandOrganize](https://github.com/Strapples/GrokImagineSearchandOrganize) | 2026-03-20 | A parallel userscript, also forked from IronSniper1. Its author asks that people link back to their GitHub, so it is linked here. |
+| **This repo** | — | Everything since: `grokSearch.user.js` v1.68.5 + `grokPostSidebar.user.js` v1.3.2 |
 
-Leaving GitHub's fork network is a hosting change only. It does not change where the idea came
+Earlier versions of this README described the Greasy Fork script as the original and IronSniper1 as
+downstream of it. That was the wrong way round: IronSniper1 came first, and the Greasy Fork script
+says plainly that it was *"Forked from IronSniper1 — big thanks for making a usable base code for
+this piece"*. The table above reflects what each source actually states.
+
+Leaving GitHub's fork network is a hosting change only. It does not change where the code came
 from, and this section is not to be removed.
 
 ## What is included
@@ -439,4 +444,19 @@ Unofficial tool, not affiliated with xAI / Grok. Internal APIs may change and br
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Please keep attribution links to this repo and the original authors when redistributing.
+**GNU General Public License v3.0** — see [LICENSE](LICENSE).
+
+```
+Copyright (C) 2026 Richard Lipka
+Copyright (C) 2026 IronSniper1
+```
+
+This project was forked from
+[ironsniper1/Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search),
+whose `LICENSE` file is GPL-3.0. Its README separately says "MIT"; where the two disagree, this
+project follows the **stricter** of the two rather than assuming the more convenient reading.
+
+In practice that means: you may use, modify and redistribute this freely, but a modified version
+you distribute must also be GPL-3.0 and ship its source.
+
+`piexifjs`, loaded at runtime via `@require`, is MIT-licensed and is not part of this repository.

@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Grok Imagine Post Sidebar (prompt)
 // @namespace    http://tampermonkey.net/
-// @version      1.3.1
+// @version      1.3.2
 // @description  Collapsible sidebar on /imagine/post/{id}: metadata and prompt from IndexedDB and Grok API.
 // @author       Richard Lipka
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
 // @supportURL   https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/issues
+// @license      GPL-3.0-only
 // @updateURL    https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokPostSidebar.user.js
 // @downloadURL  https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokPostSidebar.user.js
 // @match        https://grok.com/imagine/post/*
@@ -13,6 +14,20 @@
 // @connect      grok.com
 // @run-at       document-idle
 // ==/UserScript==
+
+// Grok Imagine Favorites Search — prompt sidebar for Grok Imagine post pages
+// Copyright (C) 2026 Richard Lipka
+// Copyright (C) 2026 IronSniper1 — https://github.com/ironsniper1/Grok-imagine-favorite-image-search
+//
+// This program is free software: you can redistribute it and/or modify it under the terms of
+// the GNU General Public License, version 3, as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+// See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with this program.
+// If not, see <https://www.gnu.org/licenses/>.
 
 (function () {
   'use strict';
