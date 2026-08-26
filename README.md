@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.js` **v1.66.0** · `grokPostSidebar.js` **v1.3.0**  
+**Current versions:** `grokSearch.js` **v1.66.1** · `grokPostSidebar.js` **v1.3.1**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Fork lineage
@@ -14,7 +14,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | **Upstream GitHub fork** this project is based on |
-| **This repo** | Enhanced fork: `grokSearch.js` v1.66.0 + `grokPostSidebar.js` v1.3.0 |
+| **This repo** | Enhanced fork: `grokSearch.js` v1.66.1 + `grokPostSidebar.js` v1.3.1 |
 
 ## What is included
 
@@ -56,16 +56,22 @@ Both scripts share the same IndexedDB database: **`GrokSearchIndex`**.
 
 ### Option A — Install from this repo (recommended)
 
-1. Install Tampermonkey (see above).
-2. Open **`grokSearch.js`** on GitHub → **Raw** → copy all contents.  
-   Tampermonkey → **Create new script** → paste → **Save**.
-3. Repeat for **`grokPostSidebar.js`** if you want the post sidebar.
-4. Hard-refresh `https://grok.com/imagine` (Ctrl+Shift+R).
+Open either link with Tampermonkey installed and it will offer to install the script directly:
 
-**Install from GitHub (raw scripts):**
+- Search: **[install `grokSearch.js`](https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokSearch.js)**
+- Sidebar: **[install `grokPostSidebar.js`](https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokPostSidebar.js)**
 
-- Search: `https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/raw/main/grokSearch.js`
-- Sidebar: `https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/raw/main/grokPostSidebar.js`
+Then hard-refresh `https://grok.com/imagine` (Ctrl+Shift+R).
+
+Installed this way both scripts carry `@updateURL` / `@downloadURL`, so **Tampermonkey checks for
+updates on its own**. Dashboard → **Utilities** → *Check for userscript updates* forces a check.
+
+> **A script pasted in by hand never auto-updates**, whatever its `@version` says — Tampermonkey
+> has no URL to poll. Releases up to v1.66.0 also shipped without those headers, so an install from
+> before v1.66.1 is frozen wherever it landed. If your search bar is missing controls this README
+> describes, that is why: install once from the links above (Tampermonkey replaces the existing
+> script rather than adding a second copy) and future releases arrive on their own. To check what
+> you are running, look at the version column in the Tampermonkey dashboard.
 
 ### Option B — Clone and copy locally
 
@@ -73,7 +79,8 @@ Both scripts share the same IndexedDB database: **`GrokSearchIndex`**.
 git clone https://github.com/richardLipka/grok-imagine-favorites-search-enhanced.git
 ```
 
-Copy each `.js` file into Tampermonkey as in option A.
+Tampermonkey → **Create new script** → paste the file contents → **Save**. A script
+installed this way will **not** auto-update — use option A unless you are editing the code.
 
 ---
 
@@ -369,6 +376,7 @@ req.onsuccess = e => {
 | Issue | Try |
 |-------|-----|
 | No search bar | Tampermonkey on? On `/imagine` not `/imagine/post/...`? Hard refresh |
+| Buttons this README describes are missing (**Verify**, **Import JSON**, **Liked only**, **Cancel**…) | You are running an older version. A hand-pasted script never auto-updates — reinstall from the links in [Installation](#option-a--install-from-this-repo-recommended), then check the version column in the Tampermonkey dashboard |
 | Script errors / no API | Enable **Allow User Scripts** in Tampermonkey |
 | Stale counts or missing children | Wait for sync, then click **Verify**; **Reindex** only if that does not help |
 | Unliked posts still in results | Click **Verify** — incremental sync never removes rows |

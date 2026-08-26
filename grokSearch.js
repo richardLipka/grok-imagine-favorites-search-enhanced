@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.66.0
+// @version      1.66.1
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
 // @supportURL   https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/issues
+// @updateURL    https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokSearch.js
+// @downloadURL  https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokSearch.js
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
@@ -71,7 +73,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.66.0';
+  const SCRIPT_VERSION = '1.66.1';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -6300,24 +6302,40 @@
     setSearchBarExpanded(searchBarExpanded);
   }
 
+  /**
+   * Every control that is injected rather than written into the `buildSearchBar()` template.
+   *
+   * Both build paths must run this. They used to have separate lists, and the fresh-build path
+   * was missing `ensureImportJsonButton()` and `ensureVerifyButton()` -- neither of which is in
+   * the template -- so **Import JSON** and **Verify** only ever appeared for users whose browser
+   * still had an older bar in the DOM to migrate. A clean install silently had no way to run a
+   * reconciliation sweep at all.
+   *
+   * Adding a control to the template is therefore not enough on its own; add its `ensure*` here.
+   * Each one is create-or-return, so calling them on both paths is free.
+   */
+  function ensureSearchBarParts() {
+    ensurePageJumpInput();
+    ensureImportJsonButton();
+    ensureExportJsonButton();
+    ensureVerifyButton();
+    ensureReindexButton();
+    ensureMediaFilterCheckboxes();
+    ensureLikedFilterCheckbox();
+    ensureModelFilterSelect();
+    ensureDisplayControls();
+    ensureDateNavButtons();
+    ensureSearchBarToggle();
+    ensureDownloadResultsButtons();
+    ensureDownloadSelectedButtons();
+    ensureLoadingIndicator();
+    ensureSearchInputListener();
+  }
+
   function buildSearchBar() {
     if (document.getElementById('grok-search-wrap')) {
       migrateSearchBarLayout();
-      ensurePageJumpInput();
-      ensureImportJsonButton();
-      ensureExportJsonButton();
-      ensureVerifyButton();
-      ensureReindexButton();
-      ensureMediaFilterCheckboxes();
-      ensureLikedFilterCheckbox();
-      ensureModelFilterSelect();
-      ensureDisplayControls();
-      ensureDateNavButtons();
-      ensureSearchBarToggle();
-      ensureDownloadResultsButtons();
-      ensureDownloadSelectedButtons();
-      ensureLoadingIndicator();
-      ensureSearchInputListener();
+      ensureSearchBarParts();
       syncInitialResultsView();
       if (!loaded && !indexing) loadAllPosts();
       return;
@@ -6455,12 +6473,11 @@
       gridSizePercent = clampGridSizePercent(localStorage.getItem(GRID_SIZE_PCT_KEY));
     } catch { /* ignore */ }
     syncMediaMinSelects();
-    ensureLikedFilterCheckbox();
-    ensureModelFilterSelect();
+    // The same chain the migration path runs -- see ensureSearchBarParts().
+    ensureSearchBarParts();
     if (sortSel) sortSel.value = currentSort;
     bindDisplayControlListeners();
     bindMediaFilterListeners();
-    ensureDateNavButtons();
     updateClearButton();
     const prevBtn = document.getElementById('grok-page-prev');
     const nextBtn = document.getElementById('grok-page-next');

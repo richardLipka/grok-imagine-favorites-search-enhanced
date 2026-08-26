@@ -3,6 +3,52 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## Unreleased
+
+Nothing here changes the installed userscripts — no version bump.
+
+### Corrected
+- The v1.63.0 notes said **Verify** was needed to find *posts liked long after they were created*.
+  That was based on a wrong assumption about feed ordering. Field data shows the liked feed is
+  ordered by **like time**, not creation time (one page spanned 190 days of `createTime`), so a
+  freshly liked old post arrives at the head of the feed and the incremental sync already catches it.
+  Verify's real job is removing unliked posts and repairing truncated syncs. Docs updated.
+
+### Tooling
+- Added a dependency-free test suite: `node test/run.js` (96 assertions across records, index
+  mutation, child sync, reconciliation, and results-grid reuse). The suite slices regions out of
+  `grokSearch.js` and runs the real functions against stubs, so it covers production code rather
+  than a copy of it — see [test/README.md](test/README.md).
+
+---
+
+## [1.66.1] — 2026-08-26
+
+Found by driving a real browser: the installed script was three releases behind, and two reasons
+why were sitting in the repo.
+
+`grokPostSidebar.js` goes to **1.3.1** for the same header fix.
+
+### Fixed
+- **Neither userscript declared `@updateURL` / `@downloadURL`**, so Tampermonkey never checked for
+  updates. Every release needed a manual copy-paste, and an install could sit frozen for months
+  while the repo moved on — which is exactly what had happened. Both headers now point at the raw
+  files on `main`, and the README install steps use links Tampermonkey can install from.
+  *This only helps installs made from v1.66.1 onward; a script already pasted in by hand has to be
+  reinstalled once from those links.*
+- **A freshly built search bar was missing Import JSON and Verify.** `buildSearchBar()` has two
+  paths — upgrade a bar an older version left in the DOM, or build one from the template — and they
+  ran different lists of `ensure*` calls. Neither button is in the template, so on a clean install
+  they never appeared and there was no way to run a reconciliation sweep at all. Both paths now run
+  a single `ensureSearchBarParts()`.
+
+### Tooling
+- New `search-bar-parts` suite (16 assertions, 413 total). It asserts the two build paths inject
+  the *same set* of controls rather than checking for particular buttons, so it catches the next
+  one too. Confirmed to fail against the bug it was written for.
+
+---
+
 ## [1.66.0] — 2026-08-26
 
 Two reported bugs: images that were never liked still were not being indexed, and collapsing the
@@ -38,25 +84,6 @@ search bar left the Grok page blank until a reload.
   `native-visibility` (hide/restore against an attribute-aware fake DOM). 397 total. Three
   mutations — restoring the old un-hide, the old probe ranking, and ignoring the template — confirm
   each suite fails when the behaviour it covers is broken.
-
----
-
-## Unreleased
-
-Nothing here changes the installed userscripts — no version bump.
-
-### Corrected
-- The v1.63.0 notes said **Verify** was needed to find *posts liked long after they were created*.
-  That was based on a wrong assumption about feed ordering. Field data shows the liked feed is
-  ordered by **like time**, not creation time (one page spanned 190 days of `createTime`), so a
-  freshly liked old post arrives at the head of the feed and the incremental sync already catches it.
-  Verify's real job is removing unliked posts and repairing truncated syncs. Docs updated.
-
-### Tooling
-- Added a dependency-free test suite: `node test/run.js` (96 assertions across records, index
-  mutation, child sync, reconciliation, and results-grid reuse). The suite slices regions out of
-  `grokSearch.js` and runs the real functions against stubs, so it covers production code rather
-  than a copy of it — see [test/README.md](test/README.md).
 
 ---
 

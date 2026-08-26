@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Grok Imagine Post Sidebar (prompt)
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
+// @version      1.3.1
 // @description  Collapsible sidebar on /imagine/post/{id}: metadata and prompt from IndexedDB and Grok API.
 // @author       Richard Lipka
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
 // @supportURL   https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/issues
+// @updateURL    https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokPostSidebar.js
+// @downloadURL  https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokPostSidebar.js
 // @match        https://grok.com/imagine/post/*
 // @grant        GM_xmlhttpRequest
 // @connect      grok.com
