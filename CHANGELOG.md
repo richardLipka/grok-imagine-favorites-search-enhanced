@@ -207,6 +207,14 @@ have the same trigger: *Results only* being off.
 
 Nothing here changes the installed userscripts — no version bump.
 
+### Repository
+- The repository left GitHub's fork network and is now standalone. The README's fork-setup
+  instructions described adding an `upstream` remote and were long obsolete; they are replaced by
+  a short **Repository** section.
+- **Credit is unaffected and stays.** Leaving the fork network is a hosting change; it says nothing
+  about where the idea came from. The old "Fork lineage" table is now **Credits and origins**,
+  still naming AnnaLynn's original and the `ironsniper1` fork this was started from.
+
 ### Corrected
 - The v1.63.0 notes said **Verify** was needed to find *posts liked long after they were created*.
   That was based on a wrong assumption about feed ordering. Field data shows the liked feed is

@@ -1,20 +1,26 @@
-# Grok Imagine Favorites Search (Enhanced Fork)
+# Grok Imagine Favorites Search (Enhanced)
 
 Tampermonkey userscripts that add **full-text search**, **filters**, **downloads**, and **offline indexing** to your media library on [Grok Imagine](https://grok.com/imagine), plus an optional **post detail sidebar**.
 
-This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
+A standalone project by **Richard Lipka**, grown from the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea by **AnnaLynn** and extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, deletion, and much else — see [Credits and origins](#credits-and-origins).
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
 **Current versions:** `grokSearch.user.js` **v1.68.4** · `grokPostSidebar.user.js` **v1.3.1**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
-## Fork lineage
+## Credits and origins
 
-| Source | Notes |
-|--------|--------|
-| [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
-| [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | **Upstream GitHub fork** this project is based on |
-| **This repo** | Enhanced fork: `grokSearch.user.js` v1.68.4 + `grokPostSidebar.user.js` v1.3.1 |
+This is now a **standalone repository**, but it began as a fork and the earlier work deserves the
+credit:
+
+| Source | Contribution |
+|--------|--------------|
+| [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | The original userscript and the idea (Greasy Fork) |
+| [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | The GitHub fork this project was started from |
+| **This repo** | Everything since: `grokSearch.user.js` v1.68.4 + `grokPostSidebar.user.js` v1.3.1 |
+
+Leaving GitHub's fork network is a hosting change only. It does not change where the idea came
+from, and this section is not to be removed.
 
 ## What is included
 
@@ -84,25 +90,17 @@ installed this way will **not** auto-update — use option A unless you are edit
 
 ---
 
-## Publishing / fork relationship
+## Repository
 
-This project is maintained as a **GitHub fork** of [ironsniper1/Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search).
-
-**One-time setup (maintainer):**
-
-1. On GitHub, open the upstream repo and click **Fork** (creates a fork under your account).
-2. In the fork’s **Settings → General**, rename the repository to `grok-imagine-favorites-search-enhanced` if desired (fork parent link is kept).
-3. From this folder:
+Standalone, with a single remote:
 
 ```bash
-git remote add upstream https://github.com/ironsniper1/Grok-imagine-favorite-image-search.git
-git remote add origin https://github.com/richardLipka/grok-imagine-favorites-search-enhanced.git
-git push -u origin master:main   # first publish only; later: git push
+git remote -v   # origin  https://github.com/richardLipka/grok-imagine-favorites-search-enhanced.git
 ```
 
-4. On GitHub, set the default branch to `main` if prompted.
-
-To pull upstream README/license changes later: `git fetch upstream` then merge or cherry-pick as needed (histories may differ).
+The default branch is `main`. Releases are annotated tags (`git tag -a vX.Y.Z`); there are no
+GitHub Releases, so the tag *is* the release. There is no `upstream` remote and nothing to merge
+from one — the code has diverged completely from where it started.
 
 ---
 

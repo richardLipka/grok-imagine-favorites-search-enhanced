@@ -18,8 +18,10 @@ Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` own
 writer and the only script with `onupgradeneeded`); the sidebar is a read-only consumer that falls back
 to the Grok API when the store is missing.
 
-This is an **enhanced fork** of AnnaLynn's original Greasy Fork script, via
-`ironsniper1/Grok-imagine-favorite-image-search`. `README.md` documents the fork lineage and every
+A **standalone repository**. It began as a fork of `ironsniper1/Grok-imagine-favorite-image-search`
+(itself from AnnaLynn's Greasy Fork script) and left GitHub's fork network once the code had
+diverged completely. That is a hosting change only: the *Credits and origins* section of
+`README.md` records where the idea came from and must stay. `README.md` also documents every
 user-facing control in detail — read it before changing UI behavior.
 
 ## Development workflow
@@ -63,7 +65,7 @@ A behavior change bumps the version in **four** places, kept in lockstep:
 
 - the `// @version` line in the script header,
 - the `SCRIPT_VERSION` const (it is stamped into downloaded image metadata),
-- the "Current versions" line and the fork-lineage row in `README.md`,
+- the "Current versions" line and the Credits row in `README.md`,
 - a new `## [x.y.z] — YYYY-MM-DD` section in `CHANGELOG.md` with `### Added` / `### Changed` / `### Fixed`.
 
 Changes that do not alter what users install (tests, docs, tooling) do **not** bump the version or get
@@ -71,8 +73,8 @@ a tag — they go under `## Unreleased` in the changelog.
 
 Commit subjects are imperative with the version in parentheses, e.g.
 `Add context menu and lightbox downloads (v1.61)`. Releases are annotated tags named `vX.Y.Z`
-(`git tag -a v1.63.0`); the repo does not use GitHub Releases. Branch is `main`; `origin` is the
-GitHub fork.
+(`git tag -a v1.63.0`); the repo does not use GitHub Releases. Branch is `main`, and
+`origin` is the only remote.
 
 ## Architecture of `grokSearch.user.js`
 
