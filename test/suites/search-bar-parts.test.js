@@ -92,6 +92,13 @@ module.exports = {
     t.equal('both lightbox paths run the chain',
       (ensureLb.match(/ensureLightboxButtons\(/g) || []).length, 2);
 
+    t.group('the running version is discoverable from the page');
+    t.ok('init publishes it on <html>',
+      /dataset\.grokSearchVersion = SCRIPT_VERSION/.test(readSource()), 'version marker missing');
+    const header = readSource().match(/@version\s+(\S+)/)[1];
+    const constant = readSource().match(/const SCRIPT_VERSION = '([^']+)'/)[1];
+    t.equal('and it matches the @version header', constant, header);
+
     t.group('the controls this actually broke are in the chain');
     for (const [fn, label] of [
       ['ensureImportJsonButton', 'Import JSON'],

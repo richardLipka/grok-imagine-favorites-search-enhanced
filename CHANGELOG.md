@@ -193,6 +193,16 @@ have the same trigger: *Results only* being off.
 
 ---
 
+## [1.68.4] — 2026-08-26
+
+### Added
+- The running version is published as `data-grok-search-version` on `<html>`. Check what is
+  actually installed with `document.documentElement.dataset.grokSearchVersion` in the console —
+  without it, a stale Tampermonkey install is hard to tell apart from a fix that did not work,
+  which cost real time chasing the lightbox buttons.
+
+---
+
 ## Unreleased
 
 Nothing here changes the installed userscripts — no version bump.

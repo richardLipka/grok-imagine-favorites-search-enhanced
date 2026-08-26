@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.68.3
+// @version      1.68.4
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -111,7 +111,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.68.3';
+  const SCRIPT_VERSION = '1.68.4';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -7169,6 +7169,9 @@
   let initiated = false;
   function init() {
     if (!isImagineListPage()) return;
+    // Published so the running version can be read from the page. Without it, telling a stale
+    // Tampermonkey install apart from a bug that survived a fix means guessing from CSS.
+    try { document.documentElement.dataset.grokSearchVersion = SCRIPT_VERSION; } catch { /* ignore */ }
     if (initiated && document.getElementById('grok-search-wrap')) {
       syncInitialResultsView();
       if (!loaded && !indexing) loadAllPosts();
