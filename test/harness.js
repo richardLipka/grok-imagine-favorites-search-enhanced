@@ -575,6 +575,38 @@ ${region}
 return syncCardImage;`)(createElement);
 }
 
+/**
+ * Which page the reader is on. The rule under test is that only a change of *mode* moves it --
+ * an SPA re-init calls setResultsOnlyEnabled() with the value it already has.
+ */
+function createResultsOnlySandbox({ resultsOnly = true, currentPage = 0, loaded = true } = {}) {
+  const region = sliceBetween(readSource(),
+    '  function setResultsOnlyEnabled(', '  function updateResultsOnlyLayout(');
+
+  const prelude = `
+    const log = { checkbox: 0, layout: 0, filters: 0, enforce: 0, native: 0, loading: 0 };
+    function syncResultsOnlyCheckbox() { log.checkbox++; }
+    function updateResultsOnlyLayout() { log.layout++; }
+    function applyNativeVisibility() { log.native++; }
+    function showLoadingIndicator() { log.loading++; }
+    function applyFilter() { log.filters++; }
+    function scheduleEnforceDisplay() { log.enforce++; }
+  `;
+
+  const epilogue = `
+    return {
+      log, setResultsOnlyEnabled,
+      get resultsOnly() { return resultsOnly; },
+      get currentPage() { return currentPage; },
+      setCurrentPage(n) { currentPage = n; },
+    };
+  `;
+
+  return new Function('resultsOnly', 'currentPage', 'loaded', `${prelude}
+${region}
+${epilogue}`)(resultsOnly, currentPage, loaded);
+}
+
 function createGridSandbox({ createElement, onRender }) {
   const src = readSource();
   // The end marker has to be looked for past renderResultCards' own declaration, otherwise the
@@ -595,7 +627,7 @@ function createGridSandbox({ createElement, onRender }) {
 module.exports = {
   SOURCE_PATH, readSource, sliceBetween,
   createIndexSandbox, createGridSandbox, createLikeSandbox, createMetadataSandbox,
-  createCompactSandbox, createCardImageSandbox,
+  createCompactSandbox, createCardImageSandbox, createResultsOnlySandbox,
   createDownloadSandbox, createBulkDownloadSandbox,
   createFeedSandbox, createNativeVisibilitySandbox, createSearchBarSandbox,
   createDeleteSandbox,

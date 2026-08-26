@@ -253,6 +253,26 @@ Nothing here changes the installed userscripts — no version bump.
 
 ---
 
+## [1.69.1] — 2026-08-26
+
+### Fixed
+
+- **The results jumped back to page 1 on their own.** `syncResultsView()` reset `currentPage` on
+  every render, so anything that re-rendered dragged the reader to the front: an incremental sync
+  that found one new post, a **Verify** sweep, liking a row, deleting a row. `setResultsOnlyEnabled()`
+  did the same unconditionally, and `setSearchBarExpanded()` calls it on every init — including the
+  re-inits an SPA navigation triggers — so moving around grok.com was enough on its own.
+
+  Going back to page 1 answers the user changing *what they are looking at*, so it now happens only
+  in the handlers that do that. Every one of them already reset the page itself: the search box, the
+  date inputs and day stepper, the media/liked/model filters, sort, **Clear**, the page-size and
+  compact switches, and **Reindex**, which clears the index outright. Toggling *Results only* still
+  resets, but only when the mode actually changes. Nothing needs a floor: `showResults()` clamps the
+  page to the last one, so a match set that shrinks under you lands on the end of the results rather
+  than out of bounds.
+
+---
+
 ## [1.69.0] — 2026-08-26
 
 ### Added

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.69.0
+// @version      1.69.1
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -134,7 +134,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.69.0';
+  const SCRIPT_VERSION = '1.69.1';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -2781,6 +2781,20 @@
     hideAllSearchResults();
   }
 
+  /**
+   * Renders whatever `applyFilter()` just matched.
+   *
+   * It deliberately does **not** reset `currentPage`. Going back to page 1 is a response to the
+   * user changing what they are looking at, so it belongs to the handlers that do that -- and
+   * every one of them already does it (the search box, the date inputs and day stepper, the
+   * media/liked/model filters, sort, Clear, the page-size and compact switches, and Reindex,
+   * which clears the index outright).
+   *
+   * Resetting here instead meant *anything* that re-rendered dragged the reader back to page 1:
+   * an incremental sync that found one new post, a Verify sweep, liking a row, deleting a row.
+   * Nothing needs a floor here either -- showResults() clamps `currentPage` to the last page, so
+   * a match set that shrinks lands on the end of the results rather than out of bounds.
+   */
   function syncResultsView() {
     updateDisplayMode();
 
@@ -2798,7 +2812,6 @@
       return;
     }
 
-    currentPage = 0;
     const noResults = document.getElementById('grok-no-results');
     if (matchedPosts.length === 0) {
       hideAllSearchResults();
@@ -2828,10 +2841,14 @@
 
   function setResultsOnlyEnabled(enabled) {
     const next = Boolean(enabled);
+    // Only a genuine change of mode is a reason to go back to page 1. setSearchBarExpanded()
+    // calls this on every init, including the re-inits an SPA navigation triggers, and an
+    // unconditional reset there dropped the reader to page 1 while they were reading.
+    const changed = next !== resultsOnly;
     resultsOnly = next;
     syncResultsOnlyCheckbox();
     updateResultsOnlyLayout();
-    currentPage = 0;
+    if (changed) currentPage = 0;
     if (!loaded) {
       applyNativeVisibility();
       showLoadingIndicator(DEFAULT_LOADING_MESSAGE);
