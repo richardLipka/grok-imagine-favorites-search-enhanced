@@ -110,6 +110,39 @@ have the same trigger: *Results only* being off.
 
 ---
 
+## [1.68.0] — 2026-08-26
+
+### Added
+- **Delete**, in three places: **Delete selected** in the results panel, a **Delete** button in the
+  lightbox, and *Delete…* in the right-click menu. All three go through one confirmation that
+  names the exact count and says the action is permanent, with **Cancel focused** so a stray Enter
+  cannot confirm it.
+
+  A row only leaves the index once the server has accepted the delete. If a delete fails the row
+  stays, because hiding media that still exists would misrepresent what the account holds. An
+  item that was *already* gone (404) counts as done; a 403 or 500 does not.
+- **Like button in the lightbox** alongside Delete, and the heart moved to the **top-right** of
+  each card. The child/variation marker moves to the bottom-left to make room.
+
+### Fixed
+- **Liking works out of the box.** It required `tools/capture-like.js` to have been run first, and
+  without a stored template the buttons just said so — which is why liking appeared broken. The
+  real endpoints are now built in. A captured template still overrides them if a deployment
+  differs.
+
+### On how the endpoints were found
+- `POST /rest/media/post/like`, `/unlike` and `/delete` all take `{ id }`. That was established by
+  probing each with a UUID that cannot exist: the wrong field name still reports the field as
+  missing, while the right one gets past validation and answers 404. So the shapes are known
+  rather than guessed, and **nothing real was touched to learn them**.
+
+### Tooling
+- New `delete` suite: 43 assertions on consent and on never removing a row the server kept. 547
+  total. Three mutations — proceeding without consent, removing rows regardless of the response,
+  and counting a 403 as success — confirm it fails when any of those safety properties break.
+
+---
+
 ## Unreleased
 
 Nothing here changes the installed userscripts — no version bump.

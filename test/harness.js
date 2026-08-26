@@ -429,9 +429,51 @@ ${region}
 ${epilogue}`)(storage);
 }
 
+/**
+ * Deleting, which is the only feature that destroys the user's media. The network and the
+ * confirmation are stubbed; what is under test is the orchestration -- that nothing is removed
+ * from the index unless the server accepted it, and that nothing happens at all without consent.
+ */
+function createDeleteSandbox(control = {}) {
+  const region = sliceBetween(readSource(),
+    '  async function deleteRemotePost', '  async function downloadSelectedPosts');
+
+  const prelude = `
+    const POST_DELETE = 'https://grok.com/rest/media/post/delete';
+    const log = { requests: [], statuses: [], removed: [], confirms: [], flushes: 0, filters: 0 };
+
+    async function postJsonWithRetry(url, body, label) {
+      log.requests.push({ url, id: body && body.id, label });
+      const r = (control.responses || {})[body && body.id];
+      return r || { ok: true };
+    }
+    async function confirmDangerousAction(opts) {
+      log.confirms.push(opts);
+      return control.confirm !== false;
+    }
+    function setDownloadStatus(t) { log.statuses.push(t); }
+    function syncDownloadSelectedButtons() {}
+    function applyFilter() { log.filters++; }
+    function createIndexWriter() {
+      return { put() {}, del() {}, async flush() { log.flushes++; return 0; } };
+    }
+    function removeRowsById(ids) { log.removed.push(...ids); return ids.length; }
+    function getSelectedPostsInOrder() { return control.selected || []; }
+  `;
+
+  const epilogue = `
+    return { log, deleteRemotePost, deletePosts, deleteSelectedPosts, deleteSinglePost,
+             get busy() { return deleteInProgress; } };
+  `;
+
+  return new Function('control', `${prelude}
+${region}
+${epilogue}`)(control);
+}
+
 /** The like/unlike request templating helpers (no network, pure shaping). */
 function createLikeSandbox() {
-  const region = sliceBetween(readSource(), '  /** Writes `value` at a dotted/array path', '  function sendLikeRequest');
+  const region = sliceBetween(readSource(), '  /** Writes `value` at a dotted/array path', '  function sendTemplatedLikeRequest');
   return new Function(`${region}
 return { setAtPath, buildLikeRequest };`)();
 }
@@ -459,4 +501,5 @@ module.exports = {
   createIndexSandbox, createGridSandbox, createLikeSandbox, createMetadataSandbox,
   createDownloadSandbox, createBulkDownloadSandbox,
   createFeedSandbox, createNativeVisibilitySandbox, createSearchBarSandbox,
+  createDeleteSandbox,
 };

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.67.2
+// @version      1.68.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -54,6 +54,14 @@
   const ASSETS_SYNC_STALE_PAGES = 3;
   const ASSETS_MAX_PAGES = 2000;
   const POST_GET = 'https://grok.com/rest/media/post/get';
+  /**
+   * Confirmed against the live API by probing with a UUID that cannot exist: each accepts
+   * `{ id }` and answers 404 for an unknown one, so the shape is known rather than guessed and
+   * nothing real was touched to learn it. `unlike` is idempotent and answers 200 either way.
+   */
+  const POST_LIKE = 'https://grok.com/rest/media/post/like';
+  const POST_UNLIKE = 'https://grok.com/rest/media/post/unlike';
+  const POST_DELETE = 'https://grok.com/rest/media/post/delete';
   /** Liked-list pages to walk for metadata (40 posts/page; includes childPosts). */
   const SYNC_LIST_REFRESH_PAGES = 4;
   const SYNC_LIST_PAGE_DELAY_MS = 40;
@@ -91,7 +99,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.67.2';
+  const SCRIPT_VERSION = '1.68.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -986,8 +994,9 @@
     } catch { return null; }
   }
 
+  /** Always available now that the endpoints are known; kept as a hook for future gating. */
   function hasLikeSupport() {
-    return Boolean(readLikeTemplate());
+    return true;
   }
 
   /** Writes `value` at a dotted/array path inside a cloned body. */
@@ -1011,7 +1020,7 @@
     return { url: url.replace('{id}', encodeURIComponent(postId)), body, method: tpl.method || 'POST' };
   }
 
-  function sendLikeRequest(tpl, postId, liked) {
+  function sendTemplatedLikeRequest(tpl, postId, liked) {
     const req = buildLikeRequest(tpl, postId, liked);
     return new Promise(resolve => {
       GM_xmlhttpRequest({
@@ -1026,21 +1035,28 @@
     });
   }
 
+  /**
+   * Uses the endpoints above unless a captured template overrides them. Liking no longer needs
+   * tools/capture-like.js to have been run: the endpoints are known, so the buttons work out of
+   * the box. The template path stays for a deployment where they differ.
+   */
+  async function sendLikeRequest(postId, liked) {
+    const tpl = readLikeTemplate();
+    if (tpl) return sendTemplatedLikeRequest(tpl, postId, liked);
+    const res = await postJsonWithRetry(liked ? POST_LIKE : POST_UNLIKE, { id: postId },
+      liked ? 'like' : 'unlike');
+    return { ok: res.ok, status: res.status ?? 0 };
+  }
+
   /** Optimistic toggle: flips the row, reverts if the request fails. */
   async function setPostLiked(post, liked) {
     if (!post?.id) return false;
-    const tpl = readLikeTemplate();
-    if (!tpl) {
-      flashStampStatus('liking not set up — see tools/capture-like.js');
-      console.warn('[GrokSearch] No like request template stored. Run tools/capture-like.js once to record one.');
-      return false;
-    }
     const previous = post.isLiked ?? null;
     const writer = createIndexWriter();
     writer.put(updatePostRow(normalizePost({ ...post, isLiked: liked })) || post);
     applyFilter();
 
-    const res = await sendLikeRequest(tpl, post.id, liked);
+    const res = await sendLikeRequest(post.id, liked);
     if (!res.ok) {
       writer.put(updatePostRow(normalizePost({ ...post, isLiked: previous })) || post);
       applyFilter();
@@ -3660,6 +3676,11 @@
       bulkDownloadConfirmResolver = resolve;
       const dlg = document.getElementById('grok-bulk-download-confirm');
       const msg = document.getElementById('grok-bulk-download-confirm-message');
+      const titleEl = document.getElementById('grok-bulk-download-confirm-title');
+      const okBtn = dlg?.querySelector('.grok-bulk-download-confirm-ok');
+      // The dialog is shared with the delete confirm, so its wording and styling are reset.
+      if (titleEl) titleEl.textContent = 'Download selected images';
+      if (okBtn) { okBtn.textContent = 'Continue'; okBtn.classList.remove('grok-confirm-danger'); }
       const noun = count === 1 ? 'image' : 'images';
       if (msg) {
         msg.textContent = `This will take some time. You selected ${count} ${noun}. `
@@ -3691,6 +3712,32 @@
    * `dirHandle` is passed on retry so the user is not asked for the folder a second time. The
    * handle stays valid for the lifetime of the page, and the permission is re-checked anyway.
    */
+  /**
+   * Same dialog shell as the bulk-download confirm, worded for an irreversible action. Returns
+   * false unless the user actively confirms -- Escape, the backdrop and Cancel all mean no.
+   */
+  function confirmDangerousAction({ title, message, okLabel }) {
+    ensureBulkDownloadConfirmDialog();
+    return new Promise(resolve => {
+      bulkDownloadConfirmResolver = resolve;
+      const dlg = document.getElementById('grok-bulk-download-confirm');
+      const titleEl = document.getElementById('grok-bulk-download-confirm-title');
+      const msgEl = document.getElementById('grok-bulk-download-confirm-message');
+      const okBtn = dlg?.querySelector('.grok-bulk-download-confirm-ok');
+      if (titleEl) titleEl.textContent = title;
+      if (msgEl) msgEl.textContent = message;
+      if (okBtn) {
+        okBtn.textContent = okLabel || 'Continue';
+        okBtn.classList.add('grok-confirm-danger');
+      }
+      if (dlg) {
+        dlg.hidden = false;
+        // Focus Cancel, not the destructive button, so a stray Enter cannot confirm.
+        dlg.querySelector('.grok-bulk-download-confirm-cancel')?.focus();
+      }
+    });
+  }
+
   async function downloadPostsToFolder(posts, { dirHandle: existingHandle = null } = {}) {
     if (bulkDownloadInProgress) return;
     if (posts.length === 0) return;
@@ -3779,6 +3826,75 @@
     await downloadPostsToFolder(posts, { dirHandle });
   }
 
+  // ─── Delete ─────────────────────────────────────────────────────────────────
+  /**
+   * Deleting is permanent and happens on Grok's side, so every path into it goes through a
+   * confirmation naming the exact count, and nothing is removed from the index until the server
+   * has actually accepted the delete. A failure leaves the row alone rather than hiding media
+   * that still exists.
+   */
+  async function deleteRemotePost(id) {
+    const res = await postJsonWithRetry(POST_DELETE, { id }, 'delete');
+    // A post that is already gone is not a failure; the goal state is reached either way.
+    return res.ok || res.status === 404;
+  }
+
+  let deleteInProgress = false;
+
+  async function deletePosts(posts, { confirmLabel = 'delete' } = {}) {
+    if (deleteInProgress) return { deleted: 0, failed: 0 };
+    const targets = posts.filter(p => p?.id);
+    if (!targets.length) {
+      setDownloadStatus('nothing selected');
+      return { deleted: 0, failed: 0 };
+    }
+    const noun = targets.length === 1 ? 'item' : 'items';
+    const ok = await confirmDangerousAction({
+      title: `Delete ${targets.length} ${noun}`,
+      message: `This permanently deletes ${targets.length} ${noun} from your Grok library. `
+        + 'It cannot be undone, and downloading them first is the only way to keep a copy.',
+      okLabel: `Delete ${targets.length} ${noun}`,
+    });
+    if (!ok) return { deleted: 0, failed: 0 };
+
+    deleteInProgress = true;
+    syncDownloadSelectedButtons();
+    const writer = createIndexWriter();
+    const goneIds = [];
+    let failed = 0;
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        setDownloadStatus(`deleting ${i + 1}/${targets.length}…`, true);
+        if (await deleteRemotePost(targets[i].id)) goneIds.push(targets[i].id);
+        else failed++;
+      }
+      if (goneIds.length) {
+        removeRowsById(goneIds, writer);
+        await writer.flush();
+        applyFilter();
+      }
+      setDownloadStatus(failed === 0
+        ? `deleted ${goneIds.length}`
+        : `deleted ${goneIds.length}, failed ${failed}`);
+    } catch (err) {
+      console.error('[GrokSearch] delete failed:', err);
+      setDownloadStatus('delete failed');
+    } finally {
+      deleteInProgress = false;
+      syncDownloadSelectedButtons();
+    }
+    console.log(`[GrokSearch] Deleted ${goneIds.length} of ${targets.length} (${confirmLabel})`);
+    return { deleted: goneIds.length, failed };
+  }
+
+  async function deleteSelectedPosts() {
+    return deletePosts(getSelectedPostsInOrder(), { confirmLabel: 'selection' });
+  }
+
+  async function deleteSinglePost(post) {
+    return deletePosts([post], { confirmLabel: 'single' });
+  }
+
   async function downloadSelectedPosts() {
     const posts = getSelectedPostsInOrder();
     if (posts.length === 0) {
@@ -3843,6 +3959,7 @@
         label: post.isLiked === true ? 'Unlike' : 'Like',
         disabled: !hasLikeSupport(),
       },
+      { action: 'delete', label: 'Delete\u2026' },
     ];
     const dateKey = formatPostDateKey(post.createTime);
     if (dateKey) {
@@ -3904,6 +4021,9 @@
       case 'toggle-like':
         await togglePostLiked(post);
         break;
+      case 'delete':
+        await deleteSinglePost(post);
+        break;
       case 'filter-date': {
         const dateKey = formatPostDateKey(post.createTime);
         if (dateKey) applyDateFilterForDay(dateKey);
@@ -3945,6 +4065,31 @@
     actions.appendChild(btn);
     bindLightboxDownloadButton();
     ensureLightboxLikeButton(lb);
+    ensureLightboxDeleteButton(lb);
+  }
+
+  function ensureLightboxDeleteButton(lb) {
+    const actions = lb?.querySelector('.grok-lightbox-actions');
+    if (!actions || document.getElementById('grok-lightbox-delete')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'grok-toolbar-btn grok-lightbox-delete-btn';
+    btn.id = 'grok-lightbox-delete';
+    btn.textContent = 'Delete';
+    btn.title = 'Permanently delete this item from your Grok library';
+    actions.appendChild(btn);
+    btn.addEventListener('click', async e => {
+      e.preventDefault();
+      e.stopPropagation();
+      const post = matchedPosts[lightboxIndex];
+      if (!post) return;
+      btn.disabled = true;
+      const res = await deleteSinglePost(post);
+      btn.disabled = false;
+      // The row is gone from matchedPosts, so staying open would show the next item under the
+      // old index. Closing is the honest outcome.
+      if (res.deleted > 0) closeResultLightbox();
+    });
   }
 
   function ensureLightboxLikeButton(lb) {
@@ -5144,7 +5289,8 @@
       .grok-check-all-btn,
       .grok-clear-selection-btn,
       .grok-cancel-download-btn,
-      .grok-retry-download-btn {
+      .grok-retry-download-btn,
+      .grok-delete-selected-btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -5402,10 +5548,11 @@
       .grok-result-card--child {
         box-shadow: inset 0 0 0 2px rgba(139, 92, 246, 0.45);
       }
+      /* The heart owns the top-right corner, so the child marker moves to the bottom-left. */
       .grok-result-child-mark {
         position: absolute;
-        top: 8px;
-        right: 8px;
+        bottom: 8px;
+        left: 8px;
         z-index: 4;
         display: flex;
         align-items: center;
@@ -5811,7 +5958,7 @@
         opacity: 0.35; cursor: default;
       }
       .grok-result-like {
-        position: absolute; bottom: 8px; left: 8px; z-index: 4;
+        position: absolute; top: 8px; right: 8px; z-index: 5;
         display: flex; align-items: center; justify-content: center;
         width: 26px; height: 26px; padding: 0;
         border: none; border-radius: 50%;
@@ -5827,6 +5974,27 @@
       .grok-result-like.is-liked svg { fill: currentColor; stroke: currentColor; }
       .grok-result-like.is-unknown { color: rgba(255,255,255,0.45); }
       .grok-lightbox-like-btn.is-liked { color: #ff4d6d; border-color: rgba(255,77,109,0.5); }
+      .grok-delete-selected-btn:not(:disabled),
+      .grok-lightbox-delete-btn:not(:disabled) {
+        border-color: rgba(248,113,113,0.45);
+        color: rgba(252,165,165,0.95);
+      }
+      .grok-delete-selected-btn:hover:not(:disabled),
+      .grok-lightbox-delete-btn:hover:not(:disabled) {
+        border-color: rgba(248,113,113,0.85);
+        background: rgba(248,113,113,0.18);
+        color: #fff;
+      }
+      .grok-toolbar-btn.grok-confirm-danger {
+        border-color: rgba(248,113,113,0.65);
+        background: rgba(248,113,113,0.18);
+        color: #ffd9d9;
+      }
+      .grok-toolbar-btn.grok-confirm-danger:hover:not(:disabled) {
+        border-color: rgba(248,113,113,0.95);
+        background: rgba(248,113,113,0.3);
+        color: #fff;
+      }
       .grok-filter-model-select {
         font-size: 11px; padding: 2px 6px; margin: 0;
         max-width: 160px;
@@ -6350,6 +6518,13 @@
       'Clear image selection'
     );
 
+    appendSelectionToolbarButton(
+      panelWrap,
+      'grok-delete-selected-btn',
+      'Delete selected',
+      'Permanently delete the selected items from your Grok library'
+    );
+
     // Cancel and Retry live next to Download selected in both bars; they are hidden unless a
     // run is active or the last run left something behind.
     for (const wrap of [toolbarWrap, panelWrap]) {
@@ -6367,6 +6542,15 @@
       );
     }
 
+    document.querySelectorAll('.grok-delete-selected-btn').forEach(btn => {
+      if (btn.dataset.grokDeleteSelectedBound) return;
+      btn.dataset.grokDeleteSelectedBound = '1';
+      btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        deleteSelectedPosts();
+      });
+    });
     document.querySelectorAll('.grok-cancel-download-btn').forEach(btn => {
       if (btn.dataset.grokCancelDownloadBound) return;
       btn.dataset.grokCancelDownloadBound = '1';
@@ -6438,6 +6622,10 @@
     });
     document.querySelectorAll('.grok-clear-selection-btn').forEach(btn => {
       btn.disabled = busy || count === 0;
+    });
+    document.querySelectorAll('.grok-delete-selected-btn').forEach(btn => {
+      btn.disabled = count === 0 || busy || deleteInProgress;
+      btn.textContent = count > 0 ? `Delete selected (${count})` : 'Delete selected';
     });
     document.querySelectorAll('.grok-cancel-download-btn').forEach(btn => {
       btn.hidden = !busy;
