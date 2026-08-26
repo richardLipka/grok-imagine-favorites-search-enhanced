@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.66.1
+// @version      1.66.2
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -73,7 +73,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.66.1';
+  const SCRIPT_VERSION = '1.66.2';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -101,12 +101,23 @@
     'MEDIA_POST_SOURCE_UNSPECIFIED',
     MEDIA_SOURCE_LIKED,
   ];
-  /** Payload fields that have been seen to carry the viewer's like state. */
+  /**
+   * Payload fields that have been seen to carry the viewer's like state.
+   *
+   * `likeStatus` inside `userInteractionStatus` is the one Grok actually sends -- confirmed
+   * against a live response. Until it was on this list every post detected as `null` (unknown),
+   * which *Liked only* excludes, so the filter matched nothing at all. The rest are kept as
+   * fallbacks because the payload shape is not contractual and has changed before.
+   */
   const LIKED_BOOLEAN_FIELDS = [
+    'likeStatus',
     'isLiked', 'liked', 'hasLiked', 'isFavorite', 'isFavorited', 'favorited',
     'likedByUser', 'isLikedByUser', 'userLiked', 'viewerHasLiked',
   ];
-  const LIKED_CONTAINER_FIELDS = ['viewerState', 'viewer', 'interaction', 'interactions', 'userState', 'state'];
+  const LIKED_CONTAINER_FIELDS = [
+    'userInteractionStatus',
+    'viewerState', 'viewer', 'interaction', 'interactions', 'userState', 'state',
+  ];
   /** Request template for like/unlike, captured from Grok's own UI by tools/capture-like.js. */
   const LIKE_REQUEST_KEY = 'grokSearchLikeRequest';
   /** Template recorded by tools/capture-list.js; when present it replaces the guessed source. */

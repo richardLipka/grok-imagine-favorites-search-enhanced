@@ -13,6 +13,11 @@ module.exports = {
     t.equal('alternative field name', m.detectLikedState({ id: 'a', favorited: true }), true);
     t.equal('nested under viewerState', m.detectLikedState({ id: 'a', viewerState: { liked: true } }), true);
     t.equal('nested under interaction', m.detectLikedState({ id: 'a', interaction: { hasLiked: false } }), false);
+    // The shape Grok actually sends, confirmed against a live response.
+    t.equal('userInteractionStatus.likeStatus, liked',
+      m.detectLikedState({ id: 'a', userInteractionStatus: { likeStatus: true } }), true);
+    t.equal('userInteractionStatus.likeStatus, not liked',
+      m.detectLikedState({ id: 'a', userInteractionStatus: { likeStatus: false } }), false);
     t.equal('absent means unknown, not false', m.detectLikedState({ id: 'a' }), null);
     t.equal('non-boolean is ignored', m.detectLikedState({ id: 'a', isLiked: 'yes' }), null);
     t.equal('null payload', m.detectLikedState(null), null);

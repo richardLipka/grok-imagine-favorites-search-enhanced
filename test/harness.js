@@ -50,8 +50,8 @@ function createIndexSandbox() {
     const FULL_INDEX_MAX_PAGES = 2000;
     const RECONCILE_MAX_DELETE_RATIO = 0.5;
     const RECONCILE_LAST_RUN_KEY = 'grokSearchLastReconcileAt';
-    const LIKED_BOOLEAN_FIELDS = ['isLiked','liked','hasLiked','isFavorite','isFavorited','favorited','likedByUser','isLikedByUser','userLiked','viewerHasLiked'];
-    const LIKED_CONTAINER_FIELDS = ['viewerState','viewer','interaction','interactions','userState','state'];
+    const LIKED_BOOLEAN_FIELDS = ['likeStatus','isLiked','liked','hasLiked','isFavorite','isFavorited','favorited','likedByUser','isLikedByUser','userLiked','viewerHasLiked'];
+    const LIKED_CONTAINER_FIELDS = ['userInteractionStatus','viewerState','viewer','interaction','interactions','userState','state'];
 
     let allPosts = [];
     const postById = new Map();

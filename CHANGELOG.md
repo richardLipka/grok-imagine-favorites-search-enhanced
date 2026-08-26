@@ -3,6 +3,20 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.66.2] — 2026-08-26
+
+### Fixed
+- ***Liked only* matched nothing.** `detectLikedState()` sniffs a list of candidate field names,
+  and the one Grok actually sends — `userInteractionStatus.likeStatus` — was not on it. Every post
+  therefore detected as `null` (unknown), which the filter deliberately excludes, so the result was
+  always empty. Confirmed against a live API response rather than guessed.
+
+### Known issue
+- **Media created since roughly June 2026 is not reachable through `/rest/media/post/list` at all**,
+  so it cannot be indexed yet. See the note under Unreleased.
+
+---
+
 ## Unreleased
 
 Nothing here changes the installed userscripts — no version bump.
