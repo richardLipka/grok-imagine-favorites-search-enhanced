@@ -472,10 +472,47 @@ ${epilogue}`)(control);
 }
 
 /** The like/unlike request templating helpers (no network, pure shaping). */
-function createLikeSandbox() {
-  const region = sliceBetween(readSource(), '  /** Writes `value` at a dotted/array path', '  function sendTemplatedLikeRequest');
-  return new Function(`${region}
-return { setAtPath, buildLikeRequest };`)();
+function createLikeSandbox(control = {}) {
+  const src = readSource();
+  const region = sliceBetween(src, '  /** Writes `value` at a dotted/array path', '  function sendTemplatedLikeRequest')
+    + sliceBetween(src, '  let likedCollectionId = null;', '  /** Optimistic toggle');
+
+  const prelude = `
+    const COLLECTION_LIST = 'https://grok.com/rest/media/collection/list';
+    const COLLECTION_ADD = 'https://grok.com/rest/media/collection/assets/add';
+    const COLLECTION_REMOVE = 'https://grok.com/rest/media/collection/assets/remove';
+    const LIKED_COLLECTION_KEY = 'grokSearchLikedCollectionId';
+    const store = Object.assign({}, control.storage);
+    const log = { requests: [], warnings: [] };
+
+    const readStoredString = (k, d = '') => (k in store ? store[k] : d);
+    const writeStoredString = (k, v) => { store[k] = String(v); };
+    function readLikeTemplate() { return control.template || null; }
+    function sendTemplatedLikeRequest(tpl, id, liked) {
+      log.requests.push({ templated: true, url: tpl.url, id, liked });
+      return Promise.resolve({ ok: true, status: 200 });
+    }
+    async function postJsonWithRetry(url, body, label) {
+      log.requests.push({ url, body, label });
+      if (url === COLLECTION_LIST) {
+        return control.collections === null
+          ? { ok: false, status: 500 }
+          : { ok: true, data: { collections: control.collections
+              || [{ id: 'liked-1', name: 'Liked', isDefault: true }] } };
+      }
+      return control.mutate || { ok: true, data: { addedCount: 1, removedCount: 1 } };
+    }
+    const console = { log() {}, warn: m => log.warnings.push(String(m)), error() {} };
+  `;
+
+  const epilogue = `
+    return { setAtPath, buildLikeRequest, pickLikedCollection,
+             resolveLikedCollectionId, sendLikeRequest, log, store };
+  `;
+
+  return new Function('control', `${prelude}
+${region}
+${epilogue}`)(control);
 }
 
 /** The keyed results-grid reconciler, driven against the fake DOM in ./dom.js. */

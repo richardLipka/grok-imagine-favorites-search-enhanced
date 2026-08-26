@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.68.0
+// @version      1.68.1
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -55,13 +55,25 @@
   const ASSETS_MAX_PAGES = 2000;
   const POST_GET = 'https://grok.com/rest/media/post/get';
   /**
-   * Confirmed against the live API by probing with a UUID that cannot exist: each accepts
-   * `{ id }` and answers 404 for an unknown one, so the shape is known rather than guessed and
-   * nothing real was touched to learn it. `unlike` is idempotent and answers 200 either way.
+   * `/rest/media/post/delete` takes `{ id }`. Confirmed by probing with a UUID that cannot exist:
+   * a wrong field name still reports the field missing, the right one gets past validation and
+   * answers 404 -- so the shape is known rather than guessed, and nothing real was touched.
    */
-  const POST_LIKE = 'https://grok.com/rest/media/post/like';
-  const POST_UNLIKE = 'https://grok.com/rest/media/post/unlike';
   const POST_DELETE = 'https://grok.com/rest/media/post/delete';
+
+  /**
+   * Liking is **collection membership**, not a post flag.
+   *
+   * `/rest/media/post/like` still exists and still answers 200, but it does nothing at all --
+   * verified by liking a post through it and re-reading the post, which came back unliked. Grok
+   * moved likes into collections: every account has a default collection named "Liked", and the
+   * heart adds to or removes from it. Both endpoints report how many rows they touched
+   * (`addedCount` / `removedCount`), which is what makes a silent no-op detectable.
+   */
+  const COLLECTION_LIST = 'https://grok.com/rest/media/collection/list';
+  const COLLECTION_ADD = 'https://grok.com/rest/media/collection/assets/add';
+  const COLLECTION_REMOVE = 'https://grok.com/rest/media/collection/assets/remove';
+  const LIKED_COLLECTION_KEY = 'grokSearchLikedCollectionId';
   /** Liked-list pages to walk for metadata (40 posts/page; includes childPosts). */
   const SYNC_LIST_REFRESH_PAGES = 4;
   const SYNC_LIST_PAGE_DELAY_MS = 40;
@@ -99,7 +111,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.68.0';
+  const SCRIPT_VERSION = '1.68.1';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -1035,17 +1047,54 @@
     });
   }
 
+  let likedCollectionId = null;
+
+  /** The default collection is the Liked one; the name is a fallback for a localised account. */
+  function pickLikedCollection(collections) {
+    const list = Array.isArray(collections) ? collections : [];
+    return list.find(c => c?.isDefault === true)
+      || list.find(c => String(c?.name || '').toLowerCase() === 'liked')
+      || null;
+  }
+
+  async function resolveLikedCollectionId({ force = false } = {}) {
+    if (likedCollectionId && !force) return likedCollectionId;
+    const cached = readStoredString(LIKED_COLLECTION_KEY, '');
+    if (cached && !force) {
+      likedCollectionId = cached;
+      return likedCollectionId;
+    }
+    const res = await postJsonWithRetry(COLLECTION_LIST, { limit: 100 }, 'collections');
+    if (!res.ok) return null;
+    const found = pickLikedCollection(res.data?.collections);
+    if (!found?.id) {
+      console.warn('[GrokSearch] No default "Liked" collection found; liking is unavailable.');
+      return null;
+    }
+    likedCollectionId = String(found.id);
+    writeStoredString(LIKED_COLLECTION_KEY, likedCollectionId);
+    return likedCollectionId;
+  }
+
   /**
-   * Uses the endpoints above unless a captured template overrides them. Liking no longer needs
-   * tools/capture-like.js to have been run: the endpoints are known, so the buttons work out of
-   * the box. The template path stays for a deployment where they differ.
+   * Adds to or removes from the Liked collection, unless a captured template overrides it.
+   * `changed` is false when the server accepted the call but touched no rows -- already liked, or
+   * already not. That is still the desired end state, so it counts as success, but it is reported
+   * separately so a genuine no-op is never mistaken for a change.
    */
   async function sendLikeRequest(postId, liked) {
     const tpl = readLikeTemplate();
     if (tpl) return sendTemplatedLikeRequest(tpl, postId, liked);
-    const res = await postJsonWithRetry(liked ? POST_LIKE : POST_UNLIKE, { id: postId },
-      liked ? 'like' : 'unlike');
-    return { ok: res.ok, status: res.status ?? 0 };
+    const collectionId = await resolveLikedCollectionId();
+    if (!collectionId) return { ok: false, status: 0 };
+    const res = await postJsonWithRetry(
+      liked ? COLLECTION_ADD : COLLECTION_REMOVE,
+      { collectionId, assetIds: [postId] },
+      liked ? 'like' : 'unlike'
+    );
+    if (!res.ok) return { ok: false, status: res.status ?? 0 };
+    const touched = Number(liked ? res.data?.addedCount : res.data?.removedCount);
+    return { ok: true, status: 200, changed: Number.isFinite(touched) ? touched > 0 : true };
   }
 
   /** Optimistic toggle: flips the row, reverts if the request fails. */
@@ -1065,6 +1114,9 @@
       return false;
     }
     await writer.flush();
+    if (res.changed === false) {
+      console.log(`[GrokSearch] ${post.id} was already ${liked ? 'liked' : 'unliked'}`);
+    }
     flashStampStatus(liked ? 'liked' : 'unliked');
     return true;
   }

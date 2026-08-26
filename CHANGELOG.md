@@ -143,6 +143,27 @@ have the same trigger: *Results only* being off.
 
 ---
 
+## [1.68.1] — 2026-08-26
+
+### Fixed
+- **Liking really works now.** v1.68.0 called `/rest/media/post/like`, which answers `200` and
+  **does nothing** — caught by liking a post through it and re-reading the post, which came back
+  unliked. Grok moved likes into collections: every account has a default collection named
+  "Liked", and the heart adds to or removes from it via
+  `/rest/media/collection/assets/{add,remove}` with `{ collectionId, assetIds }`. The collection
+  id is resolved once from `collection/list` (by `isDefault`, falling back to the name) and
+  cached.
+
+  Both endpoints report `addedCount` / `removedCount`, so a call that changed nothing is
+  distinguishable from one that did — the exact failure mode that made the previous attempt look
+  like it had worked.
+
+### Tooling
+- 26 more assertions across the `liked` and `delete` suites, 573 total. Three mutations, including
+  one that reports a no-op as a real change and one that picks the wrong collection.
+
+---
+
 ## Unreleased
 
 Nothing here changes the installed userscripts — no version bump.

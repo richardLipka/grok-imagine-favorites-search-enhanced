@@ -105,12 +105,17 @@ module.exports = {
     // ── liking ───────────────────────────────────────────────────────────────────────────
     t.group('like and unlike hit their own endpoints');
     const src = readSource();
-    t.ok('the like endpoint is declared',
-      src.includes("const POST_LIKE = 'https://grok.com/rest/media/post/like';"));
-    t.ok('the unlike endpoint is declared',
-      src.includes("const POST_UNLIKE = 'https://grok.com/rest/media/post/unlike';"));
     t.ok('the delete endpoint is declared',
       src.includes("const POST_DELETE = 'https://grok.com/rest/media/post/delete';"));
+    // Liking is collection membership. /rest/media/post/like answers 200 and does nothing, so
+    // using it would look like it worked while changing nothing at all.
+    t.ok('liking adds to a collection',
+      src.includes("const COLLECTION_ADD = 'https://grok.com/rest/media/collection/assets/add';"));
+    t.ok('unliking removes from it',
+      src.includes("const COLLECTION_REMOVE = 'https://grok.com/rest/media/collection/assets/remove';"));
+    t.ok('the dead post/like endpoint is not used',
+      !src.includes("rest/media/post/like'") && !src.includes("rest/media/post/unlike'"),
+      'the no-op like endpoint is still referenced');
     t.ok('liking no longer requires a captured template',
       /function hasLikeSupport\(\)\s*\{\s*return true;/.test(src.replace(/\n\s*/g, ' ')),
       'hasLikeSupport should be unconditional');

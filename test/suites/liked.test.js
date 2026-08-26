@@ -4,7 +4,7 @@ const { createIndexSandbox, createLikeSandbox } = require('../harness');
 
 module.exports = {
   name: 'liked state — detection, storage, and request templating',
-  run(t) {
+  async run(t) {
     const m = createIndexSandbox();
 
     t.group('detecting like state on a payload');
@@ -68,6 +68,71 @@ module.exports = {
     const twoUrl = { url: 'https://grok.com/like', unlikeUrl: 'https://grok.com/unlike', body: {}, idPath: ['postId'] };
     t.equal('separate unlike endpoint used', like.buildLikeRequest(twoUrl, 'x', false).url, 'https://grok.com/unlike');
     t.equal('like endpoint used for liking', like.buildLikeRequest(twoUrl, 'x', true).url, 'https://grok.com/like');
+
+    t.group('finding the Liked collection');
+    // Liking is collection membership, not a post flag: /rest/media/post/like answers 200 and
+    // changes nothing, so the heart has to add to the account's default collection instead.
+    t.equal('the default collection wins',
+      like.pickLikedCollection([{ id: 'a', name: 'garden' }, { id: 'b', name: 'x', isDefault: true }])?.id, 'b');
+    t.equal('the name is a fallback for a localised account',
+      like.pickLikedCollection([{ id: 'a', name: 'garden' }, { id: 'c', name: 'Liked' }])?.id, 'c');
+    t.equal('matched case-insensitively',
+      like.pickLikedCollection([{ id: 'c', name: 'LIKED' }])?.id, 'c');
+    t.equal('and nothing matches nothing', like.pickLikedCollection([{ id: 'a', name: 'garden' }]), null);
+    t.equal('a non-array is handled', like.pickLikedCollection(undefined), null);
+
+    t.group('resolving it is cached, not re-fetched');
+    let lk = createLikeSandbox();
+    t.equal('resolved from the API', await lk.resolveLikedCollectionId(), 'liked-1');
+    t.equal('and remembered in storage', lk.store.grokSearchLikedCollectionId, 'liked-1');
+    const before = lk.log.requests.length;
+    await lk.resolveLikedCollectionId();
+    t.equal('a second call costs nothing', lk.log.requests.length, before);
+    lk = createLikeSandbox({ storage: { grokSearchLikedCollectionId: 'cached-1' } });
+    t.equal('a stored id is reused', await lk.resolveLikedCollectionId(), 'cached-1');
+    t.equal('with no request at all', lk.log.requests.length, 0);
+
+    t.group('liking adds to the collection, unliking removes');
+    lk = createLikeSandbox();
+    let r = await lk.sendLikeRequest('abc', true);
+    t.equal('the add endpoint is used',
+      lk.log.requests.at(-1).url, 'https://grok.com/rest/media/collection/assets/add');
+    t.equal('with the collection id', lk.log.requests.at(-1).body.collectionId, 'liked-1');
+    t.equal('and the asset in an array', lk.log.requests.at(-1).body.assetIds.join(), 'abc');
+    t.ok('it reports success', r.ok && r.changed, r);
+    lk = createLikeSandbox();
+    await lk.sendLikeRequest('abc', false);
+    t.equal('the remove endpoint is used for unlike',
+      lk.log.requests.at(-1).url, 'https://grok.com/rest/media/collection/assets/remove');
+
+    t.group('a call that touched nothing is reported as unchanged');
+    lk = createLikeSandbox({ mutate: { ok: true, data: { addedCount: 0 } } });
+    r = await lk.sendLikeRequest('abc', true);
+    t.ok('still a success, since the end state is right', r.ok, r);
+    t.equal('but flagged as no change', r.changed, false);
+    lk = createLikeSandbox({ mutate: { ok: true, data: { removedCount: 0 } } });
+    t.equal('same for unlike', (await lk.sendLikeRequest('abc', false)).changed, false);
+    lk = createLikeSandbox({ mutate: { ok: true, data: {} } });
+    t.equal('a response with no count is assumed to have worked',
+      (await lk.sendLikeRequest('abc', true)).changed, true);
+
+    t.group('failures are surfaced, not swallowed');
+    lk = createLikeSandbox({ mutate: { ok: false, status: 500 } });
+    r = await lk.sendLikeRequest('abc', true);
+    t.ok('a failed mutation is not ok', !r.ok, r);
+    t.equal('with the status', r.status, 500);
+    lk = createLikeSandbox({ collections: null });
+    r = await lk.sendLikeRequest('abc', true);
+    t.ok('an unreachable collection list means no like', !r.ok, r);
+    lk = createLikeSandbox({ collections: [{ id: 'a', name: 'garden' }] });
+    r = await lk.sendLikeRequest('abc', true);
+    t.ok('so does an account with no Liked collection', !r.ok, r);
+    t.ok('and it says why', lk.log.warnings.some(w => /Liked/.test(w)), lk.log.warnings);
+
+    t.group('a captured template still wins');
+    lk = createLikeSandbox({ template: { url: 'https://grok.com/custom', body: {}, idPath: ['postId'] } });
+    await lk.sendLikeRequest('abc', true);
+    t.ok('the collection endpoints are bypassed', lk.log.requests.at(-1).templated === true, lk.log.requests);
 
     t.group('missing likedPath');
     const noFlag = { url: 'https://grok.com/like', body: { postId: '' }, idPath: ['postId'], likedPath: null };
