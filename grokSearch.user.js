@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.66.2
+// @version      1.67.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -35,6 +35,24 @@
   const GRID_SIZE_MIN_PCT = 10;
   const GRID_SIZE_MAX_PCT = 200;
   const ENDPOINT = 'https://grok.com/rest/media/post/list';
+  /**
+   * The asset feed the current Grok UI builds its library from. Unlike media/post/list it is
+   * genuinely ordered newest-first, it reaches today, and every row already carries the prompt
+   * and model -- so indexing costs one request per 60 items and nothing per item.
+   */
+  const ASSETS_ENDPOINT = 'https://grok.com/rest/assets';
+  const ASSETS_WORKSPACE = 'WORKSPACE_KIND_IMAGINE_ALL';
+  /** The server caps a page at 60 however much is asked for. */
+  const ASSETS_PAGE_SIZE = 60;
+  /** Media is served straight off this host under the asset's storage key; no signing needed. */
+  const ASSET_CDN_BASE = 'https://assets.grok.com/';
+  /**
+   * The feed is ordered, so a sync can stop once it stops seeing anything new. It takes this
+   * many consecutive all-known pages to call it, rather than one, because a deleted asset or a
+   * clock skew can produce a single stale-looking page mid-run.
+   */
+  const ASSETS_SYNC_STALE_PAGES = 3;
+  const ASSETS_MAX_PAGES = 2000;
   const POST_GET = 'https://grok.com/rest/media/post/get';
   /** Liked-list pages to walk for metadata (40 posts/page; includes childPosts). */
   const SYNC_LIST_REFRESH_PAGES = 4;
@@ -73,7 +91,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.66.2';
+  const SCRIPT_VERSION = '1.67.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -624,6 +642,9 @@
       childVideoCount: post.childVideoCount ?? 0,
       videoCount: post.videoCount ?? 0,
       isLiked: typeof post.isLiked === 'boolean' ? post.isLiked : null,
+      // Which generation an asset came from. Siblings of a multi-image generation share it,
+      // which is the grouping the asset feed offers in place of a parent/child tree.
+      conversationId: String(post.conversationId || ''),
     };
     if (post[METADATA_REFRESH_KEY] != null) {
       row[METADATA_REFRESH_KEY] = post[METADATA_REFRESH_KEY];
@@ -1104,6 +1125,7 @@
       || (before.parentPrompt || '') !== (after.parentPrompt || '')
       || (before.rootId || '') !== (after.rootId || '')
       || (before.rootPrompt || '') !== (after.rootPrompt || '')
+      || (before.conversationId || '') !== (after.conversationId || '')
       || (before.isLiked ?? null) !== (after.isLiked ?? null);
   }
 
@@ -1298,10 +1320,15 @@
     }
 
     const deepUpdatedCount = await refreshPostsViaGet(statusEl);
+
+    // The asset feed is the only path that reaches recently generated media, so it runs on every
+    // sync. It is ordered, so it stops on its own after a few all-known pages.
+    const assets = await syncAssetsFeed(statusEl);
+
     return {
-      newCount,
-      updatedCount: listUpdatedCount + deepUpdatedCount + childSyncCount,
-      failed,
+      newCount: newCount + assets.added,
+      updatedCount: listUpdatedCount + deepUpdatedCount + childSyncCount + assets.updated,
+      failed: failed || assets.failed,
     };
   }
 
@@ -1449,6 +1476,36 @@
       await sleep(SYNC_LIST_PAGE_DELAY_MS);
     }
 
+    // The index is fed by two sources now, so presence has to be judged against both. Without
+    // this the sweep would consider every row that came from the asset feed missing and try to
+    // delete it -- the media/post/list walk cannot see recently generated media at all.
+    if (complete) {
+      let assetToken = null;
+      let assetPages = 0;
+      const seenAssetTokens = new Set();
+      while (assetPages < ASSETS_MAX_PAGES) {
+        const page = await fetchAssetPage(assetToken);
+        if (!page.ok) {
+          console.warn('[GrokSearch] Reconcile: asset walk failed, refusing to delete anything');
+          complete = false;
+          break;
+        }
+        for (const a of page.assets) {
+          if (a?.assetId) remoteIds.add(String(a.assetId));
+        }
+        assetPages++;
+        if (statusEl) setLoadStatus(`verifying… ${remoteIds.size.toLocaleString()}`);
+        if (!page.nextPageToken || seenAssetTokens.has(page.nextPageToken)) break;
+        seenAssetTokens.add(page.nextPageToken);
+        assetToken = page.nextPageToken;
+        await sleep(SYNC_LIST_PAGE_DELAY_MS);
+      }
+      if (assetPages >= ASSETS_MAX_PAGES) {
+        console.warn('[GrokSearch] Reconcile: asset walk hit the page cap, refusing to delete');
+        complete = false;
+      }
+    }
+
     let removed = 0;
     let refusedDelete = 0;
     if (complete) {
@@ -1539,6 +1596,204 @@
     if (Date.now() - last < RECONCILE_INTERVAL_MS) return;
     console.log('[GrokSearch] Running scheduled index reconciliation');
     await runReconcile({ manual: false });
+  }
+
+  // ─── Asset feed ─────────────────────────────────────────────────────────────
+  /**
+   * Grok moved Imagine's library off media/post/list. That endpoint still answers, but it is
+   * unordered (two identical calls return different samples), it returns no child trees, and
+   * nothing created since roughly June 2026 appears in it at all -- which is why newly generated
+   * images stopped being indexed.
+   *
+   * /rest/assets is what the current UI actually paginates. It is ordered by create time,
+   * descending, and each row carries everything a index row needs, so there is no per-item
+   * request: the prompt and model come from `mediaGenInput`, and the media URL is the asset's
+   * storage `key` under the CDN host.
+   *
+   * `assetId` is the same id space as a media post id, so rows from here merge with rows the old
+   * feed produced instead of duplicating them.
+   */
+  function gmGetJson(url, label) {
+    return new Promise(resolve => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        headers: { Accept: 'application/json' },
+        withCredentials: true,
+        onload: res => {
+          if (res.status < 200 || res.status >= 300) {
+            console.warn(`[GrokSearch] ${label} HTTP ${res.status}`);
+            resolve({ ok: false, status: res.status });
+            return;
+          }
+          try {
+            resolve({ ok: true, data: JSON.parse(res.responseText) });
+          } catch {
+            console.warn(`[GrokSearch] ${label} response was not JSON`);
+            resolve({ ok: false, status: res.status });
+          }
+        },
+        onerror: () => resolve({ ok: false, status: 0 }),
+        ontimeout: () => resolve({ ok: false, status: 0 }),
+      });
+    });
+  }
+
+  function buildAssetsUrl(pageToken) {
+    const qs = new URLSearchParams({
+      pageSize: String(ASSETS_PAGE_SIZE),
+      orderBy: 'ORDER_BY_CREATE_TIME',
+      workspaceKind: ASSETS_WORKSPACE,
+    });
+    if (pageToken) qs.set('pageToken', String(pageToken));
+    return `${ASSETS_ENDPOINT}?${qs.toString()}`;
+  }
+
+  async function fetchAssetPage(pageToken) {
+    const res = await gmGetJson(buildAssetsUrl(pageToken), 'assets');
+    if (!res.ok) return { ok: false, status: res.status };
+    return {
+      ok: true,
+      assets: Array.isArray(res.data?.assets) ? res.data.assets : [],
+      nextPageToken: res.data?.nextPageToken || null,
+    };
+  }
+
+  /** The storage key is a path; each segment is encoded so spaces or unicode cannot break it. */
+  function assetMediaUrl(asset) {
+    const key = String(asset?.key || '');
+    if (!key) return '';
+    return ASSET_CDN_BASE + key.split('/').map(encodeURIComponent).join('/');
+  }
+
+  /**
+   * `mediaGenInput` is a oneof: textToImage, imageToVideo, textToVideo, … Rather than listing
+   * them, take the first branch that carries a prompt, so a new generation mode still indexes.
+   */
+  function assetGenInput(asset) {
+    const gen = asset?.mediaGenInput;
+    if (!gen || typeof gen !== 'object') return null;
+    for (const value of Object.values(gen)) {
+      if (value && typeof value === 'object' && (value.prompt || value.modelName)) return value;
+    }
+    return null;
+  }
+
+  function assetMediaType(asset) {
+    const mime = String(asset?.mimeType || '');
+    if (mime.startsWith('video/')) return 'MEDIA_POST_TYPE_VIDEO';
+    if (mime.startsWith('image/')) return 'MEDIA_POST_TYPE_IMAGE';
+    return '';
+  }
+
+  /** Assets carry no like state; `null` means unknown, which is what the Liked filter expects. */
+  function parseAsset(asset) {
+    const id = String(asset?.assetId || '');
+    if (!id || asset?.isDeleted) return null;
+    const gen = assetGenInput(asset);
+    const url = assetMediaUrl(asset);
+    return {
+      id,
+      prompt: String(gen?.prompt || asset?.summary || ''),
+      thumbnail: url,
+      mediaUrl: url,
+      createTime: String(asset?.createTime || ''),
+      model: String(gen?.modelName || ''),
+      mediaType: assetMediaType(asset),
+      isChild: false,
+      parentId: null,
+      rootId: null,
+      parentPrompt: null,
+      rootPrompt: null,
+      conversationId: String(asset?.sourceConversationId || ''),
+      isLiked: detectLikedState(asset),
+      childPostCount: 0,
+      childImageCount: 0,
+      childVideoCount: 0,
+      videoCount: assetMediaType(asset) === 'MEDIA_POST_TYPE_VIDEO' ? 1 : 0,
+    };
+  }
+
+  /**
+   * Walks the asset feed newest-first and merges what it finds.
+   *
+   * `stopWhenKnown` is what makes the routine sync cheap: because the feed really is ordered,
+   * once ASSETS_SYNC_STALE_PAGES consecutive pages contain nothing new, everything older is
+   * already indexed. A full reindex passes false and walks to the end.
+   */
+  async function syncAssetsFeed(statusEl, { stopWhenKnown = true, label = 'syncing' } = {}) {
+    const writer = createIndexWriter();
+    const fresh = [];
+    let pageToken = null;
+    let pages = 0;
+    let added = 0;
+    let updated = 0;
+    let stalePages = 0;
+    let failed = false;
+    const seenTokens = new Set();
+
+    while (pages < ASSETS_MAX_PAGES) {
+      const page = await fetchAssetPage(pageToken);
+      if (!page.ok) { failed = true; break; }
+      if (!page.assets.length) break;
+
+      let pageNew = 0;
+      for (const raw of page.assets) {
+        const parsed = parseAsset(raw);
+        if (!parsed) continue;
+        const cached = postById.get(parsed.id);
+        if (!cached) {
+          fresh.push(addPostRow(stampMetadataRefreshed(normalizePost(parsed))));
+          pageNew++;
+          added++;
+          continue;
+        }
+        // An existing row may have come from the old feed, which carried child links and like
+        // state the asset feed does not. Keep those rather than blanking them.
+        const merged = normalizePost({
+          ...cached,
+          ...parsed,
+          isChild: cached.isChild,
+          parentId: cached.parentId,
+          rootId: cached.rootId,
+          parentPrompt: cached.parentPrompt,
+          rootPrompt: cached.rootPrompt,
+          childPostCount: cached.childPostCount,
+          childImageCount: cached.childImageCount,
+          childVideoCount: cached.childVideoCount,
+          videoCount: cached.videoCount ?? parsed.videoCount,
+          prompt: parsed.prompt || cached.prompt,
+          isLiked: parsed.isLiked ?? cached.isLiked ?? null,
+        });
+        if (postMetadataChanged(cached, merged)) {
+          writer.put(updatePostRow(merged) || cached);
+          updated++;
+        }
+      }
+
+      pages++;
+      stalePages = pageNew > 0 ? 0 : stalePages + 1;
+      if (statusEl) setLoadStatus(`${label}… +${added} new, ${updated} updated`);
+      if (stopWhenKnown && stalePages >= ASSETS_SYNC_STALE_PAGES) break;
+      if (!page.nextPageToken) break;
+      if (seenTokens.has(page.nextPageToken)) {
+        console.warn('[GrokSearch] Asset walk stopped: repeated page token');
+        break;
+      }
+      seenTokens.add(page.nextPageToken);
+      pageToken = page.nextPageToken;
+      await sleep(SYNC_LIST_PAGE_DELAY_MS);
+    }
+
+    if (fresh.length) {
+      sortAllPostsNewestFirst();
+      for (const row of fresh) writer.put(row);
+    }
+    await writer.flush();
+    if (added || updated) {
+      console.log(`[GrokSearch] Asset feed: +${added} new, ${updated} updated over ${pages} page(s)`);
+    }
+    return { added, updated, pages, failed };
   }
 
   function formatSyncStatusMessage(newCount, refreshedCount) {
@@ -1740,6 +1995,7 @@
           'id', 'prompt', 'parentPrompt', 'parentId', 'rootId', 'rootPrompt', 'isChild',
           'thumbnail', 'mediaUrl', 'createTime', 'model', 'mediaType',
           'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount', 'isLiked',
+          'conversationId',
           METADATA_REFRESH_KEY,
         ],
         posts,
@@ -1808,6 +2064,7 @@
           'id', 'prompt', 'parentPrompt', 'parentId', 'rootId', 'rootPrompt', 'isChild',
           'thumbnail', 'mediaUrl', 'createTime', 'model', 'mediaType',
           'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount', 'isLiked',
+          'conversationId',
           METADATA_REFRESH_KEY,
         ],
         posts,
@@ -1845,6 +2102,12 @@
   }
 
   async function fetchFullIndex(statusEl) {
+    // The asset feed carries everything Grok currently exposes, in order, so it goes first and
+    // is walked to the end. The legacy list pass then follows for the child trees it still has
+    // and the asset feed does not.
+    setLoadStatus('indexing library…');
+    const assets = await syncAssetsFeed(statusEl, { stopWhenKnown: false, label: 'indexing' });
+
     const allFetched = [];
     let cursor = null;
     let pageIndex = 0;
@@ -1883,7 +2146,7 @@
       await dbPutMany(allFetched.slice(i, i + chunkSize));
       if (statusEl) setLoadStatus(`saving… ${Math.min(i + chunkSize, allFetched.length)}/${allFetched.length}`);
     }
-    return allFetched.length;
+    return allFetched.length + assets.added;
   }
 
   const DEFAULT_LOADING_MESSAGE = 'Loading saved posts…';

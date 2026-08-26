@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.user.js` **v1.66.2** · `grokPostSidebar.user.js` **v1.3.1**  
+**Current versions:** `grokSearch.user.js` **v1.67.0** · `grokPostSidebar.user.js` **v1.3.1**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Fork lineage
@@ -14,7 +14,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | **Upstream GitHub fork** this project is based on |
-| **This repo** | Enhanced fork: `grokSearch.user.js` v1.66.2 + `grokPostSidebar.user.js` v1.3.1 |
+| **This repo** | Enhanced fork: `grokSearch.user.js` v1.67.0 + `grokPostSidebar.user.js` v1.3.1 |
 
 ## What is included
 
@@ -301,7 +301,18 @@ If it picks badly, force a re-probe with **Reindex**, or pin one by hand:
 localStorage.setItem('grokSearchMediaSource', 'MEDIA_POST_SOURCE_LIKED'); // or '(none)' for no filter
 ```
 
-### Capturing the library request
+### Where the index comes from
+
+Since v1.67.0 the script reads **`/rest/assets`**, which is what Grok's own library view
+paginates. It is ordered newest-first, reaches the current day, and carries the prompt and model
+inline — so a sync costs one request per 60 images and nothing per image.
+
+The older `/rest/media/post/list` endpoint is still walked afterwards, because it is the only
+place child/variation trees are exposed. On its own it is not enough: it is unordered, and nothing
+generated since roughly June 2026 appears in it at all. If you were missing recent images before
+v1.67.0, that is why.
+
+### Capturing the library request (rarely needed now)
 
 `grokSearch.user.js` walks the same feed API Grok's own page uses, and asks it for the widest
 `filter.source` it can find. That enum is undocumented, so the script probes for it — and if the

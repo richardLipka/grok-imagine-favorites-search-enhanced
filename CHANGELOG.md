@@ -17,6 +17,52 @@ Versions match the `@version` in each userscript header.
 
 ---
 
+## [1.67.0] — 2026-08-26
+
+Newly generated images are indexed again. Diagnosed by driving a real logged-in browser rather
+than reasoning about the code.
+
+**Grok moved Imagine's library off the API this script was built on.** `/rest/media/post/list`
+still answers, but it is unordered (two identical calls return different samples), it returns no
+child trees, and nothing created since roughly June 2026 appears in it at all. The current UI
+paginates `/rest/assets` instead, and that is what the script now walks.
+
+### Added
+- **`/rest/assets` is the primary feed.** `GET /rest/assets?pageSize=60&orderBy=ORDER_BY_CREATE_TIME&workspaceKind=WORKSPACE_KIND_IMAGINE_ALL`
+  is genuinely ordered newest-first and reaches the current day. Each row already carries the
+  prompt and model in `mediaGenInput`, and the media URL is the asset's storage `key` under
+  `assets.grok.com`, so indexing costs **one request per 60 items and nothing per item** — where
+  the old path needed a `post/get` per parent.
+  `assetId` is the same id space as a media post id, so these rows merge with existing ones
+  instead of duplicating them.
+- Because the feed is ordered, the routine sync stops once `ASSETS_SYNC_STALE_PAGES` (3)
+  consecutive pages contain nothing new. A full reindex walks it to the end.
+- `conversationId` on every row. Siblings of one generation share it — an average of 4.8 assets
+  per generation, up to 41 — which is the grouping the asset feed offers in place of a
+  parent/child tree.
+
+### Changed
+- The old list pass still runs, for the child trees it has and the asset feed does not. Rows it
+  created keep their child links, denormalized prompts and like state when the asset feed
+  refreshes them.
+- **Reconciliation now walks both feeds** before deleting anything, and refuses to delete at all
+  if the asset walk fails. Without that it would have considered every asset-feed row missing —
+  the list walk cannot see recent media — and tried to delete it.
+
+### Note on the source probe
+- `filter.source` on the old endpoint is **ignored**, not honoured: `sort: "BANANA"` behaves
+  exactly like `sort: "CREATE_TIME_DESC"`, and every invented `MEDIA_POST_SOURCE_*` returns 200.
+  The v1.66.0 probe was therefore comparing twelve identical requests, and its "beyond likes"
+  ranking picked `(none)` — unordered and childless — over `MEDIA_SOURCE_LIKED`. It no longer
+  matters which it picks, because the asset feed is what reaches current media.
+
+### Tooling
+- New `assets` suite: 52 assertions covering parsing, the ordered early stop, merge-onto-existing,
+  and the reconcile safety property. 467 total. Three mutations — stopping after one stale page,
+  reconcile ignoring the asset feed, and an unencoded storage key — confirm it fails when broken.
+
+---
+
 ## Unreleased
 
 Nothing here changes the installed userscripts — no version bump.

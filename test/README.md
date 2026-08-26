@@ -27,7 +27,7 @@ Eight sandboxes:
 
 | Sandbox | Region | Covers |
 |---------|--------|--------|
-| `createIndexSandbox()` | `isVideoMediaType` → `formatSyncStatusMessage` | Record shape, index mutation, child sync, tree edges, deep-refresh selection, reconciliation |
+| `createIndexSandbox()` | `isVideoMediaType` → `formatSyncStatusMessage` | Record shape, index mutation, child sync, tree edges, deep-refresh selection, the asset feed, reconciliation |
 | `createGridSandbox()` | `renderResultCards` | Keyed results-grid reconciliation, against the fake DOM in [`dom.js`](dom.js) |
 | `createLikeSandbox()` | `setAtPath` → `sendLikeRequest` | Like/unlike request templating (pure shaping, no network) |
 | `createMetadataSandbox()` | `PNG_CRC_TABLE` → `isDownloadableImagePost` | EXIF assembly, PNG text chunks, the WebP RIFF rebuild |
@@ -90,3 +90,6 @@ current suites, each caught:
 | Un-hiding re-derives the element instead of using its marker | 5 in `native-visibility` |
 | The source probe ranks on newest `createTime` again | 3 in `feed` |
 | A captured list template is ignored | 6 in `feed` |
+| The asset sync stops after one all-known page | 2 in `assets` |
+| Reconcile ignores the asset feed | 3 in `assets` |
+| An asset storage key is not URL-encoded | 1 in `assets` |

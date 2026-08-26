@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.66.1, ~6k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokSearch.user.js` (v1.67.0, ~6.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.user.js` (v1.3.1, ~530 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
@@ -110,6 +110,20 @@ session cookies authenticate the request:
   post array and the cursor up by candidate key name plus one level of nesting rather than assuming
   `posts`/`nextCursor`. Same rule as the like button: capture the real request, never invent one.
 - `POST /rest/media/post/get` — single post with the full child tree (used for deep refresh).
+- `GET /rest/assets?pageSize=60&orderBy=ORDER_BY_CREATE_TIME&workspaceKind=WORKSPACE_KIND_IMAGINE_ALL`
+  — **the primary feed since v1.67.0**, and what Grok's own library view paginates. Unlike
+  `post/list` it is genuinely ordered newest-first and reaches the current day, so the sync's
+  "stop once nothing is new" shortcut is sound here and only here. Every row carries the prompt and
+  model in `mediaGenInput` (a oneof — resolve it by shape, not by branch name), and the media URL
+  is the asset's storage `key` under `assets.grok.com`, so there is **no per-item request**.
+  `assetId` is the same id space as a media post id, which is why asset rows merge with list rows
+  rather than duplicating them. `workspaceKind` is validated, unlike `filter.source`.
+
+**`filter.source`, `sort` and `collectionId` on `post/list` are ignored, not honoured.**
+`sort: "BANANA"` behaves exactly like `sort: "CREATE_TIME_DESC"`, and every invented
+`MEDIA_POST_SOURCE_*` returns 200 with a plausible payload. Any probe that ranks those candidates
+is comparing identical requests. Verify a parameter is real before building on it — send a
+deliberate nonsense value and check it is rejected.
 
 Both go through `postJsonWithRetry()`, which retries `429`/`5xx` with exponential backoff and honours
 `Retry-After`. It always resolves: `ok: false` means the request failed, and callers must never treat

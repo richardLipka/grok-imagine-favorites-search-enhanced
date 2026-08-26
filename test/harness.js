@@ -50,6 +50,12 @@ function createIndexSandbox() {
     const FULL_INDEX_MAX_PAGES = 2000;
     const RECONCILE_MAX_DELETE_RATIO = 0.5;
     const RECONCILE_LAST_RUN_KEY = 'grokSearchLastReconcileAt';
+    const ASSETS_MAX_PAGES = 2000;
+    const ASSETS_ENDPOINT = 'https://grok.com/rest/assets';
+    const ASSETS_WORKSPACE = 'WORKSPACE_KIND_IMAGINE_ALL';
+    const ASSETS_PAGE_SIZE = 60;
+    const ASSET_CDN_BASE = 'https://assets.grok.com/';
+    const ASSETS_SYNC_STALE_PAGES = 3;
     const LIKED_BOOLEAN_FIELDS = ['likeStatus','isLiked','liked','hasLiked','isFavorite','isFavorited','favorited','likedByUser','isLikedByUser','userLiked','viewerHasLiked'];
     const LIKED_CONTAINER_FIELDS = ['userInteractionStatus','viewerState','viewer','interaction','interactions','userState','state'];
 
@@ -79,6 +85,25 @@ function createIndexSandbox() {
     }
     async function dbDeleteMany(ids) { dbCalls.del++; dbCalls.delRows += ids.length; }
 
+    /**
+     * Canned asset-feed pages: [{ assets: [...] } | { fail: true }, ...]. Stubbed at the
+     * transport, so the real fetchAssetPage() and its URL building are what run.
+     */
+    let assetPages = [];
+    function GM_xmlhttpRequest(opts) {
+      const token = new URL(opts.url).searchParams.get('pageToken');
+      const i = token ? Number(token) : 0;
+      const page = assetPages[i];
+      queueMicrotask(() => {
+        if (page && page.fail) { opts.onload({ status: 500, responseText: '' }); return; }
+        opts.onload({ status: 200, responseText: JSON.stringify({
+          assets: page ? page.assets : [],
+          nextPageToken: page && i + 1 < assetPages.length ? String(i + 1) : null,
+        }) });
+      });
+      return { abort() {} };
+    }
+
     /** Canned liked-feed pages: [{ posts: [...] } | { fail: true }, ...] */
     async function fetchPage(cursor) {
       const i = cursor ? Number(cursor) : 0;
@@ -94,6 +119,7 @@ function createIndexSandbox() {
       get allPosts() { return allPosts; },
       postById, knownIds, selectedPostIds, dbCalls, storage,
       setFeedPages(pages) { feedPages = pages; },
+      setAssetPages(pages) { assetPages = pages; },
       get indexRevision() { return indexRevision; },
       toStorageRecord, normalizePost, addPostRow, updatePostRow, rebuildPostIndex,
       createIndexWriter, collectChildRecords, syncChildRecordsForParent,
@@ -102,6 +128,8 @@ function createIndexSandbox() {
       postNeedsDeepRefresh, postHasKnownChildren, stampMetadataRefreshed, detectLikedState,
       pickDeepRefreshTargets, removeRowsById, reconcileLikedIndex, verifyIndexIntegrity,
       getRootIdOf, removeDescendantsOfRoot, buildPromptById, computeSearchText,
+      buildAssetsUrl, fetchAssetPage, assetMediaUrl, assetGenInput, assetMediaType,
+      parseAsset, syncAssetsFeed,
     };
   `;
 
