@@ -61,6 +61,50 @@ module.exports = {
     t.equal('a promptless asset falls back to its summary',
       m.parseAsset(asset('a', { mediaGenInput: null, summary: 'from summary' })).prompt, 'from summary');
 
+    t.group('rows the feed carries but an image index should not');
+    // Grok copies its stock character assets into every account. They have no mediaGenInput, so
+    // they render as blank cards the user never made; the voice files are not images at all.
+    const stock = over => asset('s', { auxKeys: { imagine_official_asset: 'true',
+      duplicated_from_asset_id: 'orig-1' }, mediaGenInput: null, ...over });
+    t.ok('a stock picture is refused', !m.isIndexableAsset(stock({ name: 'Lena-Picture.png' })));
+    t.ok('a stock voice file is refused',
+      !m.isIndexableAsset(stock({ name: 'Michael-Voice.mp3', mimeType: 'audio/mpeg' })));
+    t.ok('audio is refused whoever owns it',
+      !m.isIndexableAsset(asset('a', { mimeType: 'audio/mpeg' })));
+    t.ok('so is anything with no MIME type at all', !m.isIndexableAsset(asset('a', { mimeType: '' })));
+    t.equal('and parseAsset returns null for them', m.parseAsset(stock({})), null);
+
+    t.group('but ordinary rows are kept');
+    t.ok('a generated image', m.isIndexableAsset(asset('a')));
+    t.ok('a generated video', m.isIndexableAsset(asset('a', { mimeType: 'video/mp4' })));
+    // The flag is a string; only the literal 'true' means stock. Presence alone must not exclude.
+    t.ok("auxKeys saying 'false' is not a stock asset",
+      m.isIndexableAsset(asset('a', { auxKeys: { imagine_official_asset: 'false' } })));
+    t.ok('nor is an unrelated auxKey',
+      m.isIndexableAsset(asset('a', { auxKeys: { r_rated: 'true', thumbhash: 'zzz' } })));
+    // The user's own uploads have no mediaGenInput either, and they are genuinely theirs.
+    t.ok('an own upload with no generation input is kept',
+      m.isIndexableAsset(asset('a', { mediaGenInput: null, fileSource: 'IMAGINE_SELF_UPLOAD_FILE_SOURCE' })));
+    t.ok('a deleted asset is still refused', !m.isIndexableAsset(asset('a', { isDeleted: true })));
+
+    t.group('stock assets are skipped by the sync, not merely unrendered');
+    let f = createIndexSandbox();
+    f.setAssetPages([{ assets: [asset('good'), stock({ assetId: 'stock1' }),
+      asset('audio1', { mimeType: 'audio/mpeg' })] }]);
+    await f.syncAssetsFeed(null, { stopWhenKnown: false });
+    t.equal('only the real one is indexed', f.allPosts.map(p => p.id).join(','), 'good');
+
+    t.group('and Verify can clear ones already in the index');
+    f = createIndexSandbox();
+    f.addPostRow(f.normalizePost({ id: 'stock1', prompt: '', createTime: '2026-08-26T00:00:00Z' }));
+    f.addPostRow(f.normalizePost({ id: 'good', prompt: 'keep me', createTime: '2026-08-26T00:00:00Z' }));
+    f.setFeedPages([{ posts: [] }]);
+    f.setAssetPages([{ assets: [asset('good'), stock({ assetId: 'stock1' })] }]);
+    const swept = await f.reconcileLikedIndex(null);
+    t.equal('the stock row is removed', swept.removed, 1);
+    t.ok('and the real one stays', f.postById.has('good') && !f.postById.has('stock1'),
+      [...f.postById.keys()]);
+
     t.group('the request URL');
     const url = new URL(m.buildAssetsUrl(null));
     t.equal('ordered by create time', url.searchParams.get('orderBy'), 'ORDER_BY_CREATE_TIME');
@@ -156,7 +200,7 @@ module.exports = {
       { id: 'legacy1', prompt: 'x', createTime: '2026-01-01T00:00:00Z' },
       { id: 'legacy2', prompt: 'y', createTime: '2026-01-01T00:00:00Z' },
     ] }]);
-    r.setAssetPages([{ assets: [{ assetId: 'assetOnly' }] }]);
+    r.setAssetPages([{ assets: [{ assetId: 'assetOnly', mimeType: 'image/jpeg' }] }]);
     let out = await r.reconcileLikedIndex(null);
     t.equal('nothing is deleted', out.removed, 0);
     t.ok('the asset-only row survives', r.postById.has('assetOnly'), [...r.postById.keys()]);

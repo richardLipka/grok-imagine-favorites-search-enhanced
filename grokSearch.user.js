@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.67.1
+// @version      1.67.2
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -91,7 +91,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.67.1';
+  const SCRIPT_VERSION = '1.67.2';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -1491,7 +1491,9 @@
           break;
         }
         for (const a of page.assets) {
-          if (a?.assetId) remoteIds.add(String(a.assetId));
+          // Same predicate the sync uses. Counting a stock asset as "present" here would make
+          // Verify keep the very rows parseAsset() now refuses to add.
+          if (a?.assetId && isIndexableAsset(a)) remoteIds.add(String(a.assetId));
         }
         assetPages++;
         if (statusEl) setLoadStatus(`verifying… ${remoteIds.size.toLocaleString()}`);
@@ -1686,10 +1688,32 @@
     return '';
   }
 
+  /**
+   * The asset feed carries more than the user's own generated media, and two kinds of row do not
+   * belong in a searchable image index:
+   *
+   * - **Grok's stock character assets** (`Lena-Picture.png`, `Michael-Voice.mp3`, …). They are
+   *   copied into every account -- `auxKeys.duplicated_from_asset_id` points at the original --
+   *   and carry no `mediaGenInput`, so they show up as blank cards the user never made.
+   * - **Anything that is not an image or a video.** The voice files are `audio/mpeg`; rendering
+   *   one in an `<img>` gives an empty card with no way to tell why.
+   *
+   * Checked against 900 live assets: 8 matched, every one a stock `*-Voice.mp3` / `*-Picture.png`,
+   * and no ordinary generated image was caught. Deliberately *not* filtered on: a missing
+   * `mediaGenInput` alone, which would also drop the user's own uploads
+   * (`IMAGINE_SELF_UPLOAD_FILE_SOURCE`), and the `.../content` URL shape, which 4,231 perfectly
+   * good rows in a real index also use.
+   */
+  function isIndexableAsset(asset) {
+    if (!asset || asset.isDeleted) return false;
+    if (String(asset.auxKeys?.imagine_official_asset) === 'true') return false;
+    return /^(image|video)\//.test(String(asset.mimeType || ''));
+  }
+
   /** Assets carry no like state; `null` means unknown, which is what the Liked filter expects. */
   function parseAsset(asset) {
     const id = String(asset?.assetId || '');
-    if (!id || asset?.isDeleted) return null;
+    if (!id || !isIndexableAsset(asset)) return null;
     const gen = assetGenInput(asset);
     const url = assetMediaUrl(asset);
     return {

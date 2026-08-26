@@ -87,6 +87,29 @@ have the same trigger: *Results only* being off.
 
 ---
 
+## [1.67.2] — 2026-08-26
+
+### Fixed
+- **Grok's stock character assets were being indexed.** `Lena-Picture.png`, `Michael-Voice.mp3`
+  and friends are copied into every account (`auxKeys.duplicated_from_asset_id` points at the
+  original) and carry no `mediaGenInput`, so they appeared as blank cards nobody had made — and
+  one of them is an `audio/mpeg` file rendered into an `<img>`, which can only ever be empty.
+  `parseAsset()` now skips any asset flagged `imagine_official_asset: "true"` or whose MIME type
+  is not `image/*` or `video/*`, and the reconciliation walk applies the same rule so **Verify**
+  clears out the ones already indexed.
+
+  Checked against 900 live assets: 8 matched, every one a stock `*-Voice.mp3` / `*-Picture.png`,
+  and no ordinary generated image was caught. Deliberately **not** used as signals: a missing
+  `mediaGenInput`, which would also drop the user's own uploads, and the `.../content` URL shape,
+  which 4,231 perfectly good rows in a real index also use.
+
+### Tooling
+- 14 more assertions in the `assets` suite, 504 total. Three mutations confirm it, including one
+  that keys the stock check on the flag being *present* rather than being `"true"` — the values
+  are strings, and `"false"` is common.
+
+---
+
 ## Unreleased
 
 Nothing here changes the installed userscripts — no version bump.
