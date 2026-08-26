@@ -11,10 +11,10 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.js` (v1.66.1, ~6k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
-| `grokPostSidebar.js` (v1.3.1, ~530 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
+| `grokSearch.user.js` (v1.66.1, ~6k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokPostSidebar.user.js` (v1.3.1, ~530 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
-Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.js` owns the schema (it is the only
+Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
 writer and the only script with `onupgradeneeded`); the sidebar is a read-only consumer that falls back
 to the Grok API when the store is missing.
 
@@ -35,7 +35,7 @@ node test/run.js
 ```
 
 Run it after touching sync, index, or render logic — it is the only verification available without a
-browser. It slices regions out of `grokSearch.js` and runs the real functions against stubs, so a
+browser. It slices regions out of `grokSearch.user.js` and runs the real functions against stubs, so a
 rename or reorder of an anchor function makes it throw `harness: start marker not found`; fix the
 markers in `test/harness.js` rather than deleting the suite. See [test/README.md](test/README.md).
 
@@ -74,7 +74,7 @@ Commit subjects are imperative with the version in parentheses, e.g.
 (`git tag -a v1.63.0`); the repo does not use GitHub Releases. Branch is `main`; `origin` is the
 GitHub fork.
 
-## Architecture of `grokSearch.js`
+## Architecture of `grokSearch.user.js`
 
 One IIFE, no modules; all state lives in module-scope `let`s near the top (`allPosts`, `matchedPosts`,
 `currentPage`, `filter*`, `resultsOnly`, …) and all tunables are `const`s in the same block. Sections
@@ -370,7 +370,7 @@ evict IndexedDB, and `importDatabaseJson()` merges an exported file back in (row
 the ids it contains; nothing is deleted). Import runs rows through `normalizePost()` like any other
 write path, so the derived caches stay correct.
 
-## `grokPostSidebar.js`
+## `grokPostSidebar.user.js`
 
 Same single-IIFE shape, `grok-post-sidebar-*` namespace, its own `injectStyles()`. Extracts the post
 UUID with `POST_ID_RE`, reads the shared index first and the `post/get` API second, then
@@ -379,6 +379,6 @@ caught by wrapping `history.pushState`/`replaceState` (guarded by `window.__grok
 plus `popstate` and a 1.5 s polling fallback; a `refreshSeq` counter discards responses for a post the
 user already navigated away from.
 
-Helpers duplicated from `grokSearch.js` (`isVideoMediaType`, `extractChildMediaCounts`, `escapeHtml`,
+Helpers duplicated from `grokSearch.user.js` (`isVideoMediaType`, `extractChildMediaCounts`, `escapeHtml`,
 `openDB`) are intentional copies — the scripts install independently and cannot share code. Change both
 when the semantics change.

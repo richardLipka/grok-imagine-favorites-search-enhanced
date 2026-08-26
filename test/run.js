@@ -4,7 +4,7 @@
  * Zero-dependency test runner:  node test/run.js  [name-filter]
  *
  * Suites live in ./suites/*.test.js and export { name, run(t) }. They exercise the real code
- * from grokSearch.js — see harness.js for how the userscript's IIFE is sliced apart.
+ * from grokSearch.user.js — see harness.js for how the userscript's IIFE is sliced apart.
  */
 
 const fs = require('fs');
@@ -63,7 +63,7 @@ async function main() {
       failures.push(`${suite.name} › threw ${crashed.message}`);
       console.log(`    ${RED}THREW${OFF} ${crashed.message}`);
       if (!/^harness:/.test(crashed.message)) console.log(crashed.stack);
-      else console.log(`         ${DIM}grokSearch.js moved — update the markers in test/harness.js${OFF}`);
+      else console.log(`         ${DIM}grokSearch.user.js moved — update the markers in test/harness.js${OFF}`);
     }
   }
 

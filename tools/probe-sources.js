@@ -2,7 +2,7 @@
    on https://grok.com/imagine. Read-only: it only issues list queries (limit 5) and prints
    which enum values are accepted and what date range each returns.
 
-   Why: grokSearch.js indexes MEDIA_POST_SOURCE_LIKED only. If your own recent generations
+   Why: grokSearch.user.js indexes MEDIA_POST_SOURCE_LIKED only. If your own recent generations
    are not liked, they are not in that feed. This finds out whether another source exposes
    them, so the script can be taught to index it. */
 (async () => {

@@ -6,8 +6,8 @@
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
 // @supportURL   https://github.com/richardLipka/grok-imagine-favorites-search-enhanced/issues
-// @updateURL    https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokSearch.js
-// @downloadURL  https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokSearch.js
+// @updateURL    https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokSearch.user.js
+// @downloadURL  https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokSearch.user.js
 // @match        https://grok.com/imagine*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
@@ -2785,7 +2785,7 @@
       postUrl: getPostDetailUrl(id),
       source: 'Grok Imagine',
       generator: 'xAI Grok Imagine',
-      taggedBy: `grokSearch.js v${getScriptVersion()}`,
+      taggedBy: `grokSearch.user.js v${getScriptVersion()}`,
       taggedAt: new Date().toISOString(),
     };
     for (const key of Object.keys(fields)) {

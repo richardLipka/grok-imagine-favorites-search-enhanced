@@ -42,6 +42,12 @@ why were sitting in the repo.
   they never appeared and there was no way to run a reconciliation sweep at all. Both paths now run
   a single `ensureSearchBarParts()`.
 
+### Changed
+- **Both scripts are renamed to `grokSearch.user.js` / `grokPostSidebar.user.js`.** Tampermonkey
+  only offers to install a URL whose filename ends in `.user.js`, so without it the install links
+  above just show source. Existing bookmarks to the old raw paths will 404 — use the links in the
+  README.
+
 ### Tooling
 - New `search-bar-parts` suite (16 assertions, 413 total). It asserts the two build paths inject
   the *same set* of controls rather than checking for particular buttons, so it catches the next

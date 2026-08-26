@@ -182,7 +182,7 @@ module.exports = {
     t.equal('and the owning root id', fields.rootId, 'root-1');
     t.equal('like state survives as a boolean', fields.isLiked, true);
     t.equal('the post URL is derived', fields.postUrl, `https://grok.com/imagine/post/${POST.id}`);
-    t.ok('the script version is stamped', String(fields.taggedBy).includes('grokSearch.js'), fields.taggedBy);
+    t.ok('the script version is stamped', String(fields.taggedBy).includes('grokSearch.user.js'), fields.taggedBy);
     const bare = JSON.parse(m.buildPostMetadata({ id: 'x', prompt: 'p' }).json);
     t.ok('empty values are dropped rather than written blank', !('rootPrompt' in bare), bare);
     t.ok('keywords describe the post',

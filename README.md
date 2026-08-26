@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 This repository is an **enhanced fork** of the original *Grok Imagine Favorites Search + Saved Item Pass-Through* idea (author **AnnaLynn**), extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, and related improvements by **Richard Lipka**.
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.js` **v1.66.1** · `grokPostSidebar.js` **v1.3.1**  
+**Current versions:** `grokSearch.user.js` **v1.66.1** · `grokPostSidebar.user.js` **v1.3.1**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Fork lineage
@@ -14,14 +14,14 @@ See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 |--------|--------|
 | [AnnaLynn — Grok Imagine Favorites Search](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) | Original userscript concept (Greasy Fork) |
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | **Upstream GitHub fork** this project is based on |
-| **This repo** | Enhanced fork: `grokSearch.js` v1.66.1 + `grokPostSidebar.js` v1.3.1 |
+| **This repo** | Enhanced fork: `grokSearch.user.js` v1.66.1 + `grokPostSidebar.user.js` v1.3.1 |
 
 ## What is included
 
 | File | Runs on | Purpose |
 |------|---------|---------|
-| **`grokSearch.js`** | `https://grok.com/imagine*` (not post detail URLs) | Search bar, IndexedDB index, results grid/panel, sync, downloads |
-| **`grokPostSidebar.js`** | `https://grok.com/imagine/post/*` | Collapsible sidebar: metadata + prompt on post pages |
+| **`grokSearch.user.js`** | `https://grok.com/imagine*` (not post detail URLs) | Search bar, IndexedDB index, results grid/panel, sync, downloads |
+| **`grokPostSidebar.user.js`** | `https://grok.com/imagine/post/*` | Collapsible sidebar: metadata + prompt on post pages |
 
 Both scripts share the same IndexedDB database: **`GrokSearchIndex`**.
 
@@ -58,8 +58,8 @@ Both scripts share the same IndexedDB database: **`GrokSearchIndex`**.
 
 Open either link with Tampermonkey installed and it will offer to install the script directly:
 
-- Search: **[install `grokSearch.js`](https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokSearch.js)**
-- Sidebar: **[install `grokPostSidebar.js`](https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokPostSidebar.js)**
+- Search: **[install `grokSearch.user.js`](https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokSearch.user.js)**
+- Sidebar: **[install `grokPostSidebar.user.js`](https://raw.githubusercontent.com/richardLipka/grok-imagine-favorites-search-enhanced/main/grokPostSidebar.user.js)**
 
 Then hard-refresh `https://grok.com/imagine` (Ctrl+Shift+R).
 
@@ -117,7 +117,7 @@ Indexing time depends on library size. Leave the tab open until the status finis
 
 ---
 
-## Using search (`grokSearch.js`)
+## Using search (`grokSearch.user.js`)
 
 ### Search bar
 
@@ -224,7 +224,7 @@ downloads, untagged.
 
 ---
 
-## Post sidebar (`grokPostSidebar.js`)
+## Post sidebar (`grokPostSidebar.user.js`)
 
 On `https://grok.com/imagine/post/{uuid}`:
 
@@ -232,7 +232,7 @@ On `https://grok.com/imagine/post/{uuid}`:
 - Uses IndexedDB when available, else Grok **post/get** API.
 - Collapsible like the search bar (bottom-right toggle).
 
-Install together with `grokSearch.js` so the index is shared.
+Install together with `grokSearch.user.js` so the index is shared.
 
 ---
 
@@ -303,7 +303,7 @@ localStorage.setItem('grokSearchMediaSource', 'MEDIA_POST_SOURCE_LIKED'); // or 
 
 ### Capturing the library request
 
-`grokSearch.js` walks the same feed API Grok's own page uses, and asks it for the widest
+`grokSearch.user.js` walks the same feed API Grok's own page uses, and asks it for the widest
 `filter.source` it can find. That enum is undocumented, so the script probes for it — and if the
 deployment only accepts likes-only values, **images you never liked cannot be reached at all**,
 however the probe ranks them. You will see this in the console and the status bar:
@@ -410,7 +410,7 @@ node test/run.js
 ```
 
 No dependencies and no build step — the `.js` files are what ships. The suite runs the real sync,
-index, rendering, download and image-metadata logic from `grokSearch.js` against stubs; see
+index, rendering, download and image-metadata logic from `grokSearch.user.js` against stubs; see
 [test/README.md](test/README.md). Anything needing a browser (IndexedDB, the folder picker, the
 live SPA, CSS) still has to be checked by pasting the script into Tampermonkey.
 

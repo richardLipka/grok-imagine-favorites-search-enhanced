@@ -1,4 +1,4 @@
-/* Teach grokSearch.js which request returns your whole library — paste into the DevTools
+/* Teach grokSearch.user.js which request returns your whole library — paste into the DevTools
    console on grok.com/imagine, then scroll your library so it loads a page or two.
 
    The script guesses `filter.source` because the enum covering everything is undocumented. When
@@ -77,7 +77,7 @@
     if (best && count <= best.count) return;     // keep the request that returns the most
 
     // The cursor key is often absent on the first page, so fall back to plain "cursor" —
-    // grokSearch.js writes it at that path when paginating.
+    // grokSearch.user.js writes it at that path when paginating.
     const cursorPath = findPath(body, CURSOR_KEYS) || ['cursor'];
     const limitPath = findPath(body, LIMIT_KEYS);
 
@@ -112,7 +112,7 @@
       return;
     }
     localStorage.setItem(STORAGE_KEY, JSON.stringify(best.template));
-    console.log('%c✓ Stored. grokSearch.js will now replay this request instead of guessing.',
+    console.log('%c✓ Stored. grokSearch.user.js will now replay this request instead of guessing.',
       'color:#4c4;font-weight:bold');
     console.log(JSON.stringify(best.template, null, 2));
     console.log('%cReload grok.com/imagine and click Reindex to rebuild from it.', 'color:#4af');

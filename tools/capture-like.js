@@ -1,4 +1,4 @@
-/* Teach grokSearch.js how to like a post — paste into the DevTools console on grok.com,
+/* Teach grokSearch.user.js how to like a post — paste into the DevTools console on grok.com,
    then click Grok's OWN like button on any image.
 
    Nothing is guessed: this records the exact request Grok's UI sends and stores it as a
@@ -67,7 +67,7 @@
     };
 
     localStorage.setItem(STORAGE_KEY, JSON.stringify(template));
-    console.log('%c✓ Captured a like request — grokSearch.js can now like posts.', 'color:#4c4;font-weight:bold');
+    console.log('%c✓ Captured a like request — grokSearch.user.js can now like posts.', 'color:#4c4;font-weight:bold');
     console.log(JSON.stringify(template, null, 2));
     console.log('%cReload grok.com/imagine to pick it up. To undo: localStorage.removeItem(\'' + STORAGE_KEY + '\')', 'color:#888');
     cleanup();

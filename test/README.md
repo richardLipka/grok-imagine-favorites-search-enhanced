@@ -14,7 +14,7 @@ Exit code is non-zero if anything fails.
 
 ## Why it works this way
 
-`grokSearch.js` is a single IIFE with no exports. It cannot be `require()`d, and it cannot run
+`grokSearch.user.js` is a single IIFE with no exports. It cannot be `require()`d, and it cannot run
 outside a logged-in `grok.com` page with Tampermonkey — which is exactly why the sync logic
 was historically hard to verify and accumulated silent bugs.
 

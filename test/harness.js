@@ -6,14 +6,14 @@
  * source, evaluates them with stubbed collaborators, and hands the functions back.
  *
  * Nothing here duplicates production logic: every assertion runs the real code from
- * grokSearch.js. If a region marker stops matching, the slice throws with the marker name
+ * grokSearch.user.js. If a region marker stops matching, the slice throws with the marker name
  * rather than failing somewhere confusing later.
  */
 
 const fs = require('fs');
 const path = require('path');
 
-const SOURCE_PATH = path.join(__dirname, '..', 'grokSearch.js');
+const SOURCE_PATH = path.join(__dirname, '..', 'grokSearch.user.js');
 
 function readSource() {
   return fs.readFileSync(SOURCE_PATH, 'utf8');
@@ -23,7 +23,7 @@ function readSource() {
 function sliceBetween(src, startMarker, endMarker) {
   const start = src.indexOf(startMarker);
   if (start < 0) {
-    throw new Error(`harness: start marker not found in grokSearch.js: ${JSON.stringify(startMarker)}`);
+    throw new Error(`harness: start marker not found in grokSearch.user.js: ${JSON.stringify(startMarker)}`);
   }
   const end = src.indexOf(endMarker, start + startMarker.length);
   if (end < 0) {
@@ -373,7 +373,7 @@ function createGridSandbox({ createElement, onRender }) {
   // slice stops at the function it is meant to capture.
   const decl = '  function renderResultCards(';
   const declAt = src.indexOf(decl);
-  if (declAt < 0) throw new Error('harness: renderResultCards not found in grokSearch.js');
+  if (declAt < 0) throw new Error('harness: renderResultCards not found in grokSearch.user.js');
   const region = sliceBetween(src.slice(declAt), decl, '\n  function ');
 
   const factory = new Function(
