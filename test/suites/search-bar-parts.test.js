@@ -84,6 +84,14 @@ module.exports = {
     t.ok('and the download builder no longer creates anything else',
       !/ensureLightboxLikeButton|ensureLightboxDeleteButton/.test(dl), dl);
 
+    // ensureResultLightbox() also has two paths -- reuse an existing lightbox, or build one
+    // from a template that carries Download alone. Both have to run the chain, exactly like
+    // buildSearchBar(). This is the third place the same hazard turned up.
+    const ensureLb = stripComments(sliceBetween(src,
+      '  function ensureResultLightbox() {', '\n  function '));
+    t.equal('both lightbox paths run the chain',
+      (ensureLb.match(/ensureLightboxButtons\(/g) || []).length, 2);
+
     t.group('the controls this actually broke are in the chain');
     for (const [fn, label] of [
       ['ensureImportJsonButton', 'Import JSON'],

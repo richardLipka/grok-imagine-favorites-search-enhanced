@@ -179,6 +179,20 @@ have the same trigger: *Results only* being off.
 
 ---
 
+## [1.68.3] — 2026-08-26
+
+### Fixed
+- **Lightbox Like and Delete still did not appear** after v1.68.2, because
+  `ensureResultLightbox()` has *two* paths as well — reuse an existing lightbox, or build one from
+  a template that carries Download alone — and only the reuse path ran the chain. On a fresh page
+  load the template path is the one taken, so the buttons were never injected. Both paths now run
+  `ensureLightboxButtons()`.
+
+  Third occurrence of one hazard, so it is now written down as an invariant in `CLAUDE.md` and
+  asserted structurally for both builders.
+
+---
+
 ## Unreleased
 
 Nothing here changes the installed userscripts — no version bump.

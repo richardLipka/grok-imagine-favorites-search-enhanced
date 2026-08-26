@@ -305,6 +305,16 @@ This is the fragile part of the codebase and the usual source of bugs:
 - **A `MutationObserver` on `document.body`** detects SPA URL changes (re-`init()` + sync) and re-asserts
   visibility/results after React re-renders, debounced ~350 ms via `scheduleEnforceDisplay()`. Because
   React can rewrite the DOM at any time, injected UI must be re-assertable.
+- **An `ensure*` that guards on one element must never be the thing that creates another, and
+  every builder with a "reuse or create" split must run the same injection chain on both paths.**
+  This exact hazard has now caused three separate invisible-control bugs: **Import JSON** and
+  **Verify** missing on a fresh install (v1.66.1), and lightbox **Like**/**Delete** missing twice
+  over (v1.68.2) — once because they were chained off `ensureLightboxDownloadButton()`, which
+  returns early since Download is in the template, and once because
+  `ensureResultLightbox()`'s fresh-build path did not call the chain at all. Nothing fails loudly
+  when this happens; the control is simply absent. `ensureSearchBarParts()` and
+  `ensureLightboxButtons()` are the single chains, and `test/suites/search-bar-parts.test.js`
+  asserts structurally that both paths of each builder call them.
 - **All DOM builders are idempotent** — `ensureX()` creates-or-returns, `migrateX()` upgrades a search
   bar built by an older script version that is still in the DOM. `buildSearchBar()` detects an existing
   `#grok-search-wrap` and runs the whole `ensure*`/`migrate*` chain instead of rebuilding. New UI added
