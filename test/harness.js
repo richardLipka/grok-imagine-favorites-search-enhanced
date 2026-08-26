@@ -387,6 +387,48 @@ function createNativeVisibilitySandbox({ document, grid = null, root = null }) {
   return new Function('document', 'grid', 'root', `${prelude}\n${region}\n${epilogue}`)(document, grid, root);
 }
 
+/**
+ * Collapsing and expanding the search bar, which owns the *Results only* preference. The DOM is
+ * stubbed away entirely; what matters here is which writes reach storage.
+ */
+function createSearchBarSandbox(storage = {}) {
+  const src = readSource();
+  const region = sliceBetween(src, '  function getStoredResultsOnly', '  function syncResultsOnlyCheckbox')
+    + sliceBetween(src, '  function setSearchBarExpanded(', '  function patchSearchBarCollapseStyles');
+
+  const prelude = `
+    const RESULTS_ONLY_KEY = 'grokSearchResultsOnly';
+    const SEARCH_BAR_COLLAPSED_KEY = 'grokSearchBarCollapsed';
+    const store = Object.assign({}, storage);
+    const log = { forced: [], hides: 0, nativeApplies: 0 };
+
+    let resultsOnly = true;
+    let searchBarExpanded = true;
+
+    const localStorage = {
+      getItem: k => (Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null),
+      setItem: (k, v) => { store[k] = String(v); },
+    };
+    function setResultsOnlyEnabled(v) { resultsOnly = Boolean(v); log.forced.push(resultsOnly); }
+    function hideAllSearchResults() { log.hides++; }
+    function applyNativeVisibility() { log.nativeApplies++; }
+    const document = { getElementById: () => null };
+  `;
+
+  const epilogue = `
+    return {
+      store, log, setSearchBarExpanded, getStoredResultsOnly,
+      get resultsOnly() { return resultsOnly; },
+      get searchBarExpanded() { return searchBarExpanded; },
+      setResultsOnly(v) { resultsOnly = Boolean(v); },
+    };
+  `;
+
+  return new Function('storage', `${prelude}
+${region}
+${epilogue}`)(storage);
+}
+
 /** The like/unlike request templating helpers (no network, pure shaping). */
 function createLikeSandbox() {
   const region = sliceBetween(readSource(), '  /** Writes `value` at a dotted/array path', '  function sendLikeRequest');
@@ -416,5 +458,5 @@ module.exports = {
   SOURCE_PATH, readSource, sliceBetween,
   createIndexSandbox, createGridSandbox, createLikeSandbox, createMetadataSandbox,
   createDownloadSandbox, createBulkDownloadSandbox,
-  createFeedSandbox, createNativeVisibilitySandbox,
+  createFeedSandbox, createNativeVisibilitySandbox, createSearchBarSandbox,
 };

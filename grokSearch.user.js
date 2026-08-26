@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.67.0
+// @version      1.67.1
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       AnnaLynn (original), Richard Lipka (enhanced fork)
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -91,7 +91,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.67.0';
+  const SCRIPT_VERSION = '1.67.1';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -4990,6 +4990,8 @@
         background: rgba(139,92,246,0.15);
         color: #fff;
       }
+      /* Fixed and above the page, so it needs its own surface. Without a background the
+         results floated transparently over Grok's own content and the two interleaved. */
       #grok-inline-results-viewport {
         display: none;
         position: fixed;
@@ -5001,6 +5003,8 @@
         overflow: auto;
         padding: 12px 20px 24px;
         box-sizing: border-box;
+        background: #14141c;
+        border-top: 1px solid rgba(255, 255, 255, 0.14);
         -webkit-overflow-scrolling: touch;
       }
       #grok-search-bar {
@@ -6495,12 +6499,22 @@
     actions.appendChild(btn);
   }
 
+  /**
+   * Collapsing forces `resultsOnly` off at runtime so Grok's own page is left alone, and
+   * expanding restores the user's choice from storage.
+   *
+   * The forced value must never be written back. It used to be: this function saved
+   * `resultsOnly` before clearing it, and `ensureSearchBarToggle()` calls it on every init --
+   * including the re-inits an SPA navigation triggers. So the first collapse stored the real
+   * preference, and the next init, with `resultsOnly` already forced to false, overwrote it
+   * with '0'. Expanding then restored that '0' and *Results only* stayed off for good, which
+   * left the script rendering nothing until a filter was typed.
+   *
+   * Only the checkbox handler writes RESULTS_ONLY_KEY, because only a click is a preference.
+   */
   function setSearchBarExpanded(expanded) {
     searchBarExpanded = expanded;
     if (!expanded) {
-      try {
-        localStorage.setItem(RESULTS_ONLY_KEY, resultsOnly ? '1' : '0');
-      } catch { /* ignore */ }
       setResultsOnlyEnabled(false);
       hideAllSearchResults();
       applyNativeVisibility();

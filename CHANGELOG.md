@@ -63,6 +63,30 @@ paginates `/rest/assets` instead, and that is what the script now walks.
 
 ---
 
+## [1.67.1] — 2026-08-26
+
+Two display faults, both long-standing rather than new, and both reported together because they
+have the same trigger: *Results only* being off.
+
+### Fixed
+- **Collapsing the search bar destroyed the *Results only* preference.** `setSearchBarExpanded()`
+  forces the flag off while collapsed, and it used to save the flag to storage first. But
+  `ensureSearchBarToggle()` runs on every init, including the re-inits an SPA navigation triggers
+  — so the first collapse stored the real preference and the *next* init, with the flag already
+  forced off, overwrote it with `'0'`. Expanding restored that `'0'`, and from then on the script
+  rendered **nothing until a filter was typed**. Only the checkbox handler writes the key now,
+  because only a click is a preference.
+- **The inline results viewport had no background.** It is `position: fixed` above Grok's own
+  page, so with *Results only* off the results and the page underneath interleaved. It now paints
+  its own surface, matching the results panel.
+
+### Tooling
+- New `search-bar-state` suite: 23 assertions, including a five-cycle collapse/expand round trip
+  in both directions. 490 total. Two mutations — restoring the write-back, and removing the
+  background — confirm it fails when either regresses.
+
+---
+
 ## Unreleased
 
 Nothing here changes the installed userscripts — no version bump.
