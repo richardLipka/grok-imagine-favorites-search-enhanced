@@ -42,6 +42,46 @@ class FakeElement {
   }
 }
 
+/**
+ * The card/image pair syncCardImage() touches: an `<img>` with attributes, alt, loading, an
+ * inline style string, and a parent that can swap it for another element.
+ */
+class FakeImage {
+  constructor() {
+    this.tag = 'img';
+    this.attrs = new Map();
+    this.alt = '';
+    this.loading = 'lazy';
+    this.className = '';
+    this.style = { cssText: 'width:100%; aspect-ratio:3/4;' };
+    this.card = null;
+  }
+
+  setAttribute(k, v) { this.attrs.set(k, String(v)); }
+  getAttribute(k) { return this.attrs.has(k) ? this.attrs.get(k) : null; }
+
+  replaceWith(next) {
+    if (!this.card) return;
+    next.card = this.card;
+    this.card.img = next;
+    this.card = null;
+  }
+}
+
+/** A card whose only queryable child is its thumbnail. */
+class FakeCard {
+  constructor(src) {
+    this.img = new FakeImage();
+    this.img.card = this;
+    if (src) this.img.setAttribute('src', src);
+  }
+
+  querySelector(sel) {
+    if (sel !== ':scope > img') throw new Error(`FakeCard: unexpected selector ${sel}`);
+    return this.img;
+  }
+}
+
 /** Container pre-filled with cards carrying the given ids. */
 function containerWith(ids = []) {
   const container = new FakeElement();
@@ -94,4 +134,5 @@ function fakeDocument(nodes) {
   };
 }
 
-module.exports = { FakeElement, FakeNode, fakeDocument, containerWith, idsOf };
+module.exports = {
+  FakeImage, FakeCard, FakeElement, FakeNode, fakeDocument, containerWith, idsOf };

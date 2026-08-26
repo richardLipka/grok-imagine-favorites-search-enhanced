@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.68.5, ~6.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokSearch.user.js` (v1.69.0, ~6.4k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.user.js` (v1.3.2, ~530 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
@@ -270,16 +270,52 @@ left the index entirely, so a filter change never clears what the user checked. 
 selection count against a match count has to count the *intersection* (see
 `syncDownloadSelectedButtons`), not `selectedPostIds.size`.
 
+Between `matchedPosts` and the grid sits one more layer: **`getDisplayEntries()`**, which turns
+the flat match set into `{ post, children }` entries — one per card. With **Compact** off that is
+a 1:1 map; with it on, a matched child is folded into the entry of its **outermost** matched
+ancestor. Three things follow, and each of them was a bug first:
+
+- **Paging, the pager, and `updatePanelPageRange()` count entries; everything else still counts
+  posts.** `matchedPosts` is deliberately untouched, because the lightbox, selection, bulk
+  download and delete all index into it.
+- **Fold into the outermost matched ancestor, not the nearest.** Stopping at the first match puts
+  a grandchild inside a parent that is itself folded somewhere else, and that inner entry is never
+  rendered — the row silently vanishes from the grid.
+- **Only fold into an entry that is actually emitted.** A cycle in `parentId` makes everyone
+  someone else’s owner, so nobody is top level; the fallback is a cell of its own.
+
+Entries are cached against the identity *and length* of `matchedPosts` plus the compact flag.
+`applyFilter()` also invalidates explicitly — the identity check is the safety net for paths that
+mutate the array in place.
+
+The render path goes through `getDisplayCount()` / `getDisplayPage(start, size)`, **not**
+`getDisplayEntries()`. With compact off those two never build the full list, because it would be a
+1:1 wrapper around the whole match set — an object per indexed post, rebuilt on every keystroke.
+Only the page being rendered gets wrapped.
+
+Because folded children have no checkbox, the parent card carries `data-group` (its own id plus
+every folded child id) and the grid’s `change` handler selects the whole group from it.
+
 `renderResultCards()` reconciles the grid against the page **by post id**, reusing card elements and
 patching only the fields that differ — notably assigning `img.src` only when it changed, so paging no
 longer makes the browser re-decode every thumbnail. Consequences for anyone editing card markup:
 
+- `renderResultCard(card, entry)` takes an **entry**, not a post — `entry.post` and
+  `entry.children`.
 - The skeleton is built once in `createResultCardElement()`; optional parts (child mark, date badge,
   badges) always exist and are toggled with `[hidden]`. The card CSS sets `display: flex` on some of
   them, so `.grok-result-card [hidden] { display: none !important; }` is what makes the attribute
   work — don't drop it.
 - Cards persist across renders, so anything stateful must be set explicitly on every pass in
   `renderResultCard()`. Nothing may rely on a fresh element.
+- **The thumbnail is the exception: a card recycled for a different post gets a *new* `<img>`,
+  never a re-pointed one** (`syncCardImage()`). Assigning `src` leaves the previous post’s picture
+  painted until the new one loads, and `loading="lazy"` can defer that indefinitely because the
+  element never leaves and re-enters the viewport — which is how the bottom rows of page 2 stayed
+  showing page 1. A fresh element paints blank rather than wrong and gets a fresh loading state;
+  it is `eager` because paging is a request to see that page, while a fresh card’s first paint
+  stays `lazy`. Use `:scope > img`: the compact strip’s thumbnails are `<img>` elements in the
+  same card.
 
 `syncModelFilterOptions()` rescans the index for distinct models, so it is gated on `indexRevision` —
 bumped by `addPostRow`/`rebuildPostIndex` — rather than running on every filter pass.
@@ -323,6 +359,16 @@ This is the fragile part of the codebase and the usual source of bugs:
   to the `buildSearchBar()` HTML template also needs an `ensure*` function, or users upgrading in place
   will not get it.
 - **Everything injected is namespaced `grok-*`** (ids and classes) and styled only from `injectStyles()`.
+  Note that Grok’s **own** app root also has an id starting with `grok`, so a DevTools probe that
+  filters on `[id^="grok-"]` to exclude this script’s UI silently excludes the entire page. Filter
+  on the specific prefixes instead.
+- **`injectStyles()` is one template literal, so a backtick anywhere in that CSS — including in a
+  comment — ends the string and breaks the whole file.** `test/suites/source-syntax.test.js`
+  parses both scripts to catch it, since every other suite only evaluates sliced regions.
+- **The show/hide button’s corner is a class** (`grok-toggle-tr` …), applied from
+  `applyTogglePosition()` on every init rather than only when the button is created. Both
+  `injectStyles()` and `patchSearchBarCollapseStyles()` define all four, and each rule resets all
+  four offsets — leaving one out lets the previous corner linger.
 - **The toolbar's filter and action groups must stay `flex-wrap: wrap` with a shrinkable
   `min-width: 0`.** Their children are all `flex-shrink: 0`, so a `nowrap` group whose box gets
   squeezed overflows and paints over its neighbour rather than reflowing — that is how v1.63.0 put

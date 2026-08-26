@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.68.5
+// @version      1.69.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -49,6 +49,14 @@
   const PAGE_SIZE_MAX = 300;
   const GRID_SIZE_MIN_PCT = 10;
   const GRID_SIZE_MAX_PCT = 200;
+  /** Corners the show/hide button can sit in, and the one it starts in. */
+  const TOGGLE_POSITIONS = ['tr', 'br', 'tl', 'bl'];
+  const DEFAULT_TOGGLE_POS = 'tr';
+  const DEFAULT_COMPACT_GROUPS = false;
+  /** Child thumbnails a compact card shows before folding the rest into a +N chip. */
+  const COMPACT_CHILD_LIMIT = 8;
+  /** Child links the lightbox lists before folding the rest into a +N chip. */
+  const LIGHTBOX_CHILD_LIMIT = 24;
   const ENDPOINT = 'https://grok.com/rest/media/post/list';
   /**
    * The asset feed the current Grok UI builds its library from. Unlike media/post/list it is
@@ -126,7 +134,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.68.5';
+  const SCRIPT_VERSION = '1.69.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -192,6 +200,8 @@
   const SORT_KEY = 'grokSearchSort';
   const PAGE_SIZE_KEY = 'grokSearchPageSize';
   const GRID_SIZE_PCT_KEY = 'grokSearchGridSizePct';
+  const COMPACT_GROUPS_KEY = 'grokSearchCompactGroups';
+  const TOGGLE_POS_KEY = 'grokSearchTogglePos';
   const SEARCH_BAR_COLLAPSED_KEY = 'grokSearchBarCollapsed';
   const MEDIA_MIN_OPTIONS = [1, 3, 5, 7, 10];
   /** Wait after last keystroke before filtering (ms); capped at 1s. */
@@ -226,6 +236,16 @@
   let mediaSourceResolved = false;
   let pageSize = DEFAULT_PAGE_SIZE;
   let gridSizePercent = DEFAULT_GRID_SIZE_PCT;
+  let compactGroups = DEFAULT_COMPACT_GROUPS;
+  let togglePosition = DEFAULT_TOGGLE_POS;
+  /** What the grid pages over: one entry per card, `{ post, children }`. See getDisplayEntries(). */
+  let displayEntries = [];
+  let displayEntriesSource = null;
+  let displayEntriesSignature = '';
+  /** parentId -> immediate children; see getChildrenByParent(). */
+  let childrenByParent = new Map();
+  let childrenByParentSource = null;
+  let childrenByParentLength = -1;
   let currentPage = 0;
   let currentSort = 'newest';
   let matchedPosts = [];
@@ -749,6 +769,13 @@
   function updatePostRow(next) {
     const current = postById.get(next.id);
     if (!current) return null;
+    // Rows are updated in place, so a re-parent changes neither the identity nor the length of
+    // `allPosts` -- the two things getChildrenByParent() watches. Nothing re-parents a post today;
+    // this is here so that if anything ever does, the child index does not quietly go stale.
+    if (current.isChild !== next.isChild
+        || String(current.parentId || '') !== String(next.parentId || '')) {
+      childrenByParentSource = null;
+    }
     for (const key of Object.keys(current)) {
       if (!(key in next)) delete current[key];
     }
@@ -2827,9 +2854,17 @@
     return (post?.childPostCount ?? 0) > 0;
   }
 
-  function getAllDescendantPosts(rootId) {
-    const id = String(rootId || '');
-    if (!id) return [];
+  /**
+   * parentId -> its immediate children, over the whole index.
+   *
+   * Cached against the identity and length of `allPosts`, the same shape of check the display
+   * entries use: `removeDescendantsOfRoot()` replaces the array and `addPostRow()` pushes, so
+   * between them every structural change moves one or the other.
+   */
+  function getChildrenByParent() {
+    if (childrenByParentSource === allPosts && childrenByParentLength === allPosts.length) {
+      return childrenByParent;
+    }
     const byParent = new Map();
     for (const p of allPosts) {
       if (!p.isChild || !p.parentId) continue;
@@ -2837,6 +2872,18 @@
       if (!byParent.has(parentId)) byParent.set(parentId, []);
       byParent.get(parentId).push(p);
     }
+    childrenByParent = byParent;
+    childrenByParentSource = allPosts;
+    childrenByParentLength = allPosts.length;
+    return byParent;
+  }
+
+  function getAllDescendantPosts(rootId) {
+    const id = String(rootId || '');
+    if (!id) return [];
+    // Walked on every lightbox render now, not just on Download all, so the index is not
+    // rebuilt from scratch per call.
+    const byParent = getChildrenByParent();
     const out = [];
     const seen = new Set([id]);
     const walk = parentId => {
@@ -4145,6 +4192,65 @@
     ensureLightboxDownloadButton(lb);
     ensureLightboxLikeButton(lb);
     ensureLightboxDeleteButton(lb);
+    ensureLightboxChildRow(lb);
+  }
+
+  /**
+   * The row of links to a parent's children, under the prompt.
+   *
+   * Each is a real <a> to the post page, so ctrl-click and middle-click do what the browser
+   * always does with a link. A plain left click is intercepted only when the child is somewhere
+   * in the current result set — then it moves the lightbox instead of leaving the page.
+   */
+  function ensureLightboxChildRow(lb) {
+    const meta = lb?.querySelector('.grok-lightbox-meta');
+    if (!meta || document.getElementById('grok-lightbox-kids')) return;
+    const row = document.createElement('div');
+    row.id = 'grok-lightbox-kids';
+    row.className = 'grok-lightbox-kids';
+    row.hidden = true;
+    meta.appendChild(row);
+    row.addEventListener('click', e => {
+      const link = e.target.closest('.grok-lightbox-kid');
+      if (!link) return;
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+      const idx = matchedPosts.findIndex(p => p.id === link.dataset.id);
+      if (idx < 0) return;                     // filtered out — let the link open the post page
+      e.preventDefault();
+      lightboxIndex = idx;
+      renderResultLightbox();
+    });
+  }
+
+  function renderLightboxChildRow(post) {
+    const row = document.getElementById('grok-lightbox-kids');
+    if (!row) return;
+    const kids = post ? getAllDescendantPosts(post.id) : [];
+    if (!kids.length) {
+      if (row.dataset.sig !== '') {
+        row.dataset.sig = '';
+        row.innerHTML = '';
+      }
+      row.hidden = true;
+      return;
+    }
+    const shown = kids.slice(0, LIGHTBOX_CHILD_LIMIT);
+    const rest = kids.length - shown.length;
+    const label = `<span class="grok-lightbox-kids-label">${kids.length} child result${kids.length !== 1 ? 's' : ''}</span>`;
+    const links = shown.map(c => `
+      <a class="grok-lightbox-kid" href="${escapeHtml(getPostDetailUrl(c.id))}" data-id="${escapeHtml(c.id)}"
+         target="_blank" rel="noopener" title="${escapeHtml(c.prompt || '')}">
+        <img loading="lazy" src="${escapeHtml(c.thumbnail || '')}" alt="" />
+      </a>`).join('');
+    const more = rest > 0
+      ? `<span class="grok-lightbox-kid-more" title="${rest} more not shown">+${rest}</span>`
+      : '';
+    const html = label + links + more;
+    if (row.dataset.sig !== html) {
+      row.dataset.sig = html;
+      row.innerHTML = html;
+    }
+    row.hidden = false;
   }
 
   function ensureLightboxDeleteButton(lb) {
@@ -4298,6 +4404,7 @@
     if (isChildPost(post)) bits.push('Child post');
     subEl.textContent = bits.join(' · ');
 
+    renderLightboxChildRow(post);
     syncLightboxLikeButton();
     if (prevBtn) prevBtn.disabled = lightboxIndex <= 0;
     if (nextBtn) nextBtn.disabled = lightboxIndex >= matchedPosts.length - 1;
@@ -4407,7 +4514,8 @@
       if (!card || !container.contains(card)) return;
       e.preventDefault();
       e.stopPropagation();
-      const post = getPostById(card.dataset.id);
+      const kid = e.target.closest('.grok-result-kid');
+      const post = getPostById(kid ? kid.dataset.id : card.dataset.id);
       if (!post) return;
       showResultContextMenu(e.clientX, e.clientY, post);
     });
@@ -4417,9 +4525,10 @@
       if (!input || !container.contains(input)) return;
       const id = input.dataset.id;
       if (!id) return;
-      if (input.checked) selectedPostIds.add(id);
-      else selectedPostIds.delete(id);
       const card = input.closest('.grok-result-card');
+      const ids = String(card?.dataset.group || id).split(' ').filter(Boolean);
+      if (input.checked) ids.forEach(x => selectedPostIds.add(x));
+      else ids.forEach(x => selectedPostIds.delete(x));
       if (card) card.classList.toggle('grok-result-card--selected', input.checked);
       syncDownloadSelectedButtons();
     });
@@ -4427,6 +4536,14 @@
     container.addEventListener('click', e => {
       if (e.target.closest('.grok-result-select')) {
         e.stopPropagation();
+        return;
+      }
+      const kid = e.target.closest('.grok-result-kid');
+      if (kid) {
+        e.preventDefault();
+        e.stopPropagation();
+        const kidPost = getPostById(kid.dataset.id);
+        if (kidPost) openResultLightbox(kidPost);
         return;
       }
       const likeBtn = e.target.closest('.grok-result-like');
@@ -4467,10 +4584,9 @@
     hideLoadingIndicator();
 
     const size = getPageSize();
-    const totalPages = Math.max(1, Math.ceil(matchedPosts.length / size));
+    const totalPages = Math.max(1, Math.ceil(getDisplayCount() / size));
     currentPage = Math.max(0, Math.min(currentPage, totalPages - 1));
-    const start = currentPage * size;
-    const page = matchedPosts.slice(start, start + size);
+    const page = getDisplayPage(currentPage * size, size);
 
     applyNativeVisibility();
     updateDisplayMode();
@@ -4563,6 +4679,7 @@
     matchedPosts.sort(currentSort === 'oldest'
       ? (a, b) => -byCreatedDesc(a, b)
       : byCreatedDesc);
+    invalidateDisplayEntries();
 
     pruneSelection();
     syncResultsView();
@@ -4623,6 +4740,10 @@
       countText = `${n} match${matchedPosts.length !== 1 ? 'es' : ''}`;
     } else {
       countText = `${n} saved`;
+    }
+    const groups = getDisplayCount();
+    if (compactGroups && groups !== matchedPosts.length) {
+      countText += ` in ${groups.toLocaleString()} group${groups !== 1 ? 's' : ''}`;
     }
     if (countEl) countEl.textContent = countText;
     const panelCountEl = document.getElementById('grok-panel-count');
@@ -4686,6 +4807,71 @@
       <path d="M6 3v12"/><circle cx="6" cy="18" r="2"/><path d="M18 7v14"/><circle cx="18" cy="5" r="2"/>
     </svg>`;
 
+  /**
+   * The folded children of a compact card. Each thumbnail is its own button so a click can open
+   * that child rather than its parent; the +N chip is inert, so clicking it falls through to the
+   * card and opens the parent, whose lightbox lists every child.
+   */
+  function renderChildStripInner(children) {
+    if (!children.length) return '';
+    const shown = children.slice(0, COMPACT_CHILD_LIMIT);
+    const rest = children.length - shown.length;
+    const thumbs = shown.map(c => `
+      <button type="button" class="grok-result-kid" data-id="${escapeHtml(c.id)}"
+              title="${escapeHtml(c.prompt || '')}" aria-label="Open child result">
+        <img loading="lazy" src="${escapeHtml(c.thumbnail || '')}" alt="" />
+      </button>`).join('');
+    const more = rest > 0
+      ? `<span class="grok-result-kid-more" title="${rest} more — open the parent to see them all">+${rest}</span>`
+      : '';
+    return thumbs + more;
+  }
+
+  /**
+   * Points a card's thumbnail at `thumb`, returning the image element in use.
+   *
+   * When a card is **recycled for a different post** the <img> is replaced rather than
+   * re-pointed. Assigning `src` leaves the previous post's picture painted until the new one has
+   * loaded, and with `loading="lazy"` that wait can be unbounded: the element is already in the
+   * layout and never leaves and re-enters the viewport, so nothing re-triggers the deferred load.
+   * The rows nearest the fold therefore kept showing the page before -- the bottom of page 2 was
+   * still page 1.
+   *
+   * A fresh element fixes both halves. It paints nothing rather than the wrong picture, so the
+   * worst case is a cell that is visibly still loading instead of one that quietly lies; and its
+   * loading state is evaluated when it is inserted, so it cannot inherit a stuck one. The
+   * replacement loads eagerly because paging is an explicit request to see *that* page, while the
+   * first paint of a fresh card stays lazy -- that is the case lazy loading is actually for.
+   *
+   * `:scope > img` matters: the compact strip's thumbnails are `<img>` elements inside this card
+   * too, and a bare `querySelector('img')` only avoids them by DOM order.
+   */
+  function syncCardImage(card, thumb, prompt) {
+    const img = card.querySelector(':scope > img');
+    if (!img) return null;
+
+    const previous = img.getAttribute('src') || '';
+    if (previous === thumb) {
+      if (img.alt !== prompt) img.alt = prompt;
+      return img;
+    }
+    if (!previous) {
+      if (thumb) img.setAttribute('src', thumb);
+      img.alt = prompt;
+      return img;
+    }
+
+    const fresh = document.createElement('img');
+    fresh.loading = 'eager';
+    // Copied rather than restated, so the replacement cannot drift from the skeleton's box.
+    fresh.style.cssText = img.style.cssText;
+    fresh.className = img.className;
+    fresh.alt = prompt;
+    if (thumb) fresh.setAttribute('src', thumb);
+    img.replaceWith(fresh);
+    return fresh;
+  }
+
   /** Skeleton built once per card; renderResultCard() patches the parts that vary. */
   function createResultCardElement() {
     const card = document.createElement('div');
@@ -4699,7 +4885,8 @@
       <div class="grok-result-date" hidden></div>
       <img loading="lazy" style="width:100%; display:block; border-radius:14px; aspect-ratio:3/4; object-fit:cover;" />
       <div class="grok-result-prompt"></div>
-      <div class="grok-result-badges" hidden></div>`;
+      <div class="grok-result-badges" hidden></div>
+      <div class="grok-result-kids" hidden></div>`;
     return card;
   }
 
@@ -4708,7 +4895,9 @@
    * point: rebuilding the grid with innerHTML made the browser re-decode every thumbnail on
    * each page change, filter change, and sort.
    */
-  function renderResultCard(card, post) {
+  function renderResultCard(card, entry) {
+    const post = entry.post;
+    const children = entry.children || [];
     const childCard = isChildPost(post);
     const selected = selectedPostIds.has(post.id);
     const dateKey = formatPostDateKey(post.createTime);
@@ -4720,12 +4909,28 @@
     if (card.dataset.media !== mediaUrl) card.dataset.media = mediaUrl;
     if (card.title !== prompt) card.title = prompt;
     card.classList.toggle('grok-result-card--child', childCard);
+    card.classList.toggle('grok-result-card--group', children.length > 0);
     card.classList.toggle('grok-result-card--selected', selected);
+
+    // Folded children have no checkbox of their own, so the parent's covers the whole group --
+    // otherwise compact mode would make them impossible to select for download or delete.
+    const groupIds = children.length
+      ? [post.id, ...children.map(c => c.id)].join(' ')
+      : post.id;
+    if (card.dataset.group !== groupIds) card.dataset.group = groupIds;
 
     const input = card.querySelector('.grok-result-select-input');
     if (input) {
       if (input.dataset.id !== post.id) input.dataset.id = post.id;
       if (input.checked !== selected) input.checked = selected;
+    }
+
+    const selectLabel = card.querySelector('.grok-result-select');
+    if (selectLabel) {
+      const selectTitle = children.length
+        ? `Select this group (${children.length + 1} items) for download`
+        : 'Select for download';
+      if (selectLabel.title !== selectTitle) selectLabel.title = selectTitle;
     }
 
     const mark = card.querySelector('.grok-result-child-mark');
@@ -4753,12 +4958,7 @@
       }
     }
 
-    const img = card.querySelector('img');
-    if (img) {
-      const thumb = post.thumbnail || '';
-      if (img.getAttribute('src') !== thumb) img.setAttribute('src', thumb);
-      if (img.alt !== prompt) img.alt = prompt;
-    }
+    syncCardImage(card, post.thumbnail || '', prompt);
 
     const promptEl = card.querySelector('.grok-result-prompt');
     if (promptEl && promptEl.textContent !== prompt) promptEl.textContent = prompt;
@@ -4772,9 +4972,22 @@
       }
       badges.hidden = !html;
     }
+
+    const kids = card.querySelector('.grok-result-kids');
+    if (kids) {
+      const html = renderChildStripInner(children);
+      if (kids.dataset.sig !== html) {
+        kids.dataset.sig = html;
+        kids.innerHTML = html;
+      }
+      kids.hidden = !html;
+    }
   }
 
-  /** Reconciles the grid against `page`, reusing cards by id and dropping the leftovers. */
+  /**
+   * Reconciles the grid against `page` — a list of `{ post, children }` entries — reusing cards
+   * by the entry's own post id and dropping the leftovers.
+   */
   function renderResultCards(container, page) {
     const byId = new Map();
     const leftovers = new Set(container.children);
@@ -4784,14 +4997,14 @@
     }
 
     let cursor = container.firstElementChild;
-    for (const post of page) {
-      let card = byId.get(post.id);
-      if (card) byId.delete(post.id);
+    for (const entry of page) {
+      let card = byId.get(entry.post.id);
+      if (card) byId.delete(entry.post.id);
       else card = createResultCardElement();
       leftovers.delete(card);
       if (card === cursor) cursor = cursor.nextElementSibling;
       else container.insertBefore(card, cursor);
-      renderResultCard(card, post);
+      renderResultCard(card, entry);
     }
 
     for (const el of leftovers) el.remove();
@@ -4883,8 +5096,97 @@
     });
   }
 
+  /**
+   * One grid card per *family* when compact mode is on: a matched child is folded into the
+   * nearest matched ancestor instead of taking a cell of its own. Children stay in
+   * `matchedPosts`, so the lightbox, selection, download and delete paths are untouched --
+   * only what the grid pages over changes.
+   *
+   * The nearest matched *ancestor*, not the immediate parent: with "Hide childs" off and a
+   * prompt filter on, a grandchild can match while its own parent does not, and folding it into
+   * the grandparent keeps it visible instead of stranding it in a group nobody rendered.
+   */
+  function buildDisplayEntries() {
+    if (!compactGroups) return matchedPosts.map(post => ({ post, children: [] }));
+
+    const entryById = new Map();
+    for (const post of matchedPosts) entryById.set(post.id, { post, children: [] });
+
+    /**
+     * The *outermost* matched ancestor, not the nearest one. Walking only as far as the first
+     * match folds a grandchild into a parent that is itself folded somewhere else, and that
+     * inner entry is never rendered — the row would vanish from the grid.
+     */
+    const ownerIdOf = post => {
+      let cursor = post;
+      let ownerId = null;
+      const seen = new Set([post.id]);
+      while (isChildPost(cursor) && cursor.parentId) {
+        const parentId = String(cursor.parentId);
+        if (seen.has(parentId)) break;         // a cycle in the tree
+        seen.add(parentId);
+        if (entryById.has(parentId)) ownerId = parentId;
+        const parent = getPostById(parentId);
+        if (!parent) break;                    // chain leaves the index; keep what was found
+        cursor = parent;
+      }
+      return ownerId;
+    };
+
+    const ownerById = new Map();
+    for (const post of matchedPosts) ownerById.set(post.id, ownerIdOf(post));
+
+    const out = [];
+    for (const post of matchedPosts) {
+      // Fold only into a card that is itself rendered. If the owner turns out to be folded too —
+      // which a cycle makes true of everyone — give the row its own cell rather than posting it
+      // into an entry nobody draws.
+      const ownerId = ownerById.get(post.id);
+      if (ownerId && !ownerById.get(ownerId)) entryById.get(ownerId).children.push(post);
+      else out.push(entryById.get(post.id));
+    }
+    return out;
+  }
+
+  /**
+   * Cached until `matchedPosts` is replaced or the compact switch moves. The identity check is
+   * the safety net: applyFilter() invalidates explicitly, but every other path that rebuilds the
+   * match set does so by assigning a fresh array, and that is enough to be noticed here.
+   */
+  function getDisplayEntries() {
+    const signature = `${compactGroups ? 1 : 0}:${matchedPosts.length}`;
+    if (displayEntriesSource !== matchedPosts || displayEntriesSignature !== signature) {
+      displayEntriesSource = matchedPosts;
+      displayEntriesSignature = signature;
+      displayEntries = buildDisplayEntries();
+    }
+    return displayEntries;
+  }
+
+  function invalidateDisplayEntries() {
+    displayEntriesSource = null;
+  }
+
+  /**
+   * How many cards the grid has, and one page of them.
+   *
+   * With compact off these deliberately never touch getDisplayEntries(): the entry list would be
+   * a 1:1 wrapper around the whole match set, and building it would mean allocating an object per
+   * indexed post on every keystroke. Only the page actually rendered gets wrapped.
+   */
+  function getDisplayCount() {
+    return compactGroups ? getDisplayEntries().length : matchedPosts.length;
+  }
+
+  function getDisplayPage(start, size) {
+    if (!compactGroups) {
+      return matchedPosts.slice(start, start + size).map(post => ({ post, children: [] }));
+    }
+    return getDisplayEntries().slice(start, start + size);
+  }
+
   function getTotalPages() {
-    return Math.max(1, Math.ceil(matchedPosts.length / getPageSize()));
+    return Math.max(1, Math.ceil(getDisplayCount() / getPageSize()));
   }
 
   function getPageSize() {
@@ -4903,7 +5205,57 @@
     try {
       localStorage.setItem(PAGE_SIZE_KEY, String(pageSize));
       localStorage.setItem(GRID_SIZE_PCT_KEY, String(gridSizePercent));
+      localStorage.setItem(COMPACT_GROUPS_KEY, compactGroups ? '1' : '0');
+      localStorage.setItem(TOGGLE_POS_KEY, togglePosition);
     } catch { /* ignore */ }
+  }
+
+  function clampTogglePosition(value) {
+    const pos = String(value || '').trim();
+    return TOGGLE_POSITIONS.includes(pos) ? pos : DEFAULT_TOGGLE_POS;
+  }
+
+  function readStoredTogglePosition() {
+    try {
+      return clampTogglePosition(localStorage.getItem(TOGGLE_POS_KEY));
+    } catch {
+      return DEFAULT_TOGGLE_POS;
+    }
+  }
+
+  function readStoredCompactGroups() {
+    try {
+      const stored = localStorage.getItem(COMPACT_GROUPS_KEY);
+      return stored === null || stored === '' ? DEFAULT_COMPACT_GROUPS : stored === '1';
+    } catch {
+      return DEFAULT_COMPACT_GROUPS;
+    }
+  }
+
+  /** Corners are classes, not inline styles, so both copies of the stylesheet agree on them. */
+  function applyTogglePosition(pos, persist) {
+    togglePosition = clampTogglePosition(pos);
+    const btn = document.getElementById('grok-search-toggle');
+    if (btn) {
+      for (const p of TOGGLE_POSITIONS) btn.classList.toggle(`grok-toggle-${p}`, p === togglePosition);
+    }
+    const select = document.getElementById('grok-toggle-pos-select');
+    if (select && select.value !== togglePosition) select.value = togglePosition;
+    if (persist) {
+      try {
+        localStorage.setItem(TOGGLE_POS_KEY, togglePosition);
+      } catch { /* ignore */ }
+    }
+  }
+
+  function applyCompactGroupsSetting(on) {
+    compactGroups = Boolean(on);
+    invalidateDisplayEntries();
+    syncDisplayControlLabels();
+    persistDisplaySettings();
+    currentPage = 0;
+    if (shouldShowSearchResults() && matchedPosts.length > 0) showResults();
+    else updatePager();
   }
 
   function applyPageSizeSetting(newSize, rerender) {
@@ -4926,6 +5278,9 @@
   function applyDisplayDefaults() {
     pageSize = clampPageSize(DEFAULT_PAGE_SIZE);
     gridSizePercent = clampGridSizePercent(DEFAULT_GRID_SIZE_PCT);
+    compactGroups = DEFAULT_COMPACT_GROUPS;
+    invalidateDisplayEntries();
+    applyTogglePosition(DEFAULT_TOGGLE_POS, false);
     syncDisplayControlLabels();
     persistDisplaySettings();
     applyGridLayoutStyles();
@@ -4953,17 +5308,21 @@
     if (gridVal) gridVal.textContent = String(gridSizePercent);
     if (pageSlider) pageSlider.value = String(pageSize);
     if (gridSlider) gridSlider.value = String(gridSizePercent);
+    const compactEl = document.getElementById('grok-compact-groups');
+    if (compactEl && compactEl.checked !== compactGroups) compactEl.checked = compactGroups;
+    const posEl = document.getElementById('grok-toggle-pos-select');
+    if (posEl && posEl.value !== togglePosition) posEl.value = togglePosition;
   }
 
-  function updatePanelPageRange(pagePosts) {
+  function updatePanelPageRange(pageEntries) {
     const rangeEl = document.getElementById('grok-panel-range');
     if (!rangeEl) return;
-    if (!pagePosts.length) {
+    if (!pageEntries.length) {
       rangeEl.textContent = '';
       return;
     }
-    const first = formatPostDateTime(pagePosts[0].createTime);
-    const last = formatPostDateTime(pagePosts[pagePosts.length - 1].createTime);
+    const first = formatPostDateTime(pageEntries[0].post.createTime);
+    const last = formatPostDateTime(pageEntries[pageEntries.length - 1].post.createTime);
     rangeEl.textContent = first === last ? first : `${first} – ${last}`;
   }
 
@@ -5162,8 +5521,8 @@
       }
       #grok-search-toggle {
         position: fixed;
+        top: 70px;
         right: 16px;
-        bottom: 16px;
         z-index: 99991;
         width: 44px;
         height: 44px;
@@ -5189,6 +5548,23 @@
         width: 20px;
         height: 20px;
         flex-shrink: 0;
+      }
+      /* The corner is a class so the preference survives both copies of this stylesheet.
+         Every rule resets the opposite pair, or a stale offset keeps the old corner alive.
+
+         The top corners clear Grok's own header rather than starting at 16px: measured on
+         grok.com/imagine/saved, its Select button ends at x2323 and its search button occupies
+         x2331-2371 at y13-53, so a 44px button at top:16px lands exactly on top of the search
+         control. 70px puts it under the whole header row and over nothing but the grid. */
+      #grok-search-toggle.grok-toggle-tr { top: 70px; right: 16px; bottom: auto; left: auto; }
+      #grok-search-toggle.grok-toggle-br { top: auto; right: 16px; bottom: 16px; left: auto; }
+      #grok-search-toggle.grok-toggle-tl { top: 70px; right: auto; bottom: auto; left: 16px; }
+      #grok-search-toggle.grok-toggle-bl { top: auto; right: auto; bottom: 16px; left: 16px; }
+      /* The bar is min(900px, 92vw) and centred, so below ~1040px its right edge reaches the
+         button and a top corner would sit on the toolbar. Drop to the bottom there. */
+      @media (max-width: 1040px) {
+        #grok-search-toggle.grok-toggle-tr,
+        #grok-search-toggle.grok-toggle-tl { top: auto; bottom: 16px; }
       }
       #grok-results-only-row {
         display: flex;
@@ -5220,6 +5596,24 @@
       }
       .grok-display-control input[type="range"] {
         width: 88px;
+        margin: 0;
+        accent-color: #8b5cf6;
+        cursor: pointer;
+      }
+      .grok-display-select {
+        background: rgba(255,255,255,0.07);
+        border: 1px solid rgba(255,255,255,0.15);
+        border-radius: 7px;
+        color: rgba(255,255,255,0.8);
+        font-size: 11px;
+        padding: 2px 5px;
+        outline: none;
+        cursor: pointer;
+        font-family: inherit;
+      }
+      .grok-display-select:hover { border-color: rgba(139,92,246,0.5); color: #fff; }
+      .grok-display-select option { background: #1a1a2e; color: #fff; }
+      .grok-display-control input[type="checkbox"] {
         margin: 0;
         accent-color: #8b5cf6;
         cursor: pointer;
@@ -5603,6 +5997,10 @@
       #grok-results-grid {
         display: none;
         position: static;
+        /* Cards must keep their own height. A compact card is 39px taller than a plain one, and
+           the grid's default stretch grew every card in the row to match -- leaving the prompt
+           overlay of the plain ones floating below their image over empty card background. */
+        align-items: start;
         grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
         gap: 17px;
         padding: 0;
@@ -5702,6 +6100,61 @@
         box-shadow: inset 0 0 0 2px rgba(139, 92, 246, 0.45), 0 0 0 2px rgba(139, 92, 246, 0.75);
       }
       .grok-result-card:hover { transform: scale(1.03); box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+      /* A compact card is image + strip, so the overlays that hug the bottom of the image have
+         to clear the strip rather than sit on top of it. */
+      .grok-result-kids {
+        display: flex;
+        align-items: center;
+        gap: 3px;
+        padding: 4px 5px;
+        overflow-x: auto;
+        scrollbar-width: none;
+        background: rgba(12, 12, 18, 0.92);
+        border-top: 1px solid rgba(139, 92, 246, 0.28);
+      }
+      .grok-result-kids::-webkit-scrollbar { display: none; }
+      .grok-result-kid {
+        flex: 0 0 auto;
+        width: 30px;
+        height: 30px;
+        padding: 0;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 6px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.06);
+        cursor: pointer;
+        transition: border-color 0.15s, transform 0.15s;
+      }
+      .grok-result-kid:hover {
+        border-color: rgba(196, 181, 253, 0.75);
+        transform: scale(1.12);
+      }
+      .grok-result-kid img {
+        width: 100%;
+        height: 100%;
+        display: block;
+        border-radius: 0;
+        aspect-ratio: auto;
+        object-fit: cover;
+      }
+      .grok-result-kid-more {
+        flex: 0 0 auto;
+        padding: 0 6px;
+        font-size: 10px;
+        font-weight: 600;
+        line-height: 30px;
+        color: rgba(196, 181, 253, 0.9);
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        /* Eight thumbnails never fit a 180px card, so the strip scrolls and an ordinary trailing
+           chip would sit permanently off-screen. Sticky pins it to the visible right edge. */
+        position: sticky;
+        right: 0;
+        background: rgba(12, 12, 18, 0.92);
+        pointer-events: none;
+      }
+      .grok-result-card--group .grok-result-prompt { bottom: 39px; border-radius: 0; }
+      .grok-result-card--group .grok-result-badges { bottom: 47px; }
+      .grok-result-card--group .grok-result-child-mark { bottom: 47px; }
       .grok-result-card--selected:hover {
         box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.75), 0 8px 32px rgba(0,0,0,0.5);
       }
@@ -5961,6 +6414,39 @@
         gap: 8px;
         flex-shrink: 0;
       }
+      .grok-lightbox-kids {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 5px;
+        margin-top: 9px;
+      }
+      .grok-lightbox-kids-label {
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.45);
+        margin-right: 3px;
+      }
+      .grok-lightbox-kid {
+        width: 38px;
+        height: 38px;
+        display: block;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        border-radius: 7px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.06);
+        transition: border-color 0.15s, transform 0.15s;
+      }
+      .grok-lightbox-kid:hover {
+        border-color: rgba(196, 181, 253, 0.8);
+        transform: scale(1.08);
+      }
+      .grok-lightbox-kid img { width: 100%; height: 100%; display: block; object-fit: cover; }
+      .grok-lightbox-kid-more {
+        font-size: 11px;
+        font-weight: 600;
+        color: rgba(196, 181, 253, 0.9);
+        padding: 0 4px;
+      }
       html.grok-lightbox-open { overflow: hidden; }
       #grok-no-results {
         display: none; position: fixed; top: 50%; left: 50%;
@@ -6113,7 +6599,8 @@
     btn.id = 'grok-display-default';
     btn.className = 'grok-display-default-btn';
     btn.textContent = 'Default';
-    btn.title = `Reset to ${DEFAULT_PAGE_SIZE} per page and ${DEFAULT_GRID_SIZE_PCT}% size`;
+    btn.title = `Reset to ${DEFAULT_PAGE_SIZE} per page, ${DEFAULT_GRID_SIZE_PCT}% size, `
+      + 'compact off and the button in the top-right corner';
     row.appendChild(btn);
   }
 
@@ -6142,6 +6629,30 @@
       row.appendChild(sizeCtrl);
     }
 
+    if (!document.getElementById('grok-compact-groups')) {
+      const compact = document.createElement('label');
+      compact.id = 'grok-compact-groups-label';
+      compact.className = 'grok-display-control';
+      compact.title = 'Fold child results into their parent card instead of giving each one its own cell';
+      compact.innerHTML = '<input type="checkbox" id="grok-compact-groups" /> Compact';
+      row.appendChild(compact);
+    }
+    if (!document.getElementById('grok-toggle-pos-select')) {
+      const posCtrl = document.createElement('label');
+      posCtrl.id = 'grok-toggle-pos-label';
+      posCtrl.className = 'grok-display-control';
+      posCtrl.title = 'Corner the show/hide button sits in';
+      posCtrl.innerHTML = `
+        Button
+        <select id="grok-toggle-pos-select" class="grok-display-select">
+          <option value="tr">Top right</option>
+          <option value="br">Bottom right</option>
+          <option value="tl">Top left</option>
+          <option value="bl">Bottom left</option>
+        </select>`;
+      row.appendChild(posCtrl);
+    }
+
     ensureDisplayDefaultButton();
 
     bindDisplayControlListeners();
@@ -6151,9 +6662,8 @@
     const pageSlider = document.getElementById('grok-page-size-slider');
     const gridSlider = document.getElementById('grok-grid-size-slider');
     const defaultBtn = document.getElementById('grok-display-default');
-    if (!pageSlider || !gridSlider) return;
 
-    if (!pageSlider.dataset.grokDisplayBound) {
+    if (pageSlider && gridSlider && !pageSlider.dataset.grokDisplayBound) {
       pageSlider.dataset.grokDisplayBound = '1';
       gridSlider.dataset.grokDisplayBound = '1';
 
@@ -6176,6 +6686,24 @@
     if (defaultBtn && !defaultBtn.dataset.grokDisplayBound) {
       defaultBtn.dataset.grokDisplayBound = '1';
       defaultBtn.addEventListener('click', applyDisplayDefaults);
+    }
+
+    // Each control guards on its own binding flag. Hanging them off the sliders' flag is the
+    // mistake that left Import JSON and Verify missing for a whole release.
+    const compactEl = document.getElementById('grok-compact-groups');
+    if (compactEl && !compactEl.dataset.grokDisplayBound) {
+      compactEl.dataset.grokDisplayBound = '1';
+      compactGroups = readStoredCompactGroups();
+      compactEl.checked = compactGroups;
+      invalidateDisplayEntries();
+      compactEl.addEventListener('change', () => applyCompactGroupsSetting(compactEl.checked));
+    }
+
+    const posEl = document.getElementById('grok-toggle-pos-select');
+    if (posEl && !posEl.dataset.grokDisplayBound) {
+      posEl.dataset.grokDisplayBound = '1';
+      posEl.value = togglePosition;
+      posEl.addEventListener('change', () => applyTogglePosition(posEl.value, true));
     }
   }
 
@@ -6846,7 +7374,7 @@
         opacity: 0; visibility: hidden; pointer-events: none;
       }
       #grok-search-toggle {
-        position: fixed; right: 16px; bottom: 16px; z-index: 99991;
+        position: fixed; top: 70px; right: 16px; z-index: 99991;
         width: 44px; height: 44px; border-radius: 12px;
         border: 1px solid rgba(255,255,255,0.18);
         background: rgba(15,15,20,0.94); color: rgba(255,255,255,0.9);
@@ -6857,6 +7385,23 @@
         border-color: rgba(139,92,246,0.55); background: rgba(139,92,246,0.22); color: #fff;
       }
       #grok-search-toggle svg { width: 20px; height: 20px; }
+      /* The corner is a class so the preference survives both copies of this stylesheet.
+         Every rule resets the opposite pair, or a stale offset keeps the old corner alive.
+
+         The top corners clear Grok's own header rather than starting at 16px: measured on
+         grok.com/imagine/saved, its Select button ends at x2323 and its search button occupies
+         x2331-2371 at y13-53, so a 44px button at top:16px lands exactly on top of the search
+         control. 70px puts it under the whole header row and over nothing but the grid. */
+      #grok-search-toggle.grok-toggle-tr { top: 70px; right: 16px; bottom: auto; left: auto; }
+      #grok-search-toggle.grok-toggle-br { top: auto; right: 16px; bottom: 16px; left: auto; }
+      #grok-search-toggle.grok-toggle-tl { top: 70px; right: auto; bottom: auto; left: 16px; }
+      #grok-search-toggle.grok-toggle-bl { top: auto; right: auto; bottom: 16px; left: 16px; }
+      /* The bar is min(900px, 92vw) and centred, so below ~1040px its right edge reaches the
+         button and a top corner would sit on the toolbar. Drop to the bottom there. */
+      @media (max-width: 1040px) {
+        #grok-search-toggle.grok-toggle-tr,
+        #grok-search-toggle.grok-toggle-tl { top: auto; bottom: 16px; }
+      }
     `;
     document.head.appendChild(s);
   }
@@ -6880,6 +7425,10 @@
       btn.addEventListener('click', () => setSearchBarExpanded(!searchBarExpanded));
       document.body.appendChild(btn);
     }
+    // Outside the guard on purpose: an SPA re-init finds the button already there, and the
+    // corner class still has to be on it.
+    togglePosition = readStoredTogglePosition();
+    applyTogglePosition(togglePosition, false);
     searchBarExpanded = readSearchBarExpandedFromStorage();
     setSearchBarExpanded(searchBarExpanded);
   }

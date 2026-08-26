@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 A standalone project by **Richard Lipka**, grown from [IronSniper1's](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) base script and extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, deletion, and much else — see [Credits and origins](#credits-and-origins).
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.user.js` **v1.68.5** · `grokPostSidebar.user.js` **v1.3.2**  
+**Current versions:** `grokSearch.user.js` **v1.69.0** · `grokPostSidebar.user.js` **v1.3.2**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Credits and origins
@@ -17,7 +17,7 @@ credit.
 |--------|---------|--------------|
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | 2026-03-07 | **The base this repository was forked from.** |
 | [Strapples — Grok Imagine Favorites Search (Greasy Fork)](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) · [GrokImagineSearchandOrganize](https://github.com/Strapples/GrokImagineSearchandOrganize) | 2026-03-20 | A parallel userscript, also forked from IronSniper1. Its author asks that people link back to their GitHub, so it is linked here. |
-| **This repo** | — | Everything since: `grokSearch.user.js` v1.68.5 + `grokPostSidebar.user.js` v1.3.2 |
+| **This repo** | — | Everything since: `grokSearch.user.js` v1.69.0 + `grokPostSidebar.user.js` v1.3.2 |
 
 Earlier versions of this README described the Greasy Fork script as the original and IronSniper1 as
 downstream of it. That was the wrong way round: IronSniper1 came first, and the Greasy Fork script
@@ -137,7 +137,9 @@ Indexing time depends on library size. Leave the tab open until the status finis
 | **Liked only** | Show only posts you have liked (posts whose like state is unknown are excluded) |
 | **Model** | Filter by generation model; the list is built from the models present in your index (hidden when none are recorded) |
 | **Per page / Size** | Pagination size (1–300) and thumbnail scale (10–200%) |
-| **Default** | Reset to 44 per page, 100% size |
+| **Compact** | Fold child results into their parent’s card as a thumbnail strip, one card per family (see [Compact groups](#compact-groups)) |
+| **Button** | Which corner the show/hide button sits in — top right (default), bottom right, top left, bottom left |
+| **Default** | Reset to 44 per page, 100% size, **Compact** off, button in the top-right corner |
 | **Sort** | Newest or oldest (remembered between sessions) |
 | **Clear** | Clears text, dates, model, liked, and media filters |
 | **Download selected** | In the match-count area — save checked images to a folder (Chrome/Edge) |
@@ -165,7 +167,10 @@ Shown when **Results only** is on (default). These controls are **not** in the s
 
 ### Collapsed search bar
 
-- Click the **bottom-right** button to hide the bar (only the toggle stays).
+- Click the **show/hide** button to hide the bar (only that button stays). It sits in the
+  **top right** by default, below Grok’s own header controls so it does not cover them, and
+  **Button** in the display row moves it to any corner. On viewports narrower than 1040px the
+  top corners fall back to the bottom, because the search bar itself reaches the right edge there.
 - **Results only** turns off while hidden; native Grok grid shows.
 - **Ctrl/Cmd+F** expands the bar and focuses search.
 
@@ -176,8 +181,35 @@ Shown when **Results only** is on (default). These controls are **not** in the s
 - **Checkbox** (top-left, subtle until hover/selected) → select for **Download selected**.
 - **Date badge** (top center) → filter to that day (click again to clear).
 - **Parent** cards: video / descendant image badges (counts include **all generations** in `childPosts` tree).
-- **Child** cards: purple **child** icon (top-right), own date badge. A variation that has variations of its own shows its **own** counts, so **Download all** works from it too.
+- **Child** cards: purple **child** icon (bottom-left), own date badge. A variation that has variations of its own shows its **own** counts, so **Download all** works from it too.
 - **← / →** keys page results when the search box is not focused and the lightbox is closed.
+
+<a id="compact-groups"></a>
+
+#### Compact groups
+
+**Compact** (display row, off by default) gives each *family* one card instead of each post one
+cell. A matched child is folded into the outermost matched ancestor above it and drawn as a thumbnail
+in a strip under the parent image; anything past the first eight becomes a **+N** chip pinned to
+the right of the strip.
+
+- **Click a thumbnail** in the strip to open that child, not the parent. Right-click acts on the
+  child too.
+- **The parent’s checkbox selects the whole group**, because the folded children have no
+  checkbox of their own — without that they could not be downloaded or deleted while compact.
+- **Per page counts cards, not images**, so the match count reads e.g. `1,240 matches in 380
+  groups` and there are fewer pages.
+- Children with no matched ancestor (their parent is filtered out, or is not in the index) keep a
+  cell of their own — nothing disappears.
+- **Hide childs** and **Compact** are independent: *Hide childs* removes children from the
+  results, *Compact* keeps them but folds them in.
+
+#### Parent details
+
+Open any post with descendants and the lightbox footer lists them under the prompt: *N child
+results* followed by a thumbnail for each. Each thumbnail is a real link to that post’s page, so
+ctrl-click or middle-click opens it in a new tab; a plain click moves the lightbox to that child
+when it is in the current result set, and opens its page otherwise.
 
 ### Downloads and metadata
 

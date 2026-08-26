@@ -76,9 +76,14 @@ module.exports = {
     const lightbox = stripComments(
       sliceBetween(src, '  function ensureLightboxButtons(', '\n  }'));
     for (const fn of ['ensureLightboxDownloadButton', 'ensureLightboxLikeButton',
-                      'ensureLightboxDeleteButton']) {
+                      'ensureLightboxDeleteButton', 'ensureLightboxChildRow']) {
       t.ok(`${fn} is called from ensureLightboxButtons`, lightbox.includes(`${fn}(lb)`), lightbox);
     }
+    // ensureLightboxChildRow() guards on the row existing and binds its click listener at the
+    // same time, so a copy of the row in the template would exist with nothing listening on it.
+    const template = sliceBetween(src, '    lb.innerHTML = `', '`;');
+    t.ok('the child row is not in the template, only in the chain',
+      !template.includes('grok-lightbox-kids'), template);
     const dl = stripComments(sliceBetween(src,
       '  function ensureLightboxDownloadButton(', '\n  function '));
     t.ok('and the download builder no longer creates anything else',
@@ -91,6 +96,25 @@ module.exports = {
       '  function ensureResultLightbox() {', '\n  function '));
     t.equal('both lightbox paths run the chain',
       (ensureLb.match(/ensureLightboxButtons\(/g) || []).length, 2);
+
+    t.group('the toggle button can reach every corner');
+    // Two stylesheets define the button — injectStyles() and patchSearchBarCollapseStyles() — and
+    // the corner has to be a class in both, or whichever loads second drags it back.
+    // Matching on `right:` picks out the full four-offset corner rule and skips the narrow-screen
+    // media query, which overrides `top`/`bottom` only.
+    for (const corner of ['tr', 'br', 'tl', 'bl']) {
+      const rule = new RegExp(`#grok-search-toggle\\.grok-toggle-${corner} \\{[^}]*right:`, 'g');
+      t.equal(`.grok-toggle-${corner} is defined in both stylesheets`,
+        (src.match(rule) || []).length, 2);
+    }
+    // Every corner rule resets all four offsets; leaving one out lets the previous corner linger.
+    const cornerRules = src.match(/#grok-search-toggle\.grok-toggle-\w+ \{[^}]*right:[^}]*\}/g) || [];
+    const incomplete = cornerRules.filter(
+      rule => !['top:', 'right:', 'bottom:', 'left:'].every(p => rule.includes(p)));
+    t.equal('all eight corner rules are present', cornerRules.length, 8);
+    t.ok('and every one resets all four offsets', incomplete.length === 0, incomplete);
+    t.ok('and the button starts in the top-right corner',
+      /const DEFAULT_TOGGLE_POS = 'tr'/.test(src), 'default corner changed');
 
     t.group('the running version is discoverable from the page');
     t.ok('init publishes it on <html>',

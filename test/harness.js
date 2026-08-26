@@ -63,6 +63,9 @@ function createIndexSandbox() {
     const postById = new Map();
     const knownIds = new Set();
     const selectedPostIds = new Set();
+    // updatePostRow() clears this when a row is re-parented; without it declared here the
+    // assignment would silently create a global instead of being caught.
+    let childrenByParentSource = null;
 
     // ── stubs for collaborators defined outside the sliced region ──
     const dbCalls = { put: 0, del: 0, putRows: 0, delRows: 0 };
@@ -516,6 +519,62 @@ ${epilogue}`)(control);
 }
 
 /** The keyed results-grid reconciler, driven against the fake DOM in ./dom.js. */
+/**
+ * Compact grouping: what the grid pages over once children are folded into their parents.
+ *
+ * The whole point of the feature is that `matchedPosts` is left alone -- selection, download,
+ * delete and the lightbox all still see the flat list -- so the tests here check the *entries*
+ * and never assume a post moved.
+ */
+function createCompactSandbox({ posts = [], compact = false, index = null } = {}) {
+  const region = sliceBetween(readSource(),
+    '  function buildDisplayEntries() {', '  function getPageSize()');
+
+  const prelude = `
+    let matchedPosts = posts.slice();
+    let compactGroups = Boolean(compact);
+    let displayEntries = [];
+    let displayEntriesSource = null;
+    let displayEntriesSignature = '';
+    let pageSize = 10;
+    const byId = new Map((index || posts).map(p => [p.id, p]));
+
+    function isChildPost(post) { return Boolean(post && post.isChild); }
+    function getPostById(id) { return byId.get(id) || null; }
+    function getPageSize() { return pageSize; }
+  `;
+
+  const epilogue = `
+    return {
+      buildDisplayEntries, getDisplayEntries, invalidateDisplayEntries, getTotalPages,
+      getDisplayCount, getDisplayPage,
+      get matchedPosts() { return matchedPosts; },
+      setCompact(v) { compactGroups = Boolean(v); invalidateDisplayEntries(); },
+      setPageSize(v) { pageSize = v; },
+      setMatched(list) { matchedPosts = list.slice(); invalidateDisplayEntries(); },
+      mutateMatchedInPlace(fn) { fn(matchedPosts); },
+    };
+  `;
+
+  return new Function('posts', 'compact', 'index', `${prelude}
+${region}
+${epilogue}`)(posts, compact, index);
+}
+
+/**
+ * The thumbnail swap. Its whole reason for existing is a defect that only shows up on the
+ * *second* render of a card, so the tests drive it the way paging does: same element, new post.
+ */
+function createCardImageSandbox({ createElement }) {
+  const region = sliceBetween(readSource(), '  function syncCardImage(', '\n  /**');
+  const prelude = `
+    const document = { createElement: name => createElement(name) };
+  `;
+  return new Function('createElement', `${prelude}
+${region}
+return syncCardImage;`)(createElement);
+}
+
 function createGridSandbox({ createElement, onRender }) {
   const src = readSource();
   // The end marker has to be looked for past renderResultCards' own declaration, otherwise the
@@ -536,6 +595,7 @@ function createGridSandbox({ createElement, onRender }) {
 module.exports = {
   SOURCE_PATH, readSource, sliceBetween,
   createIndexSandbox, createGridSandbox, createLikeSandbox, createMetadataSandbox,
+  createCompactSandbox, createCardImageSandbox,
   createDownloadSandbox, createBulkDownloadSandbox,
   createFeedSandbox, createNativeVisibilitySandbox, createSearchBarSandbox,
   createDeleteSandbox,

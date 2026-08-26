@@ -253,6 +253,45 @@ Nothing here changes the installed userscripts — no version bump.
 
 ---
 
+## [1.69.0] — 2026-08-26
+
+### Added
+
+- **Compact groups** (display row, off by default): one card per family instead of one per post.
+  Matched children fold into the outermost matched ancestor above them and appear as a strip under
+  the parent image, with a **+N** chip for the rest. Clicking a thumbnail opens that child;
+  the parent’s checkbox selects the whole group, since the folded children have no checkbox of
+  their own. Pages now count cards, and the match count says how many groups they came to.
+- **Child links in the lightbox**: opening a post that has descendants lists them under the
+  prompt. Each is a real link to the post page — ctrl/middle-click opens a tab — while a plain
+  click moves the lightbox to that child when it is in the current results.
+- **Button** setting in the display row: the show/hide button can sit in any of the four corners.
+
+### Changed
+
+- The show/hide button now starts in the **top-right** corner instead of the bottom-right, offset
+  below Grok’s own header row so it covers none of its controls (measured: Grok’s Select button
+  ends at x2323 and its search button occupies x2331–2371 at y13–53, so a plain `top: 16px`
+  would have landed on the search control). Below 1040px the top corners fall back to the bottom,
+  where the search bar no longer reaches.
+- Result cards no longer stretch to the tallest card in their grid row. They always did, but it
+  only became visible once compact cards made row heights differ — a plain card would have grown
+  to match, leaving its prompt overlay floating below its image.
+
+### Fixed
+
+- **Paging left the previous page showing at the bottom of the grid.** The grid reuses card
+  elements across pages, and pointing a reused `<img>` at a new `src` is not enough: the browser
+  keeps painting the old picture until the new one has loaded, and with `loading="lazy"` that load
+  can be deferred indefinitely — the element is already in the layout, so it never leaves and
+  re-enters the viewport to re-trigger it. Rows in view reloaded; rows at or below the fold kept
+  the page before, permanently. A card being recycled for a *different* post now gets a new image
+  element, which can only paint blank or correct, and loads eagerly because paging is an explicit
+  request to see that page. The first paint of a fresh card is still lazy.
+  Measured on a live library: after paging, 1 of 44 thumbnails had loaded; with the fix, 44 of 44.
+
+---
+
 ## [1.66.1] — 2026-08-26
 
 Found by driving a real browser: the installed script was three releases behind, and two reasons

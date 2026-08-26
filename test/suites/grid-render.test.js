@@ -14,12 +14,14 @@ module.exports = {
         created.push(el);
         return el;
       },
-      onRender: (card, post) => {
-        card.dataset.id = post.id;
-        patched.push(post.id);
+      onRender: (card, entry) => {
+        card.dataset.id = entry.post.id;
+        patched.push(entry.post.id);
       },
     });
-    const page = ids => ids.map(id => ({ id }));
+    // The grid pages over `{ post, children }` entries, not bare posts -- compact mode folds a
+    // child into its parent's entry, and the reconciler still keys on the entry's own post id.
+    const page = ids => ids.map(id => ({ post: { id }, children: [] }));
 
     t.group('ordering');
     let c = containerWith([]);
