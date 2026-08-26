@@ -164,6 +164,21 @@ have the same trigger: *Results only* being off.
 
 ---
 
+## [1.68.2] — 2026-08-26
+
+### Fixed
+- **The lightbox never showed Like or Delete.** They were chained off
+  `ensureLightboxDownloadButton()`, which returns early when its own button already exists — and
+  Download is part of the lightbox template, so it always did. Neither button was ever injected;
+  the Like button had been invisible this way since v1.64.0. All three now hang off one
+  `ensureLightboxButtons()`, each responsible only for itself.
+
+  This is the same hazard as the search-bar one fixed in v1.66.1: **an `ensure*` that guards on
+  one element must never be the thing that creates another.** The `search-bar-parts` suite now
+  covers the lightbox too.
+
+---
+
 ## Unreleased
 
 Nothing here changes the installed userscripts — no version bump.

@@ -68,6 +68,22 @@ module.exports = {
     t.ok('nothing is injected only when upgrading an older bar', onlyMigration.length === 0, onlyMigration);
     t.ok('nothing is injected only on a fresh build', onlyFresh.length === 0, onlyFresh);
 
+    t.group('the lightbox has the same shape of hazard');
+    // ensureLightboxDownloadButton() returns early when its own button exists, and Download is in
+    // the lightbox template -- so anything chained off it never ran. Like and Delete were invisible
+    // for several releases because of exactly that.
+    const src = readSource();
+    const lightbox = stripComments(
+      sliceBetween(src, '  function ensureLightboxButtons(', '\n  }'));
+    for (const fn of ['ensureLightboxDownloadButton', 'ensureLightboxLikeButton',
+                      'ensureLightboxDeleteButton']) {
+      t.ok(`${fn} is called from ensureLightboxButtons`, lightbox.includes(`${fn}(lb)`), lightbox);
+    }
+    const dl = stripComments(sliceBetween(src,
+      '  function ensureLightboxDownloadButton(', '\n  function '));
+    t.ok('and the download builder no longer creates anything else',
+      !/ensureLightboxLikeButton|ensureLightboxDeleteButton/.test(dl), dl);
+
     t.group('the controls this actually broke are in the chain');
     for (const [fn, label] of [
       ['ensureImportJsonButton', 'Import JSON'],
