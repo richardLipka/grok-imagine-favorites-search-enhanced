@@ -566,13 +566,17 @@ ${epilogue}`)(posts, compact, index);
  * *second* render of a card, so the tests drive it the way paging does: same element, new post.
  */
 function createCardImageSandbox({ createElement }) {
-  const region = sliceBetween(readSource(), '  function syncCardImage(', '\n  /**');
+  // Sliced from imageAltText() so the alt cap is the real one, not a stub: the two are a
+  // single defence against a broken image sizing itself to its prompt.
+  const region = sliceBetween(readSource(),
+    '  function imageAltText(', '  /** Skeleton built once per card');
   const prelude = `
+    const IMAGE_ALT_MAX = 140;
     const document = { createElement: name => createElement(name) };
   `;
   return new Function('createElement', `${prelude}
 ${region}
-return syncCardImage;`)(createElement);
+return { syncCardImage, imageAltText };`)(createElement);
 }
 
 /**

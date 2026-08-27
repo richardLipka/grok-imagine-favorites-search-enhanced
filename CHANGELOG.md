@@ -253,6 +253,27 @@ Nothing here changes the installed userscripts — no version bump.
 
 ---
 
+## [1.69.2] — 2026-08-27
+
+### Fixed
+
+- **One post whose media fails to load could wreck a whole grid row.** A broken `<img>` is not
+  replaced content: the browser lays out its `alt` text instead and grows the box to fit, ignoring
+  the element’s own `aspect-ratio`. Because the card’s alt was the *entire* prompt, and prompts
+  here reach a few thousand characters, a card holding a 2,524-character prompt whose thumbnail
+  404s measured **1,746px tall instead of 246px**.
+
+  Two changes, either of which would fix that case and which together cover the rest:
+  `.grok-result-card > img` is now `contain: size`, so the 3/4 box holds whether the media loads,
+  fails, or is still on its way; and `alt` carries a 140-character summary rather than the whole
+  prompt. A whole prompt in `alt` was wrong anyway — a screen reader reads every word of it. The
+  full text is still on the card as a `title`, in the hover overlay, and in the lightbox.
+- **A very long prompt pushed the image out of the lightbox.** The lightbox prompt had no bound,
+  so a few thousand characters grew the footer until little was left for the media. It now caps at
+  22vh and scrolls.
+
+---
+
 ## [1.69.1] — 2026-08-26
 
 ### Fixed

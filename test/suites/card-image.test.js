@@ -1,6 +1,6 @@
 'use strict';
 
-const { createCardImageSandbox } = require('../harness');
+const { createCardImageSandbox, readSource } = require('../harness');
 const { FakeCard, FakeImage } = require('../dom');
 
 /**
@@ -18,14 +18,14 @@ const { FakeCard, FakeImage } = require('../dom');
  */
 function sandbox() {
   const created = [];
-  const syncCardImage = createCardImageSandbox({
+  const { syncCardImage, imageAltText } = createCardImageSandbox({
     createElement: () => {
       const img = new FakeImage();
       created.push(img);
       return img;
     },
   });
-  return { syncCardImage, created };
+  return { syncCardImage, imageAltText, created };
 }
 
 module.exports = {
@@ -90,5 +90,48 @@ module.exports = {
     ({ syncCardImage } = sandbox());
     const empty = { querySelector: () => null };
     t.equal('returns null rather than throwing', syncCardImage(empty, 'a.jpg', 'p'), null);
+
+    // A broken <img> is not replaced content: the browser lays out the alt text and grows the box
+    // to fit, ignoring aspect-ratio. Measured against the shipped stylesheet, a card holding a
+    // 2,524-character prompt whose media 404s was 1,746px tall instead of 246px.
+    t.group('alt text cannot carry a whole prompt');
+    let imageAltText;
+    ({ imageAltText } = sandbox());
+    const long = 'a fine art oil illustration with luxurious textured brushwork. '.repeat(50);
+    t.ok('a long prompt is capped', imageAltText(long).length <= 140, imageAltText(long).length);
+    t.ok('and marked as truncated', imageAltText(long).endsWith('…'), imageAltText(long).slice(-10));
+    t.ok('the start is preserved', imageAltText(long).startsWith('a fine art oil illustration'));
+    t.equal('a short prompt is left alone', imageAltText('a cat'), 'a cat');
+    t.equal('whitespace is collapsed', imageAltText('  a   cat\non a mat  '), 'a cat on a mat');
+    t.equal('an empty prompt still describes the image', imageAltText(''), 'Grok Imagine result');
+    t.equal('and so does a missing one', imageAltText(null), 'Grok Imagine result');
+    t.ok('a prompt exactly at the cap is not truncated',
+      imageAltText('x'.repeat(140)) === 'x'.repeat(140));
+
+    t.group('the card gets the capped alt, not the prompt');
+    let created2;
+    ({ syncCardImage, imageAltText, created: created2 } = sandbox());
+    card = new FakeCard();
+    syncCardImage(card, 'a.jpg', long);
+    t.ok('on first paint', card.img.alt.length <= 140, card.img.alt.length);
+    t.equal('matching imageAltText', card.img.alt, imageAltText(long));
+    syncCardImage(card, 'b.jpg', long);
+    t.ok('and on a recycled card too', card.img.alt.length <= 140, card.img.alt.length);
+    t.ok('which really was recycled', created2.length === 1, created2.length);
+
+    t.group('the stylesheet bounds the box regardless of the alt');
+    const src = readSource();
+    // The cap is a second line of defence; this is the first, and it holds while the image is
+    // still loading as well as when it has failed.
+    t.ok('the card thumbnail is size-contained',
+      /\.grok-result-card > img \{[^}]*contain: size/.test(src), 'contain: size missing');
+    t.ok('scoped to the direct child, so compact strip thumbnails are untouched',
+      !/\.grok-result-card img \{[^}]*contain: size/.test(src));
+    t.ok('the lightbox image uses the capped alt too',
+      /grok-lightbox-media[^`]*alt="\$\{escapeHtml\(imageAltText\(post\.prompt\)\)\}"/.test(src),
+      'lightbox alt not capped');
+    t.ok('and the lightbox prompt cannot grow without limit',
+      /\.grok-lightbox-prompt \{[^}]*max-height:[^}]*overflow-y: auto/.test(src),
+      'lightbox prompt unbounded');
   },
 };

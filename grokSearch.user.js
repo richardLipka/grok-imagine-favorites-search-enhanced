@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.69.1
+// @version      1.69.2
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -134,7 +134,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.69.1';
+  const SCRIPT_VERSION = '1.69.2';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -214,6 +214,8 @@
   const DOWNLOAD_RETRY_BASE_MS = 600;
   /** Per-prompt cap for embedded image metadata; see buildPostMetadata() for why it is not larger. */
   const METADATA_PROMPT_MAX = 4000;
+  /** Per-image cap for alt text; see imageAltText() for why a whole prompt cannot go in there. */
+  const IMAGE_ALT_MAX = 140;
 
   let allPosts = [];
   /** id → the live row object inside allPosts. Rows are updated in place, never by array index. */
@@ -4410,7 +4412,7 @@
     const isVideo = isVideoMediaType(post.mediaType) || /\.mp4(\?|$)/i.test(mediaUrl);
     stage.innerHTML = isVideo
       ? `<video class="grok-lightbox-media" src="${escapeHtml(mediaUrl)}" controls autoplay playsinline></video>`
-      : `<img class="grok-lightbox-media" src="${escapeHtml(mediaUrl)}" alt="${escapeHtml(post.prompt)}" />`;
+      : `<img class="grok-lightbox-media" src="${escapeHtml(mediaUrl)}" alt="${escapeHtml(imageAltText(post.prompt))}" />`;
 
     promptEl.textContent = post.prompt || '(no prompt)';
     const bits = [];
@@ -4845,6 +4847,25 @@
   }
 
   /**
+   * A prompt shortened to something usable as alt text.
+   *
+   * Prompts here run to thousands of characters, and a whole one in `alt` is wrong twice over. A
+   * screen reader reads every word of it; and when the image fails to load the browser *renders*
+   * the alt text, at which point the <img> stops being replaced content, sizes itself to that text
+   * and ignores its own `aspect-ratio`. One unloadable thumbnail with a 2,524-character prompt
+   * measured 1,746px tall instead of 246px and wrecked the row it was in.
+   *
+   * The full prompt is still on the card as a `title`, in the prompt overlay, and in the lightbox,
+   * so nothing is lost by keeping this short.
+   */
+  function imageAltText(prompt) {
+    const text = String(prompt || '').replace(/\s+/g, ' ').trim();
+    if (!text) return 'Grok Imagine result';
+    if (text.length <= IMAGE_ALT_MAX) return text;
+    return `${text.slice(0, IMAGE_ALT_MAX - 1).trimEnd()}\u2026`;
+  }
+
+  /**
    * Points a card's thumbnail at `thumb`, returning the image element in use.
    *
    * When a card is **recycled for a different post** the <img> is replaced rather than
@@ -4867,14 +4888,15 @@
     const img = card.querySelector(':scope > img');
     if (!img) return null;
 
+    const alt = imageAltText(prompt);
     const previous = img.getAttribute('src') || '';
     if (previous === thumb) {
-      if (img.alt !== prompt) img.alt = prompt;
+      if (img.alt !== alt) img.alt = alt;
       return img;
     }
     if (!previous) {
       if (thumb) img.setAttribute('src', thumb);
-      img.alt = prompt;
+      img.alt = alt;
       return img;
     }
 
@@ -4883,7 +4905,7 @@
     // Copied rather than restated, so the replacement cannot drift from the skeleton's box.
     fresh.style.cssText = img.style.cssText;
     fresh.className = img.className;
-    fresh.alt = prompt;
+    fresh.alt = alt;
     if (thumb) fresh.setAttribute('src', thumb);
     img.replaceWith(fresh);
     return fresh;
@@ -6176,6 +6198,13 @@
         box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.75), 0 8px 32px rgba(0,0,0,0.5);
       }
       .grok-result-card img { width: 100%; display: block; border-radius: 14px; aspect-ratio: 3/4; object-fit: cover; }
+      /* A broken image is not replaced content: the browser lays out its alt text instead and
+         grows the box to fit it, ignoring aspect-ratio. "contain: size" makes the element size as
+         if it had no contents, so the 3/4 box holds whether the media loads, fails, or is still
+         on its way -- and the alt cap in imageAltText() is then a second line of defence rather
+         than the only one. Scoped to the direct child so the compact strip's thumbnails, which
+         size against their own fixed button, are untouched. */
+      .grok-result-card > img { contain: size; }
       .grok-result-prompt {
         position: absolute; bottom: 0; left: 0; right: 0;
         background: linear-gradient(transparent, rgba(0,0,0,0.85));
@@ -6420,6 +6449,11 @@
         line-height: 1.45;
         color: rgba(255, 255, 255, 0.92);
         word-break: break-word;
+        /* Prompts reach a few thousand characters. Unbounded, one of those grows the footer far
+           enough to squeeze the image out of the panel, so the prompt scrolls instead. */
+        max-height: 22vh;
+        overflow-y: auto;
+        overscroll-behavior: contain;
       }
       .grok-lightbox-sub {
         margin-top: 4px;

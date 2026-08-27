@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.69.1, ~6.4k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokSearch.user.js` (v1.69.2, ~6.4k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.user.js` (v1.3.2, ~530 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
@@ -308,6 +308,13 @@ longer makes the browser re-decode every thumbnail. Consequences for anyone edit
   work — don't drop it.
 - Cards persist across renders, so anything stateful must be set explicitly on every pass in
   `renderResultCard()`. Nothing may rely on a fresh element.
+- **A card’s `<img>` must stay bounded even when the media never loads.** A broken image is not
+  replaced content — the browser lays out its `alt` text and grows the box to fit, ignoring
+  `aspect-ratio`. With the whole prompt in `alt`, one 404 thumbnail measured 1,746px instead of
+  246px and wrecked its row. `.grok-result-card > img` is `contain: size` (scoped to the direct
+  child, so the compact strip’s thumbnails are untouched), and `imageAltText()` caps `alt` at
+  `IMAGE_ALT_MAX`. Keep both: the containment holds while an image is merely *loading* too, and
+  the cap is what makes a screen reader usable.
 - **The thumbnail is the exception: a card recycled for a different post gets a *new* `<img>`,
   never a re-pointed one** (`syncCardImage()`). Assigning `src` leaves the previous post’s picture
   painted until the new one loads, and `loading="lazy"` can defer that indefinitely because the
