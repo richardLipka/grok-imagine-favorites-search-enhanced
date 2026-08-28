@@ -253,6 +253,16 @@ Nothing here changes the installed userscripts — no version bump.
 
 ---
 
+## [1.69.3] — 2026-08-28
+
+### Fixed
+
+- **Grok top header, bottom generation bar, and collapse toggle disappeared.**
+  - `getNativeSavedRoot()` was walking up DOM ancestors until it hit `<main>`, marking `<main>` with `display: none !important`. Because Grok Imagine’s modern SPA houses the top navigation header and bottom generation controls inside `<main>`, hiding it hid the entire Grok application shell. `getNativeSavedRoot()` now stops before `<main>`, `<header>`, `<nav>`, and input containers, isolating the hide to the native image grid only.
+  - The collapse toggle (`#grok-search-toggle`) now has an elevated z-index (`100005`) and is re-asserted in `init()` and the SPA `MutationObserver` if React hydration or SPA navigation detaches it.
+
+---
+
 ## [1.69.2] — 2026-08-27
 
 ### Fixed

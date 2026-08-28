@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.69.2
+// @version      1.69.3
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -134,7 +134,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.69.2';
+  const SCRIPT_VERSION = '1.69.3';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -2497,9 +2497,10 @@
     let el = cards[0].parentElement;
     let best = el;
     for (let i = 0; i < 15 && el && el !== document.body; i++) {
+      if (el.tagName === 'MAIN' || el.getAttribute('role') === 'main' || el.tagName === 'HEADER' || el.tagName === 'NAV') break;
+      if (el.querySelector && el.querySelector('nav, header, textarea, input[type="text"], [role="navigation"], [role="banner"]')) break;
       const n = el.querySelectorAll('[class*="media-post-masonry-card"]').length;
       if (n > 0) best = el;
-      if (el.tagName === 'MAIN' || el.getAttribute('role') === 'main') return el;
       el = el.parentElement;
     }
     return best || getGrokGrid();
@@ -5562,7 +5563,7 @@
         position: fixed;
         top: 70px;
         right: 16px;
-        z-index: 99991;
+        z-index: 100005;
         width: 44px;
         height: 44px;
         border-radius: 12px;
@@ -7425,7 +7426,7 @@
         opacity: 0; visibility: hidden; pointer-events: none;
       }
       #grok-search-toggle {
-        position: fixed; top: 70px; right: 16px; z-index: 99991;
+        position: fixed; top: 70px; right: 16px; z-index: 100005;
         width: 44px; height: 44px; border-radius: 12px;
         border: 1px solid rgba(255,255,255,0.18);
         background: rgba(15,15,20,0.94); color: rgba(255,255,255,0.9);
@@ -7788,11 +7789,19 @@
     // Tampermonkey install apart from a bug that survived a fix means guessing from CSS.
     try { document.documentElement.dataset.grokSearchVersion = SCRIPT_VERSION; } catch { /* ignore */ }
     if (initiated && document.getElementById('grok-search-wrap')) {
+      ensureSearchBarToggle();
       syncInitialResultsView();
       if (!loaded && !indexing) loadAllPosts();
       return;
     }
-    if (initiated) return;
+    if (initiated) {
+      if (!document.getElementById('grok-search-wrap')) {
+        buildSearchBar();
+      } else {
+        ensureSearchBarToggle();
+      }
+      return;
+    }
     initiated = true;
     injectStyles();
     requestPersistentStorage();
@@ -7816,6 +7825,13 @@
         if (isImagineListPage()) scheduleIncrementalSync('navigation');
       }, 800);
       return;
+    }
+    if (isImagineListPage()) {
+      if (!document.getElementById('grok-search-wrap')) {
+        buildSearchBar();
+      } else if (!document.getElementById('grok-search-toggle')) {
+        ensureSearchBarToggle();
+      }
     }
     if (!searchBarExpanded) {
       clearTimeout(domEnforceTimer);

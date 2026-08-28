@@ -16,7 +16,7 @@ const path = require('path');
 const SOURCE_PATH = path.join(__dirname, '..', 'grokSearch.user.js');
 
 function readSource() {
-  return fs.readFileSync(SOURCE_PATH, 'utf8');
+  return fs.readFileSync(SOURCE_PATH, 'utf8').replace(/\r\n/g, '\n');
 }
 
 /** Text from `startMarker` up to the next occurrence of `endMarker`. */
