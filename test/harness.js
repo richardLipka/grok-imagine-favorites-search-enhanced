@@ -628,11 +628,30 @@ function createGridSandbox({ createElement, onRender }) {
   return factory(createElement, onRender);
 }
 
+function createThumbnailSandbox({ posts = [] } = {}) {
+  const src = readSource();
+  const region1 = sliceBetween(src, '  function isVideoMediaType', '  function matchesWithVideoFilter');
+  const region2 = sliceBetween(src, '  function getChildrenByParent()', '  function guessMediaExtension');
+
+  const prelude = `
+    const allPosts = posts.slice();
+    const postById = new Map(allPosts.map(p => [p.id, p]));
+    let childrenByParent = new Map();
+    let childrenByParentSource = null;
+    let childrenByParentLength = -1;
+  `;
+
+  return new Function('posts', `${prelude}
+${region1}
+${region2}
+return { getPostThumbnailUrl, isVideoPost, isVideoUrl, isLikelyImageUrl, postById, allPosts };`)(posts);
+}
+
 module.exports = {
   SOURCE_PATH, readSource, sliceBetween,
   createIndexSandbox, createGridSandbox, createLikeSandbox, createMetadataSandbox,
   createCompactSandbox, createCardImageSandbox, createResultsOnlySandbox,
   createDownloadSandbox, createBulkDownloadSandbox,
   createFeedSandbox, createNativeVisibilitySandbox, createSearchBarSandbox,
-  createDeleteSandbox,
+  createDeleteSandbox, createThumbnailSandbox,
 };

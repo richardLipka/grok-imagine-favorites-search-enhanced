@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.69.3
+// @version      1.69.5
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -134,7 +134,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.69.3';
+  const SCRIPT_VERSION = '1.69.5';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -614,8 +614,18 @@
     return t === 'MEDIA_POST_TYPE_VIDEO' || t.includes('VIDEO');
   }
 
+  function isVideoUrl(url) {
+    return /\.(mp4|webm|mov|mkv)(\?|$)/i.test(String(url || ''));
+  }
+
+  function isLikelyImageUrl(url) {
+    const s = String(url || '').trim();
+    if (!s) return false;
+    return !isVideoUrl(s);
+  }
+
   function isVideoPost(post) {
-    return isVideoMediaType(post?.mediaType);
+    return isVideoMediaType(post?.mediaType) || isVideoUrl(post?.mediaUrl) || isVideoUrl(post?.thumbnail);
   }
 
   function matchesWithVideoFilter(post) {
@@ -2480,27 +2490,33 @@
 
   // ─── Results ───────────────────────────────────────────────────────────────
   function getGrokGrid() {
-    const card = document.querySelector('[class*="media-post-masonry-card"]');
-    if (!card) return null;
-    let el = card.parentElement;
-    for (let i = 0; i < 5; i++) {
-      if (!el) break;
-      if (el.children.length > 3) return el;
+    const cards = document.querySelectorAll('[class*="media-post-masonry-card"], main a[href^="/imagine/post/"]:not(.grok-lightbox-kid)');
+    if (!cards.length) return null;
+    const total = cards.length;
+    let el = cards[0].parentElement;
+    while (el && el !== document.body && el.tagName !== 'MAIN') {
+      if (el.querySelectorAll('[class*="media-post-masonry-card"], a[href^="/imagine/post/"]:not(.grok-lightbox-kid)').length === total) {
+        return el;
+      }
       el = el.parentElement;
     }
-    return card.parentElement;
+    return cards[0].parentElement;
   }
 
   function getNativeSavedRoot() {
-    const cards = document.querySelectorAll('[class*="media-post-masonry-card"]');
+    const cards = document.querySelectorAll('[class*="media-post-masonry-card"], main a[href^="/imagine/post/"]:not(.grok-lightbox-kid)');
     if (!cards.length) return getGrokGrid();
+    const totalCards = cards.length;
     let el = cards[0].parentElement;
-    let best = el;
+    let best = null;
     for (let i = 0; i < 15 && el && el !== document.body; i++) {
       if (el.tagName === 'MAIN' || el.getAttribute('role') === 'main' || el.tagName === 'HEADER' || el.tagName === 'NAV') break;
       if (el.querySelector && el.querySelector('nav, header, textarea, input[type="text"], [role="navigation"], [role="banner"]')) break;
-      const n = el.querySelectorAll('[class*="media-post-masonry-card"]').length;
-      if (n > 0) best = el;
+      const count = el.querySelectorAll('[class*="media-post-masonry-card"], a[href^="/imagine/post/"]:not(.grok-lightbox-kid)').length;
+      if (count > 0) {
+        best = el;
+        if (count === totalCards) break;
+      }
       el = el.parentElement;
     }
     return best || getGrokGrid();
@@ -2549,8 +2565,20 @@
   }
 
   function setNativeGridVisible(visible) {
-    if (visible) showNativeHidden(HID_GRID_ATTR);
-    else hideNativeElement(getGrokGrid(), HID_GRID_ATTR);
+    if (visible) {
+      showNativeHidden(HID_GRID_ATTR);
+    } else {
+      const grid = getGrokGrid();
+      if (grid) hideNativeElement(grid, HID_GRID_ATTR);
+      const nativeCards = document.querySelectorAll(
+        '[class*="media-post-masonry-card"], main a[href^="/imagine/post/"]:not(.grok-lightbox-kid)'
+      );
+      nativeCards.forEach(card => {
+        if (!card.closest('#grok-results-panel') && !card.closest('#grok-inline-results-viewport') && !card.closest('#grok-result-lightbox')) {
+          hideNativeElement(card, HID_GRID_ATTR);
+        }
+      });
+    }
   }
 
   function setNativeSavedRootVisible(visible) {
@@ -2925,6 +2953,89 @@
 
   function getPostMediaUrl(post) {
     return post?.mediaUrl || post?.thumbnail || '';
+  }
+
+  let imagesByConversation = new Map();
+  let imagesByConversationSource = null;
+  let imagesByConversationLength = -1;
+
+  function getImagesByConversation() {
+    if (imagesByConversationSource === allPosts && imagesByConversationLength === allPosts.length) {
+      return imagesByConversation;
+    }
+    const byConv = new Map();
+    for (const p of allPosts) {
+      if (!p.conversationId || isVideoPost(p)) continue;
+      const thumb = isLikelyImageUrl(p.thumbnail) ? p.thumbnail : (isLikelyImageUrl(p.mediaUrl) ? p.mediaUrl : '');
+      if (!thumb) continue;
+      const convId = String(p.conversationId);
+      if (!byConv.has(convId)) byConv.set(convId, thumb);
+    }
+    imagesByConversation = byConv;
+    imagesByConversationSource = allPosts;
+    imagesByConversationLength = allPosts.length;
+    return byConv;
+  }
+
+  /**
+   * Resolves an image thumbnail URL for a post/asset.
+   *
+   * For video posts, `thumbnail` or `mediaUrl` may be an .mp4 file that an <img> element
+   * cannot render. In that case, we fall back to:
+   * 1. The parent post's image (if post is a variation or animation of a parent)
+   * 2. The root post's image (for deeper tree descendants)
+   * 3. The first image child of this post (if post is a parent video)
+   * 4. Sibling image from the same conversation / generation batch (conversationId)
+   * 5. Non-video mediaUrl or original thumbnail
+   */
+  function getPostThumbnailUrl(post) {
+    if (!post) return '';
+
+    // Non-video post with a valid image thumbnail
+    if (!isVideoPost(post) && isLikelyImageUrl(post.thumbnail)) {
+      return post.thumbnail;
+    }
+
+    // Video post with a dedicated image thumbnail
+    if (isLikelyImageUrl(post.thumbnail)) {
+      return post.thumbnail;
+    }
+
+    // 1. Direct parent post image
+    if (post.parentId) {
+      const parent = postById.get(post.parentId);
+      if (parent) {
+        if (isLikelyImageUrl(parent.thumbnail)) return parent.thumbnail;
+        if (isLikelyImageUrl(parent.mediaUrl)) return parent.mediaUrl;
+      }
+    }
+
+    // 2. Root post image
+    if (post.rootId && post.rootId !== post.parentId) {
+      const root = postById.get(post.rootId);
+      if (root) {
+        if (isLikelyImageUrl(root.thumbnail)) return root.thumbnail;
+        if (isLikelyImageUrl(root.mediaUrl)) return root.mediaUrl;
+      }
+    }
+
+    // 3. Child posts / descendants
+    const byParent = getChildrenByParent();
+    const children = byParent.get(post.id) || [];
+    for (const child of children) {
+      if (isLikelyImageUrl(child.thumbnail)) return child.thumbnail;
+      if (isLikelyImageUrl(child.mediaUrl)) return child.mediaUrl;
+    }
+
+    // 4. Same conversation / batch generation sibling
+    if (post.conversationId) {
+      const convThumb = getImagesByConversation().get(String(post.conversationId));
+      if (convThumb) return convThumb;
+    }
+
+    // 5. Fallback
+    if (isLikelyImageUrl(post.mediaUrl)) return post.mediaUrl;
+    return post.thumbnail || '';
   }
 
   function guessMediaExtension(url, mediaType) {
@@ -4260,7 +4371,7 @@
     const links = shown.map(c => `
       <a class="grok-lightbox-kid" href="${escapeHtml(getPostDetailUrl(c.id))}" data-id="${escapeHtml(c.id)}"
          target="_blank" rel="noopener" title="${escapeHtml(c.prompt || '')}">
-        <img loading="lazy" src="${escapeHtml(c.thumbnail || '')}" alt="" />
+        <img loading="lazy" src="${escapeHtml(getPostThumbnailUrl(c))}" alt="" />
       </a>`).join('');
     const more = rest > 0
       ? `<span class="grok-lightbox-kid-more" title="${rest} more not shown">+${rest}</span>`
@@ -4839,7 +4950,7 @@
     const thumbs = shown.map(c => `
       <button type="button" class="grok-result-kid" data-id="${escapeHtml(c.id)}"
               title="${escapeHtml(c.prompt || '')}" aria-label="Open child result">
-        <img loading="lazy" src="${escapeHtml(c.thumbnail || '')}" alt="" />
+        <img loading="lazy" src="${escapeHtml(getPostThumbnailUrl(c))}" alt="" />
       </button>`).join('');
     const more = rest > 0
       ? `<span class="grok-result-kid-more" title="${rest} more — open the parent to see them all">+${rest}</span>`
@@ -4998,7 +5109,7 @@
       }
     }
 
-    syncCardImage(card, post.thumbnail || '', prompt);
+    syncCardImage(card, getPostThumbnailUrl(post), prompt);
 
     const promptEl = card.querySelector('.grok-result-prompt');
     if (promptEl && promptEl.textContent !== prompt) promptEl.textContent = prompt;
@@ -6050,7 +6161,17 @@
         margin: 0;
       }
       html.grok-custom-results-mode [data-grok-native-saved-root="1"],
-      html.grok-custom-results-mode [class*="media-post-masonry-card"] {
+      html.grok-custom-results-mode [data-grok-hid-grid="1"],
+      html.grok-custom-results-mode [data-grok-hid-root="1"],
+      html.grok-custom-results-mode [class*="media-post-masonry-card"],
+      html.grok-custom-results-mode main a[href^="/imagine/post/"]:not(.grok-lightbox-kid) {
+        display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+      html.grok-filtered-inline-mode [class*="media-post-masonry-card"],
+      html.grok-filtered-inline-mode main a[href^="/imagine/post/"]:not(.grok-lightbox-kid),
+      html.grok-filtered-inline-mode [data-grok-hid-grid="1"] {
         display: none !important;
         visibility: hidden !important;
         pointer-events: none !important;

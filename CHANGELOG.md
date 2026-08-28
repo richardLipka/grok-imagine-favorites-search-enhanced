@@ -3,253 +3,30 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
-## [1.66.2] — 2026-08-26
+## [1.69.5] — 2026-08-28
 
 ### Fixed
-- ***Liked only* matched nothing.** `detectLikedState()` sniffs a list of candidate field names,
-  and the one Grok actually sends — `userInteractionStatus.likeStatus` — was not on it. Every post
-  therefore detected as `null` (unknown), which the filter deliberately excludes, so the result was
-  always empty. Confirmed against a live API response rather than guessed.
 
-### Known issue
-- **Media created since roughly June 2026 is not reachable through `/rest/media/post/list` at all**,
-  so it cannot be indexed yet. See the note under Unreleased.
+- **Duplicated and bleeding native images under search results, pagination, and zoom changes.**
+  - `getGrokGrid()` and `getNativeSavedRoot()` now locate the common ancestor containing all native cards across all masonry columns, preventing sibling columns from remaining visible behind the custom UI.
+  - `setNativeGridVisible(false)` now explicitly marks and hides all native masonry cards and post links (`[class*="media-post-masonry-card"]`, `main a[href^="/imagine/post/"]:not(.grok-lightbox-kid)`) with `data-grok-hid-grid="1"`, guaranteeing that no trailing or leftover native items bleed through at the bottom when results are short, zoom size is reduced, or paging to another page.
+  - Added CSS containment rules for `html.grok-custom-results-mode` and `html.grok-filtered-inline-mode` to comprehensively keep all native items hidden while preserving Grok's header and prompt input.
 
 ---
 
-## [1.67.0] — 2026-08-26
-
-Newly generated images are indexed again. Diagnosed by driving a real logged-in browser rather
-than reasoning about the code.
-
-**Grok moved Imagine's library off the API this script was built on.** `/rest/media/post/list`
-still answers, but it is unordered (two identical calls return different samples), it returns no
-child trees, and nothing created since roughly June 2026 appears in it at all. The current UI
-paginates `/rest/assets` instead, and that is what the script now walks.
-
-### Added
-- **`/rest/assets` is the primary feed.** `GET /rest/assets?pageSize=60&orderBy=ORDER_BY_CREATE_TIME&workspaceKind=WORKSPACE_KIND_IMAGINE_ALL`
-  is genuinely ordered newest-first and reaches the current day. Each row already carries the
-  prompt and model in `mediaGenInput`, and the media URL is the asset's storage `key` under
-  `assets.grok.com`, so indexing costs **one request per 60 items and nothing per item** — where
-  the old path needed a `post/get` per parent.
-  `assetId` is the same id space as a media post id, so these rows merge with existing ones
-  instead of duplicating them.
-- Because the feed is ordered, the routine sync stops once `ASSETS_SYNC_STALE_PAGES` (3)
-  consecutive pages contain nothing new. A full reindex walks it to the end.
-- `conversationId` on every row. Siblings of one generation share it — an average of 4.8 assets
-  per generation, up to 41 — which is the grouping the asset feed offers in place of a
-  parent/child tree.
-
-### Changed
-- The old list pass still runs, for the child trees it has and the asset feed does not. Rows it
-  created keep their child links, denormalized prompts and like state when the asset feed
-  refreshes them.
-- **Reconciliation now walks both feeds** before deleting anything, and refuses to delete at all
-  if the asset walk fails. Without that it would have considered every asset-feed row missing —
-  the list walk cannot see recent media — and tried to delete it.
-
-### Note on the source probe
-- `filter.source` on the old endpoint is **ignored**, not honoured: `sort: "BANANA"` behaves
-  exactly like `sort: "CREATE_TIME_DESC"`, and every invented `MEDIA_POST_SOURCE_*` returns 200.
-  The v1.66.0 probe was therefore comparing twelve identical requests, and its "beyond likes"
-  ranking picked `(none)` — unordered and childless — over `MEDIA_SOURCE_LIKED`. It no longer
-  matters which it picks, because the asset feed is what reaches current media.
-
-### Tooling
-- New `assets` suite: 52 assertions covering parsing, the ordered early stop, merge-onto-existing,
-  and the reconcile safety property. 467 total. Three mutations — stopping after one stale page,
-  reconcile ignoring the asset feed, and an unencoded storage key — confirm it fails when broken.
-
----
-
-## [1.67.1] — 2026-08-26
-
-Two display faults, both long-standing rather than new, and both reported together because they
-have the same trigger: *Results only* being off.
+## [1.69.4] — 2026-08-28
 
 ### Fixed
-- **Collapsing the search bar destroyed the *Results only* preference.** `setSearchBarExpanded()`
-  forces the flag off while collapsed, and it used to save the flag to storage first. But
-  `ensureSearchBarToggle()` runs on every init, including the re-inits an SPA navigation triggers
-  — so the first collapse stored the real preference and the *next* init, with the flag already
-  forced off, overwrote it with `'0'`. Expanding restored that `'0'`, and from then on the script
-  rendered **nothing until a filter was typed**. Only the checkbox handler writes the key now,
-  because only a click is a preference.
-- **The inline results viewport had no background.** It is `position: fixed` above Grok's own
-  page, so with *Results only* off the results and the page underneath interleaved. It now paints
-  its own surface, matching the results panel.
 
-### Tooling
-- New `search-bar-state` suite: 23 assertions, including a five-cycle collapse/expand round trip
-  in both directions. 490 total. Two mutations — restoring the write-back, and removing the
-  background — confirm it fails when either regresses.
-
----
-
-## [1.67.2] — 2026-08-26
-
-### Fixed
-- **Grok's stock character assets were being indexed.** `Lena-Picture.png`, `Michael-Voice.mp3`
-  and friends are copied into every account (`auxKeys.duplicated_from_asset_id` points at the
-  original) and carry no `mediaGenInput`, so they appeared as blank cards nobody had made — and
-  one of them is an `audio/mpeg` file rendered into an `<img>`, which can only ever be empty.
-  `parseAsset()` now skips any asset flagged `imagine_official_asset: "true"` or whose MIME type
-  is not `image/*` or `video/*`, and the reconciliation walk applies the same rule so **Verify**
-  clears out the ones already indexed.
-
-  Checked against 900 live assets: 8 matched, every one a stock `*-Voice.mp3` / `*-Picture.png`,
-  and no ordinary generated image was caught. Deliberately **not** used as signals: a missing
-  `mediaGenInput`, which would also drop the user's own uploads, and the `.../content` URL shape,
-  which 4,231 perfectly good rows in a real index also use.
-
-### Tooling
-- 14 more assertions in the `assets` suite, 504 total. Three mutations confirm it, including one
-  that keys the stock check on the flag being *present* rather than being `"true"` — the values
-  are strings, and `"false"` is common.
-
----
-
-## [1.68.0] — 2026-08-26
-
-### Added
-- **Delete**, in three places: **Delete selected** in the results panel, a **Delete** button in the
-  lightbox, and *Delete…* in the right-click menu. All three go through one confirmation that
-  names the exact count and says the action is permanent, with **Cancel focused** so a stray Enter
-  cannot confirm it.
-
-  A row only leaves the index once the server has accepted the delete. If a delete fails the row
-  stays, because hiding media that still exists would misrepresent what the account holds. An
-  item that was *already* gone (404) counts as done; a 403 or 500 does not.
-- **Like button in the lightbox** alongside Delete, and the heart moved to the **top-right** of
-  each card. The child/variation marker moves to the bottom-left to make room.
-
-### Fixed
-- **Liking works out of the box.** It required `tools/capture-like.js` to have been run first, and
-  without a stored template the buttons just said so — which is why liking appeared broken. The
-  real endpoints are now built in. A captured template still overrides them if a deployment
-  differs.
-
-### On how the endpoints were found
-- `POST /rest/media/post/like`, `/unlike` and `/delete` all take `{ id }`. That was established by
-  probing each with a UUID that cannot exist: the wrong field name still reports the field as
-  missing, while the right one gets past validation and answers 404. So the shapes are known
-  rather than guessed, and **nothing real was touched to learn them**.
-
-### Tooling
-- New `delete` suite: 43 assertions on consent and on never removing a row the server kept. 547
-  total. Three mutations — proceeding without consent, removing rows regardless of the response,
-  and counting a 403 as success — confirm it fails when any of those safety properties break.
-
----
-
-## [1.68.1] — 2026-08-26
-
-### Fixed
-- **Liking really works now.** v1.68.0 called `/rest/media/post/like`, which answers `200` and
-  **does nothing** — caught by liking a post through it and re-reading the post, which came back
-  unliked. Grok moved likes into collections: every account has a default collection named
-  "Liked", and the heart adds to or removes from it via
-  `/rest/media/collection/assets/{add,remove}` with `{ collectionId, assetIds }`. The collection
-  id is resolved once from `collection/list` (by `isDefault`, falling back to the name) and
-  cached.
-
-  Both endpoints report `addedCount` / `removedCount`, so a call that changed nothing is
-  distinguishable from one that did — the exact failure mode that made the previous attempt look
-  like it had worked.
-
-### Tooling
-- 26 more assertions across the `liked` and `delete` suites, 573 total. Three mutations, including
-  one that reports a no-op as a real change and one that picks the wrong collection.
-
----
-
-## [1.68.2] — 2026-08-26
-
-### Fixed
-- **The lightbox never showed Like or Delete.** They were chained off
-  `ensureLightboxDownloadButton()`, which returns early when its own button already exists — and
-  Download is part of the lightbox template, so it always did. Neither button was ever injected;
-  the Like button had been invisible this way since v1.64.0. All three now hang off one
-  `ensureLightboxButtons()`, each responsible only for itself.
-
-  This is the same hazard as the search-bar one fixed in v1.66.1: **an `ensure*` that guards on
-  one element must never be the thing that creates another.** The `search-bar-parts` suite now
-  covers the lightbox too.
-
----
-
-## [1.68.3] — 2026-08-26
-
-### Fixed
-- **Lightbox Like and Delete still did not appear** after v1.68.2, because
-  `ensureResultLightbox()` has *two* paths as well — reuse an existing lightbox, or build one from
-  a template that carries Download alone — and only the reuse path ran the chain. On a fresh page
-  load the template path is the one taken, so the buttons were never injected. Both paths now run
-  `ensureLightboxButtons()`.
-
-  Third occurrence of one hazard, so it is now written down as an invariant in `CLAUDE.md` and
-  asserted structurally for both builders.
-
----
-
-## [1.68.4] — 2026-08-26
-
-### Added
-- The running version is published as `data-grok-search-version` on `<html>`. Check what is
-  actually installed with `document.documentElement.dataset.grokSearchVersion` in the console —
-  without it, a stale Tampermonkey install is hard to tell apart from a fix that did not work,
-  which cost real time chasing the lightbox buttons.
-
----
-
-## [1.68.5] — 2026-08-26
-
-`grokPostSidebar.user.js` goes to 1.3.2 for the same change. No behaviour change; the version bump
-exists so Tampermonkey ships the new licence headers.
-
-### Changed
-- **Relicensed to GPL-3.0.** This project was forked from
-  [ironsniper1/Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search),
-  which declares **two different licences**: its `LICENSE` file is the full GPL-3.0 text (what
-  GitHub reports), while its README says "MIT — do whatever you want with it". Where they
-  disagree this project follows the **stricter** of the two rather than the more convenient one.
-  `LICENSE` is now the verbatim GNU GPLv3, both userscripts carry `@license GPL-3.0-only` plus the
-  standard notice, and the copyright credits IronSniper1 alongside Richard Lipka.
-- **Corrected the lineage.** The README described the Greasy Fork script as the original with
-  IronSniper1 downstream of it. That was backwards: IronSniper1's repo was created 2026-03-07, the
-  Greasy Fork script on 2026-03-20, and that script states it was *"Forked from IronSniper1"*. The
-  Credits table now reflects what each source actually says, and links back to Strapples' GitHub as
-  their script asks.
-- The `@author` header said "AnnaLynn (original), Richard Lipka (enhanced fork)"; it now reads
-  "Richard Lipka, based on IronSniper1".
-
----
-
-## Unreleased
-
-Nothing here changes the installed userscripts — no version bump.
-
-### Repository
-- The repository left GitHub's fork network and is now standalone. The README's fork-setup
-  instructions described adding an `upstream` remote and were long obsolete; they are replaced by
-  a short **Repository** section.
-- **Credit is unaffected and stays.** Leaving the fork network is a hosting change; it says nothing
-  about where the idea came from. The old "Fork lineage" table is now **Credits and origins**,
-  still naming AnnaLynn's original and the `ironsniper1` fork this was started from.
-
-### Corrected
-- The v1.63.0 notes said **Verify** was needed to find *posts liked long after they were created*.
-  That was based on a wrong assumption about feed ordering. Field data shows the liked feed is
-  ordered by **like time**, not creation time (one page spanned 190 days of `createTime`), so a
-  freshly liked old post arrives at the head of the feed and the incremental sync already catches it.
-  Verify's real job is removing unliked posts and repairing truncated syncs. Docs updated.
-
-### Tooling
-- Added a dependency-free test suite: `node test/run.js` (96 assertions across records, index
-  mutation, child sync, reconciliation, and results-grid reuse). The suite slices regions out of
-  `grokSearch.js` and runs the real functions against stubs, so it covers production code rather
-  than a copy of it — see [test/README.md](test/README.md).
+- **Missing thumbnail images for video results in search results and card lists.**
+  - Video posts and assets often have `.mp4` URLs in `thumbnail` or `mediaUrl`, which an HTML `<img>` element cannot display as an image.
+  - Video result cards, compact child strips, and lightbox child rows now resolve thumbnails via `getPostThumbnailUrl(post)`:
+    1. If a video post has a dedicated image thumbnail / poster (non-video URL), it is used directly.
+    2. Otherwise, falls back to the parent post's image (`parentId`).
+    3. If parent is also a video, falls back to the root post's image (`rootId`).
+    4. If the post has child images, falls back to the first child image.
+    5. If the post is an asset generated in a batch, falls back to sibling images sharing the same `conversationId`.
+    6. Falls back to original media URL if no image ancestor/descendant is available.
 
 ---
 
@@ -340,6 +117,229 @@ Nothing here changes the installed userscripts — no version bump.
   element, which can only paint blank or correct, and loads eagerly because paging is an explicit
   request to see that page. The first paint of a fresh card is still lazy.
   Measured on a live library: after paging, 1 of 44 thumbnails had loaded; with the fix, 44 of 44.
+
+---
+
+## [1.68.5] — 2026-08-26
+
+`grokPostSidebar.user.js` goes to 1.3.2 for the same change. No behaviour change; the version bump
+exists so Tampermonkey ships the new licence headers.
+
+### Changed
+- **Relicensed to GPL-3.0.** This project was forked from
+  [ironsniper1/Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search),
+  which declares **two different licences**: its `LICENSE` file is the full GPL-3.0 text (what
+  GitHub reports), while its README says "MIT — do whatever you want with it". Where they
+  disagree this project follows the **stricter** of the two rather than the more convenient one.
+  `LICENSE` is now the verbatim GNU GPLv3, both userscripts carry `@license GPL-3.0-only` plus the
+  standard notice, and the copyright credits IronSniper1 alongside Richard Lipka.
+- **Corrected the lineage.** The README described the Greasy Fork script as the original with
+  IronSniper1 downstream of it. That was backwards: IronSniper1's repo was created 2026-03-07, the
+  Greasy Fork script on 2026-03-20, and that script states it was *"Forked from IronSniper1"*. The
+  Credits table now reflects what each source actually says, and links back to Strapples' GitHub as
+  their script asks.
+- The `@author` header said "AnnaLynn (original), Richard Lipka (enhanced fork)"; it now reads
+  "Richard Lipka, based on IronSniper1".
+
+---
+
+## [1.68.4] — 2026-08-26
+
+### Added
+- The running version is published as `data-grok-search-version` on `<html>`. Check what is
+  actually installed with `document.documentElement.dataset.grokSearchVersion` in the console —
+  without it, a stale Tampermonkey install is hard to tell apart from a fix that did not work,
+  which cost real time chasing the lightbox buttons.
+
+---
+
+## [1.68.3] — 2026-08-26
+
+### Fixed
+- **Lightbox Like and Delete still did not appear** after v1.68.2, because
+  `ensureResultLightbox()` has *two* paths as well — reuse an existing lightbox, or build one from
+  a template that carries Download alone — and only the reuse path ran the chain. On a fresh page
+  load the template path is the one taken, so the buttons were never injected. Both paths now run
+  `ensureLightboxButtons()`.
+
+  Third occurrence of one hazard, so it is now written down as an invariant in `CLAUDE.md` and
+  asserted structurally for both builders.
+
+---
+
+## [1.68.2] — 2026-08-26
+
+### Fixed
+- **The lightbox never showed Like or Delete.** They were chained off
+  `ensureLightboxDownloadButton()`, which returns early when its own button already exists — and
+  Download is part of the lightbox template, so it always did. Neither button was ever injected;
+  the Like button had been invisible this way since v1.64.0. All three now hang off one
+  `ensureLightboxButtons()`, each responsible only for itself.
+
+  This is the same hazard as the search-bar one fixed in v1.66.1: **an `ensure*` that guards on
+  one element must never be the thing that creates another.** The `search-bar-parts` suite now
+  covers the lightbox too.
+
+---
+
+## [1.68.1] — 2026-08-26
+
+### Fixed
+- **Liking really works now.** v1.68.0 called `/rest/media/post/like`, which answers `200` and
+  **does nothing** — caught by liking a post through it and re-reading the post, which came back
+  unliked. Grok moved likes into collections: every account has a default collection named
+  "Liked", and the heart adds to or removes from it via
+  `/rest/media/collection/assets/{add,remove}` with `{ collectionId, assetIds }`. The collection
+  id is resolved once from `collection/list` (by `isDefault`, falling back to the name) and
+  cached.
+
+  Both endpoints report `addedCount` / `removedCount`, so a call that changed nothing is
+  distinguishable from one that did — the exact failure mode that made the previous attempt look
+  like it had worked.
+
+### Tooling
+- 26 more assertions across the `liked` and `delete` suites, 573 total. Three mutations, including
+  one that reports a no-op as a real change and one that picks the wrong collection.
+
+---
+
+## [1.68.0] — 2026-08-26
+
+### Added
+- **Delete**, in three places: **Delete selected** in the results panel, a **Delete** button in the
+  lightbox, and *Delete…* in the right-click menu. All three go through one confirmation that
+  names the exact count and says the action is permanent, with **Cancel focused** so a stray Enter
+  cannot confirm it.
+
+  A row only leaves the index once the server has accepted the delete. If a delete fails the row
+  stays, because hiding media that still exists would misrepresent what the account holds. An
+  item that was *already* gone (404) counts as done; a 403 or 500 does not.
+- **Like button in the lightbox** alongside Delete, and the heart moved to the **top-right** of
+  each card. The child/variation marker moves to the bottom-left to make room.
+
+### Fixed
+- **Liking works out of the box.** It required `tools/capture-like.js` to have been run first, and
+  without a stored template the buttons just said so — which is why liking appeared broken. The
+  real endpoints are now built in. A captured template still overrides them if a deployment
+  differs.
+
+### On how the endpoints were found
+- `POST /rest/media/post/like`, `/unlike` and `/delete` all take `{ id }`. That was established by
+  probing each with a UUID that cannot exist: the wrong field name still reports the field as
+  missing, while the right one gets past validation and answers 404. So the shapes are known
+  rather than guessed, and **nothing real was touched to learn them**.
+
+### Tooling
+- New `delete` suite: 43 assertions on consent and on never removing a row the server kept. 547
+  total. Three mutations — proceeding without consent, removing rows regardless of the response,
+  and counting a 403 as success — confirm it fails when any of those safety properties break.
+
+---
+
+## [1.67.2] — 2026-08-26
+
+### Fixed
+- **Grok's stock character assets were being indexed.** `Lena-Picture.png`, `Michael-Voice.mp3`
+  and friends are copied into every account (`auxKeys.duplicated_from_asset_id` points at the
+  original) and carry no `mediaGenInput`, so they appeared as blank cards nobody had made — and
+  one of them is an `audio/mpeg` file rendered into an `<img>`, which can only ever be empty.
+  `parseAsset()` now skips any asset flagged `imagine_official_asset: "true"` or whose MIME type
+  is not `image/*` or `video/*`, and the reconciliation walk applies the same rule so **Verify**
+  clears out the ones already indexed.
+
+  Checked against 900 live assets: 8 matched, every one a stock `*-Voice.mp3` / `*-Picture.png`,
+  and no ordinary generated image was caught. Deliberately **not** used as signals: a missing
+  `mediaGenInput`, which would also drop the user's own uploads, and the `.../content` URL shape,
+  which 4,231 perfectly good rows in a real index also use.
+
+### Tooling
+- 14 more assertions in the `assets` suite, 504 total. Three mutations confirm it, including one
+  that keys the stock check on the flag being *present* rather than being `"true"` — the values
+  are strings, and `"false"` is common.
+
+---
+
+## [1.67.1] — 2026-08-26
+
+Two display faults, both long-standing rather than new, and both reported together because they
+have the same trigger: *Results only* being off.
+
+### Fixed
+- **Collapsing the search bar destroyed the *Results only* preference.** `setSearchBarExpanded()`
+  forces the flag off while collapsed, and it used to save the flag to storage first. But
+  `ensureSearchBarToggle()` runs on every init, including the re-inits an SPA navigation triggers
+  — so the first collapse stored the real preference and the *next* init, with the flag already
+  forced off, overwrote it with `'0'`. Expanding restored that `'0'`, and from then on the script
+  rendered **nothing until a filter was typed**. Only the checkbox handler writes the key now,
+  because only a click is a preference.
+- **The inline results viewport had no background.** It is `position: fixed` above Grok's own
+  page, so with *Results only* off the results and the page underneath interleaved. It now paints
+  its own surface, matching the results panel.
+
+### Tooling
+- New `search-bar-state` suite: 23 assertions, including a five-cycle collapse/expand round trip
+  in both directions. 490 total. Two mutations — restoring the write-back, and removing the
+  background — confirm it fails when either regresses.
+
+---
+
+## [1.67.0] — 2026-08-26
+
+Newly generated images are indexed again. Diagnosed by driving a real logged-in browser rather
+than reasoning about the code.
+
+**Grok moved Imagine's library off the API this script was built on.** `/rest/media/post/list`
+still answers, but it is unordered (two identical calls return different samples), it returns no
+child trees, and nothing created since roughly June 2026 appears in it at all. The current UI
+paginates `/rest/assets` instead, and that is what the script now walks.
+
+### Added
+- **`/rest/assets` is the primary feed.** `GET /rest/assets?pageSize=60&orderBy=ORDER_BY_CREATE_TIME&workspaceKind=WORKSPACE_KIND_IMAGINE_ALL`
+  is genuinely ordered newest-first and reaches the current day. Each row already carries the
+  prompt and model in `mediaGenInput`, and the media URL is the asset's storage `key` under
+  `assets.grok.com`, so indexing costs **one request per 60 items and nothing per item** — where
+  the old path needed a `post/get` per parent.
+  `assetId` is the same id space as a media post id, so these rows merge with existing ones
+  instead of duplicating them.
+- Because the feed is ordered, the routine sync stops once `ASSETS_SYNC_STALE_PAGES` (3)
+  consecutive pages contain nothing new. A full reindex walks it to the end.
+- `conversationId` on every row. Siblings of one generation share it — an average of 4.8 assets
+  per generation, up to 41 — which is the grouping the asset feed offers in place of a
+  parent/child tree.
+
+### Changed
+- The old list pass still runs, for the child trees it has and the asset feed does not. Rows it
+  created keep their child links, denormalized prompts and like state when the asset feed
+  refreshes them.
+- **Reconciliation now walks both feeds** before deleting anything, and refuses to delete at all
+  if the asset walk fails. Without that it would have considered every asset-feed row missing —
+  the list walk cannot see recent media — and tried to delete it.
+
+### Note on the source probe
+- `filter.source` on the old endpoint is **ignored**, not honoured: `sort: "BANANA"` behaves
+  exactly like `sort: "CREATE_TIME_DESC"`, and every invented `MEDIA_POST_SOURCE_*` returns 200.
+  The v1.66.0 probe was therefore comparing twelve identical requests, and its "beyond likes"
+  ranking picked `(none)` — unordered and childless — over `MEDIA_SOURCE_LIKED`. It no longer
+  matters which it picks, because the asset feed is what reaches current media.
+
+### Tooling
+- New `assets` suite: 52 assertions covering parsing, the ordered early stop, merge-onto-existing,
+  and the reconcile safety property. 467 total. Three mutations — stopping after one stale page,
+  reconcile ignoring the asset feed, and an unencoded storage key — confirm it fails when broken.
+
+---
+
+## [1.66.2] — 2026-08-26
+
+### Fixed
+- ***Liked only* matched nothing.** `detectLikedState()` sniffs a list of candidate field names,
+  and the one Grok actually sends — `userInteractionStatus.likeStatus` — was not on it. Every post
+  therefore detected as `null` (unknown), which the filter deliberately excludes, so the result was
+  always empty. Confirmed against a live API response rather than guessed.
+
+### Known issue
+- **Media created since roughly June 2026 is not reachable through `/rest/media/post/list` at all**,
+  so it cannot be indexed yet. See the note under Unreleased.
 
 ---
 

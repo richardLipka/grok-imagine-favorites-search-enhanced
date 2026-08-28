@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 A standalone project by **Richard Lipka**, grown from [IronSniper1's](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) base script and extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, deletion, and much else — see [Credits and origins](#credits-and-origins).
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.user.js` **v1.69.3** · `grokPostSidebar.user.js` **v1.3.2**  
+**Current versions:** `grokSearch.user.js` **v1.69.5** · `grokPostSidebar.user.js` **v1.3.2**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Credits and origins
@@ -17,7 +17,7 @@ credit.
 |--------|---------|--------------|
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | 2026-03-07 | **The base this repository was forked from.** |
 | [Strapples — Grok Imagine Favorites Search (Greasy Fork)](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) · [GrokImagineSearchandOrganize](https://github.com/Strapples/GrokImagineSearchandOrganize) | 2026-03-20 | A parallel userscript, also forked from IronSniper1. Its author asks that people link back to their GitHub, so it is linked here. |
-| **This repo** | — | Everything since: `grokSearch.user.js` v1.69.3 + `grokPostSidebar.user.js` v1.3.2 |
+| **This repo** | — | Everything since: `grokSearch.user.js` v1.69.5 + `grokPostSidebar.user.js` v1.3.2 |
 
 Earlier versions of this README described the Greasy Fork script as the original and IronSniper1 as
 downstream of it. That was the wrong way round: IronSniper1 came first, and the Greasy Fork script
@@ -182,6 +182,7 @@ Shown when **Results only** is on (default). These controls are **not** in the s
 - **Date badge** (top center) → filter to that day (click again to clear).
 - **Parent** cards: video / descendant image badges (counts include **all generations** in `childPosts` tree).
 - **Child** cards: purple **child** icon (bottom-left), own date badge. A variation that has variations of its own shows its **own** counts, so **Download all** works from it too.
+- **Video thumbnails**: video results automatically resolve to their parental image, root image, child image, or generation batch sibling image (`conversationId`) so video cards and strips are never blank.
 - **← / →** keys page results when the search box is not focused and the lightbox is closed.
 
 <a id="compact-groups"></a>

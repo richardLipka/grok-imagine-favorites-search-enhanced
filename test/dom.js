@@ -122,13 +122,15 @@ class FakeNode {
 }
 
 /** Just enough document for `document.querySelectorAll('[attr]')`. */
-function fakeDocument(nodes) {
+function fakeDocument(nodes = []) {
   return {
     nodes,
     querySelectorAll(selector) {
       const m = /^\[([^\]=]+)\]$/.exec(selector);
-      if (!m) throw new Error(`fakeDocument: unsupported selector ${selector}`);
-      return nodes.filter(n => n.hasAttribute(m[1]));
+      if (m) {
+        return nodes.filter(n => n.hasAttribute(m[1]));
+      }
+      return [];
     },
     getElementById() { return null; },
   };

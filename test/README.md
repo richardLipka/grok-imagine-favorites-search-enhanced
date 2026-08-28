@@ -35,6 +35,7 @@ Eight sandboxes:
 | `createBulkDownloadSandbox()` | `cancelBulkDownload` → `downloadSelectedPosts` | The bulk loop: cancel, the failed queue, resuming into the same folder |
 | `createFeedSandbox()` | `setAtPath` → `buildLikeRequest`, plus `readListTemplate` → `isVideoMediaType` | Captured-template replay, response-shape tolerance, source-probe ranking |
 | `createNativeVisibilitySandbox()` | `HID_GRID_ATTR` → `updateDisplayMode` | Hiding and restoring Grok's own grid, against the attribute-aware fake DOM |
+| `createThumbnailSandbox()` | `isVideoMediaType` → `matchesWithVideoFilter`, plus `getChildrenByParent` → `guessMediaExtension` | Image thumbnail resolution for video results, parent/root/child/conversation fallback |
 
 `createMetadataSandbox()` takes a **stubbed `piexif`** — the real library is a jsDelivr `@require`
 and cannot be installed here. So the JPEG path is only checked for *how* it calls piexif, while the
