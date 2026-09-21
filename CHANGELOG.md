@@ -3,6 +3,29 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.70.0] — 2026-09-21
+
+### Added & Fixed (Grok V2 Prompt Recovery & Display)
+
+- **Prompt recovery for recent Grok Imagine generations:**
+  - Grok's backend migrated from legacy `mediaPost` records to a V2 architecture where media posts and asset feeds omit direct prompt text or strip `mediaGenInput`.
+  - Added support for all generation modes in `assetGenInput`: `textToImage`, `imageToImage`, `textToVideo`, `imageToVideo`, `referenceToVideo`, and `videoExtension`.
+  - Added parent asset/post tracking via `getAssetParentId`, extracting links from `inputAssets`, `hydratedContext.parentPostId`, `hydratedContext.parentAssetId`, `gen.parentPostId`, and `auxKeys.parent_post_id`.
+  - Added parent prompt inheritance: image variations, edits, and videos with blank prompts inherit their parent's prompt (`parentPrompt`) and root prompt (`rootPrompt`).
+  - Added sibling batch prompt propagation: images generated in multi-image batches within the same conversation now propagate prompt and model metadata across siblings.
+  - Added `getJsonWithRetry` and `fetchRemoteAsset(id)` using `GET https://grok.com/rest/assets/{id}` with exponential backoff on 429/5xx.
+  - Updated `fetchRemotePost(id)` to fall back to `GET /rest/assets/{id}` and recursively resolve parent posts up to 3 levels when prompts are missing.
+- **UI Prompt Display & Lightbox Enhancements:**
+  - **Results Grid:** Card hover titles and prompt labels display the prompt or parent prompt, with an `'Inherited from parent prompt'` tooltip for inherited prompts.
+  - **Lightbox:** Displays the effective prompt, adds `'Inherited from parent post'` title and a `'Parent prompt'` metadata badge, and automatically triggers background resolution via `resolveAndApplyPostPrompt(post)` when viewing an item with a missing prompt.
+  - **Context Menu:** `Copy prompt` copies the effective or parent prompt, flashing `'parent prompt copied'` when an inherited prompt is copied.
+- **Grok Post Sidebar (v1.4.0):**
+  - Updated `grokPostSidebar.user.js` with `GET /rest/assets/{id}` fallback and recursive parent prompt inheritance.
+  - Added **Parent ID** metadata row with quick copy button.
+  - Rendered inherited prompts with a distinct purple `Inherited from parent post` badge.
+
+---
+
 ## [1.69.5] — 2026-08-28
 
 ### Fixed

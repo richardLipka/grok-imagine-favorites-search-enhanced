@@ -37,10 +37,62 @@ module.exports = {
       m.assetGenInput({ mediaGenInput: { junk: { foo: 1 }, textToImage: { prompt: 'real' } } })?.prompt, 'real');
     t.equal('no gen input at all', m.assetGenInput({}), null);
 
+    t.group('generation input oneof kinds: imageToImage, imageToVideo, videoExtension');
+    t.equal('imageToImage',
+      m.assetGenInput({ mediaGenInput: { imageToImage: { prompt: 'oil painting', modelName: 'mod-i2i' } } })?.prompt, 'oil painting');
+    t.equal('imageToVideo',
+      m.assetGenInput({ mediaGenInput: { imageToVideo: { prompt: 'cinematic pan', modelName: 'mod-i2v' } } })?.prompt, 'cinematic pan');
+    t.equal('videoExtension',
+      m.assetGenInput({ mediaGenInput: { videoExtension: { prompt: 'extend motion', modelName: 'mod-ve' } } })?.prompt, 'extend motion');
+
+    t.group('parent ID extraction from generation metadata');
+    t.equal('inputAssets string array',
+      m.getAssetParentId({ mediaGenInput: { imageToImage: { inputAssets: ['parent-asset-1'] } } }), 'parent-asset-1');
+    t.equal('inputAssets object array',
+      m.getAssetParentId({ mediaGenInput: { imageToVideo: { inputAssets: [{ assetId: 'parent-asset-2' }] } } }), 'parent-asset-2');
+    t.equal('hydratedContext parentPostId',
+      m.getAssetParentId({ mediaGenInput: { textToImage: { hydratedContext: { parentPostId: 'parent-post-3' } } } }), 'parent-post-3');
+    t.equal('hydratedContext parentAssetId',
+      m.getAssetParentId({ mediaGenInput: { imageToImage: { hydratedContext: { parentAssetId: 'parent-asset-4' } } } }), 'parent-asset-4');
+    t.equal('direct parentPostId on gen',
+      m.getAssetParentId({ mediaGenInput: { imageToImage: { parentPostId: 'parent-post-5' } } }), 'parent-post-5');
+    t.equal('auxKeys parent_post_id',
+      m.getAssetParentId({ auxKeys: { parent_post_id: 'parent-post-6' } }), 'parent-post-6');
+    t.equal('auxKeys duplicated_from_asset_id for user asset',
+      m.getAssetParentId({ auxKeys: { duplicated_from_asset_id: 'parent-asset-7' } }), 'parent-asset-7');
+    t.equal('stock asset duplicated_from_asset_id is not treated as parent',
+      m.getAssetParentId({ auxKeys: { imagine_official_asset: 'true', duplicated_from_asset_id: 'orig-stock' } }), null);
+
     t.group('media type from the MIME type');
     t.equal('image', m.assetMediaType(asset('a')), 'MEDIA_POST_TYPE_IMAGE');
     t.equal('video', m.assetMediaType(asset('a', { mimeType: 'video/mp4' })), 'MEDIA_POST_TYPE_VIDEO');
     t.equal('unknown stays empty rather than guessing', m.assetMediaType({ mimeType: 'application/pdf' }), '');
+
+    t.group('parsing an asset with parent inherits parent prompt if available');
+    const sandboxWithParent = createIndexSandbox();
+    sandboxWithParent.addPostRow(sandboxWithParent.normalizePost({
+      id: 'parent-p1',
+      prompt: 'parent dragon prompt',
+      createTime: '2026-08-25T10:00:00Z',
+    }));
+    const childAssetRow = sandboxWithParent.parseAsset(asset('child-a1', {
+      mediaGenInput: { imageToImage: { inputAssets: ['parent-p1'], prompt: '' } },
+    }));
+    t.equal('child is marked as child post', childAssetRow.isChild, true);
+    t.equal('child parentId points to parent', childAssetRow.parentId, 'parent-p1');
+    t.equal('child inherits parentPrompt', childAssetRow.parentPrompt, 'parent dragon prompt');
+    t.equal('child effective prompt is parent prompt', childAssetRow.prompt, 'parent dragon prompt');
+
+    t.group('propagateBatchPrompts propagates prompts across conversation siblings');
+    const batchBox = createIndexSandbox();
+    const b1 = batchBox.normalizePost({ id: 'b1', prompt: 'glowing futuristic city', conversationId: 'conv-batch-42', createTime: '2026-08-27T12:00:00Z' });
+    const b2 = batchBox.normalizePost({ id: 'b2', prompt: '', conversationId: 'conv-batch-42', createTime: '2026-08-27T12:00:05Z' });
+    const b3 = batchBox.normalizePost({ id: 'b3', prompt: '', conversationId: 'conv-batch-42', createTime: '2026-08-27T12:00:10Z' });
+    const batchRows = [b1, b2, b3];
+    const propagatedCount = batchBox.propagateBatchPrompts(batchRows, null);
+    t.equal('two siblings received prompt', propagatedCount, 2);
+    t.equal('sibling 2 got prompt', b2.prompt, 'glowing futuristic city');
+    t.equal('sibling 3 got prompt', b3.prompt, 'glowing futuristic city');
 
     t.group('parsing an asset into an index row');
     const row = m.parseAsset(asset('a'));

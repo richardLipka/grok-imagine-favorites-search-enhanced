@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.69.5
+// @version      1.70.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -134,7 +134,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.69.5';
+  const SCRIPT_VERSION = '1.70.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -358,13 +358,13 @@
     return HTTP_RETRY_BASE_MS * 2 ** attempt;
   }
 
-  function gmRequestOnce(url, body, headers) {
+  function gmRequestOnce(url, body, headers, method = 'POST') {
     return new Promise(resolve => {
       GM_xmlhttpRequest({
-        method: 'POST',
+        method,
         url,
-        headers: { 'Content-Type': 'application/json', ...(headers || {}) },
-        data: JSON.stringify(body),
+        headers: { ...(method !== 'GET' ? { 'Content-Type': 'application/json' } : { Accept: 'application/json' }), ...(headers || {}) },
+        data: method !== 'GET' && body != null ? JSON.stringify(body) : undefined,
         withCredentials: true,
         onload: res => resolve({ status: res.status, text: res.responseText, headers: res.responseHeaders }),
         onerror: () => resolve({ status: 0, text: '', headers: '' }),
@@ -379,7 +379,7 @@
    */
   async function postJsonWithRetry(url, body, label, headers) {
     for (let attempt = 0; ; attempt++) {
-      const res = await gmRequestOnce(url, body, headers);
+      const res = await gmRequestOnce(url, body, headers, 'POST');
       if (res.status >= 200 && res.status < 300) {
         try {
           return { ok: true, data: JSON.parse(res.text) };
@@ -390,6 +390,31 @@
       }
       if (!isRetryableStatus(res.status) || attempt >= HTTP_MAX_RETRIES) {
         console.warn(`[GrokSearch] ${label} HTTP ${res.status}`);
+        return { ok: false, status: res.status };
+      }
+      const wait = retryDelayMs(attempt, res.headers);
+      console.warn(`[GrokSearch] ${label} HTTP ${res.status} — retrying in ${wait}ms`);
+      setLoadStatus(`rate limited — retrying…`);
+      await sleep(wait);
+    }
+  }
+
+  /**
+   * GET with backoff on 429/5xx. Used for reading individual asset generation metadata.
+   */
+  async function getJsonWithRetry(url, label, headers) {
+    for (let attempt = 0; ; attempt++) {
+      const res = await gmRequestOnce(url, null, headers, 'GET');
+      if (res.status >= 200 && res.status < 300) {
+        try {
+          return { ok: true, data: JSON.parse(res.text) };
+        } catch {
+          console.warn(`[GrokSearch] ${label} response was not JSON`);
+          return { ok: false, status: res.status };
+        }
+      }
+      if (!isRetryableStatus(res.status) || attempt >= HTTP_MAX_RETRIES) {
+        if (res.status !== 404) console.warn(`[GrokSearch] ${label} HTTP ${res.status}`);
         return { ok: false, status: res.status };
       }
       const wait = retryDelayMs(attempt, res.headers);
@@ -1183,11 +1208,66 @@
     return location.href.includes('/imagine') && !location.href.includes('/imagine/post/');
   }
 
-  async function fetchRemotePost(id) {
-    const res = await postJsonWithRetry(POST_GET, { id }, 'post/get');
-    if (!res.ok) return null;
-    const data = res.data;
-    return data?.post ?? data?.mediaPost ?? data?.item ?? data;
+  async function fetchRemoteAsset(id) {
+    if (typeof getJsonWithRetry !== 'function') return null;
+    const res = await getJsonWithRetry(`${ASSETS_ENDPOINT}/${encodeURIComponent(id)}`, 'asset/get');
+    if (!res?.ok || !res.data) return null;
+    return res.data;
+  }
+
+  async function fetchRemotePost(id, depth = 0, maxDepth = 3) {
+    let remote = null;
+    if (typeof postJsonWithRetry === 'function') {
+      const res = await postJsonWithRetry(POST_GET, { id }, 'post/get');
+      if (res?.ok && res.data) {
+        remote = res.data?.post ?? res.data?.mediaPost ?? res.data?.item ?? res.data;
+      }
+    }
+    const hasPrompt = Boolean(remote?.prompt?.trim());
+    if (!hasPrompt) {
+      const asset = await fetchRemoteAsset(id);
+      if (asset) {
+        const gen = assetGenInput(asset);
+        const assetParentId = getAssetParentId(asset, gen);
+        const ownPrompt = String(gen?.prompt || asset?.summary || '').trim();
+        const model = gen?.modelName || '';
+        if (remote) {
+          remote.prompt = ownPrompt || remote.prompt || '';
+          if (model && !remote.model) remote.model = model;
+          if (assetParentId && !remote.parentId) remote.parentId = assetParentId;
+        } else {
+          remote = {
+            id,
+            prompt: ownPrompt,
+            model,
+            parentId: assetParentId,
+            mediaType: assetMediaType(asset),
+            mediaUrl: assetMediaUrl(asset),
+            thumbnail: assetMediaUrl(asset),
+            createTime: String(asset.createTime || ''),
+          };
+        }
+
+        // If prompt is still blank and there is a parent, resolve prompt from parent
+        if (!remote.prompt && remote.parentId && depth < maxDepth) {
+          const parentId = remote.parentId;
+          const cachedParent = postById.get(parentId);
+          if (cachedParent?.prompt) {
+            remote.parentPrompt = cachedParent.prompt;
+            remote.rootPrompt = cachedParent.rootPrompt || cachedParent.prompt;
+            remote.prompt = cachedParent.prompt;
+          } else {
+            const parentRemote = await fetchRemotePost(parentId, depth + 1, maxDepth);
+            if (parentRemote?.prompt) {
+              remote.parentPrompt = parentRemote.prompt;
+              remote.rootPrompt = parentRemote.rootPrompt || parentRemote.prompt;
+              remote.prompt = parentRemote.prompt;
+            }
+          }
+        }
+      }
+    }
+    return remote;
   }
 
   function mergePostFromRemote(cached, remote) {
@@ -1196,13 +1276,64 @@
     return normalizePost({
       ...cached,
       ...parsed,
-      isChild: false,
-      parentId: null,
-      rootId: null,
-      parentPrompt: null,
-      rootPrompt: null,
+      isChild: remote.parentId ? true : (cached.isChild || false),
+      parentId: remote.parentId || cached.parentId || null,
+      rootId: remote.rootId || cached.rootId || remote.parentId || cached.parentId || null,
+      parentPrompt: remote.parentPrompt || cached.parentPrompt || null,
+      rootPrompt: remote.rootPrompt || cached.rootPrompt || null,
+      prompt: remote.prompt || cached.prompt || '',
     });
   }
+
+  async function resolveAndApplyPostPrompt(post) {
+    if (!post?.id) return false;
+    if (post.prompt && post.prompt.trim()) return false;
+
+    // 1. Check parent in postById if parentId is known
+    if (post.parentId && typeof postById !== 'undefined') {
+      const cachedParent = postById.get(post.parentId);
+      if (cachedParent && (cachedParent.prompt || cachedParent.parentPrompt)) {
+        const pPrompt = cachedParent.prompt || cachedParent.parentPrompt;
+        post.parentPrompt = cachedParent.prompt || cachedParent.parentPrompt;
+        post.rootPrompt = cachedParent.rootPrompt || pPrompt;
+        post.prompt = pPrompt;
+        updatePostRow(post);
+        if (typeof dbPutMany === 'function') await dbPutMany([post]);
+        return true;
+      }
+    }
+
+    // 2. Try sibling batch match by conversationId
+    if (post.conversationId && typeof allPosts !== 'undefined') {
+      for (const other of allPosts) {
+        if (other.id !== post.id && other.conversationId === post.conversationId && other.prompt && other.prompt.trim()) {
+          post.prompt = other.prompt.trim();
+          if (other.model && !post.model) post.model = other.model;
+          updatePostRow(post);
+          if (typeof dbPutMany === 'function') await dbPutMany([post]);
+          return true;
+        }
+      }
+    }
+
+    // 3. Query remote post (which now tries post/get and falls back to GET /rest/assets/{id} and parent)
+    try {
+      const remote = await fetchRemotePost(post.id);
+      if (remote && (remote.prompt || remote.model || remote.parentId)) {
+        const merged = mergePostFromRemote(post, remote);
+        if (merged.prompt || merged.parentId) {
+          Object.assign(post, merged);
+          updatePostRow(post);
+          if (typeof dbPutMany === 'function') await dbPutMany([post]);
+          return true;
+        }
+      }
+    } catch (err) {
+      console.warn(`[GrokSearch] Failed to resolve prompt for ${post.id}`, err);
+    }
+    return false;
+  }
+
 
   /**
    * Only worth running when the parent prompt actually changed — callers must check first.
@@ -1792,13 +1923,45 @@
 
   /**
    * `mediaGenInput` is a oneof: textToImage, imageToVideo, textToVideo, … Rather than listing
-   * them, take the first branch that carries a prompt, so a new generation mode still indexes.
+   * them, take the first branch that carries a prompt or generation context.
    */
   function assetGenInput(asset) {
     const gen = asset?.mediaGenInput;
     if (!gen || typeof gen !== 'object') return null;
+    const KINDS = ['textToImage', 'imageToImage', 'textToVideo', 'imageToVideo', 'referenceToVideo', 'videoExtension'];
+    for (const k of KINDS) {
+      if (gen[k] && typeof gen[k] === 'object') return gen[k];
+    }
     for (const value of Object.values(gen)) {
-      if (value && typeof value === 'object' && (value.prompt || value.modelName)) return value;
+      if (value && typeof value === 'object' && (value.prompt || value.modelName || value.inputAssets || value.hydratedContext || value.parentPostId)) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  function getAssetParentId(asset, gen) {
+    if (!gen) gen = assetGenInput(asset);
+    const inputAssets = gen?.inputAssets || gen?.input?.inputAssets;
+    if (Array.isArray(inputAssets) && inputAssets.length > 0) {
+      const first = inputAssets[0];
+      const id = typeof first === 'string' ? first : String(first?.assetId || first?.id || '');
+      if (id) return id;
+    } else if (typeof inputAssets === 'string' && inputAssets) {
+      return inputAssets;
+    }
+
+    const ctx = gen?.hydratedContext || gen?.input?.hydratedContext || asset?.mediaGenInput?.hydratedContext;
+    if (ctx?.parentPostId) return String(ctx.parentPostId);
+    if (ctx?.parentAssetId) return String(ctx.parentAssetId);
+
+    if (gen?.parentPostId) return String(gen.parentPostId);
+    if (gen?.parentId) return String(gen.parentId);
+
+    if (asset?.auxKeys?.parent_post_id) return String(asset.auxKeys.parent_post_id);
+    if (asset?.auxKeys?.parent_asset_id) return String(asset.auxKeys.parent_asset_id);
+    if (asset?.auxKeys?.duplicated_from_asset_id && String(asset.auxKeys.imagine_official_asset) !== 'true') {
+      return String(asset.auxKeys.duplicated_from_asset_id);
     }
     return null;
   }
@@ -1838,19 +2001,36 @@
     if (!id || !isIndexableAsset(asset)) return null;
     const gen = assetGenInput(asset);
     const url = assetMediaUrl(asset);
+    const parentId = getAssetParentId(asset, gen);
+    const ownPrompt = String(gen?.prompt || asset?.summary || '').trim();
+
+    let parentPrompt = null;
+    let rootId = null;
+    let rootPrompt = null;
+    if (parentId && typeof postById !== 'undefined') {
+      const cachedParent = postById.get(parentId);
+      if (cachedParent) {
+        parentPrompt = cachedParent.prompt || cachedParent.parentPrompt || null;
+        rootId = cachedParent.rootId || cachedParent.parentId || parentId;
+        rootPrompt = cachedParent.rootPrompt || cachedParent.parentPrompt || cachedParent.prompt || null;
+      }
+    }
+
+    const effectivePrompt = ownPrompt || parentPrompt || rootPrompt || '';
+
     return {
       id,
-      prompt: String(gen?.prompt || asset?.summary || ''),
+      prompt: effectivePrompt,
       thumbnail: url,
       mediaUrl: url,
       createTime: String(asset?.createTime || ''),
       model: String(gen?.modelName || ''),
       mediaType: assetMediaType(asset),
-      isChild: false,
-      parentId: null,
-      rootId: null,
-      parentPrompt: null,
-      rootPrompt: null,
+      isChild: Boolean(parentId),
+      parentId: parentId || null,
+      rootId: rootId || parentId || null,
+      parentPrompt,
+      rootPrompt,
       conversationId: String(asset?.sourceConversationId || ''),
       isLiked: detectLikedState(asset),
       childPostCount: 0,
@@ -1858,6 +2038,72 @@
       childVideoCount: 0,
       videoCount: assetMediaType(asset) === 'MEDIA_POST_TYPE_VIDEO' ? 1 : 0,
     };
+  }
+
+  /**
+   * Propagates prompts between siblings generated in the same batch or from parent to child.
+   */
+  function propagateBatchPrompts(rows, writer) {
+    if (!rows || !rows.length) return 0;
+    let propagated = 0;
+
+    // 1. Pass: resolve parentId if present
+    for (const post of rows) {
+      if (post.parentId && (!post.prompt || !post.prompt.trim()) && typeof postById !== 'undefined') {
+        const parent = postById.get(post.parentId);
+        if (parent && (parent.prompt || parent.parentPrompt || parent.rootPrompt)) {
+          const pPrompt = parent.prompt || parent.parentPrompt || parent.rootPrompt;
+          post.parentPrompt = post.parentPrompt || pPrompt;
+          post.rootPrompt = post.rootPrompt || parent.rootPrompt || pPrompt;
+          post.rootId = post.rootId || parent.rootId || parent.id;
+          post.prompt = pPrompt;
+          propagated++;
+          if (writer) writer.put(post);
+        }
+      }
+    }
+
+    // 2. Pass: group by conversationId for siblings generated in same batch
+    const byConv = new Map();
+    for (const post of rows) {
+      if (post.conversationId) {
+        if (!byConv.has(post.conversationId)) byConv.set(post.conversationId, []);
+        byConv.get(post.conversationId).push(post);
+      }
+    }
+
+    for (const [convId, group] of byConv.entries()) {
+      let donorPrompt = '';
+      let donorModel = '';
+      for (const p of group) {
+        if (p.prompt && p.prompt.trim()) {
+          donorPrompt = p.prompt.trim();
+          donorModel = p.model || '';
+          break;
+        }
+      }
+      if (!donorPrompt && typeof allPosts !== 'undefined') {
+        for (const existing of allPosts) {
+          if (existing.conversationId === convId && existing.prompt && existing.prompt.trim()) {
+            donorPrompt = existing.prompt.trim();
+            donorModel = existing.model || '';
+            break;
+          }
+        }
+      }
+      if (donorPrompt) {
+        for (const p of group) {
+          if (!p.prompt || !p.prompt.trim()) {
+            p.prompt = donorPrompt;
+            if (donorModel && !p.model) p.model = donorModel;
+            propagated++;
+            if (writer) writer.put(p);
+          }
+        }
+      }
+    }
+
+    return propagated;
   }
 
   /**
@@ -1899,16 +2145,16 @@
         const merged = normalizePost({
           ...cached,
           ...parsed,
-          isChild: cached.isChild,
-          parentId: cached.parentId,
-          rootId: cached.rootId,
-          parentPrompt: cached.parentPrompt,
-          rootPrompt: cached.rootPrompt,
+          isChild: Boolean(cached.parentId || parsed.parentId || cached.isChild || parsed.isChild),
+          parentId: cached.parentId || parsed.parentId || null,
+          rootId: cached.rootId || parsed.rootId || cached.parentId || parsed.parentId || null,
+          parentPrompt: cached.parentPrompt || parsed.parentPrompt || null,
+          rootPrompt: cached.rootPrompt || parsed.rootPrompt || null,
           childPostCount: cached.childPostCount,
           childImageCount: cached.childImageCount,
           childVideoCount: cached.childVideoCount,
           videoCount: cached.videoCount ?? parsed.videoCount,
-          prompt: parsed.prompt || cached.prompt,
+          prompt: parsed.prompt || cached.prompt || parsed.parentPrompt || cached.parentPrompt || '',
           isLiked: parsed.isLiked ?? cached.isLiked ?? null,
         });
         if (postMetadataChanged(cached, merged)) {
@@ -1932,6 +2178,7 @@
     }
 
     if (fresh.length) {
+      propagateBatchPrompts(fresh, writer);
       sortAllPostsNewestFirst();
       for (const row of fresh) writer.put(row);
     }
@@ -4251,9 +4498,13 @@
         if (post.id) window.open(getPostDetailUrl(post.id), '_blank');
         else window.open(getPostMediaUrl(post), '_blank');
         break;
-      case 'copy-prompt':
-        if (await copyText(post.prompt)) flashStampStatus('prompt copied');
+      case 'copy-prompt': {
+        const promptToCopy = post.prompt || post.parentPrompt || post.rootPrompt || '';
+        if (await copyText(promptToCopy)) {
+          flashStampStatus(post.prompt ? 'prompt copied' : (promptToCopy ? 'parent prompt copied' : 'no prompt to copy'));
+        }
         break;
+      }
       case 'copy-url':
         if (await copyText(getPostMediaUrl(post))) flashStampStatus('URL copied');
         break;
@@ -4526,14 +4777,42 @@
       ? `<video class="grok-lightbox-media" src="${escapeHtml(mediaUrl)}" controls autoplay playsinline></video>`
       : `<img class="grok-lightbox-media" src="${escapeHtml(mediaUrl)}" alt="${escapeHtml(imageAltText(post.prompt))}" />`;
 
-    promptEl.textContent = post.prompt || '(no prompt)';
+    const displayPrompt = post.prompt || post.parentPrompt || post.rootPrompt || '';
+    promptEl.textContent = displayPrompt || '(no prompt)';
+    if (!post.prompt && post.parentPrompt) {
+      promptEl.title = 'Inherited from parent post';
+    } else {
+      promptEl.title = '';
+    }
+
     const bits = [];
     bits.push(`${lightboxIndex + 1} / ${matchedPosts.length.toLocaleString()}`);
     const dateStr = formatPostDate(post.createTime);
     if (dateStr) bits.push(dateStr);
     if (post.model) bits.push(post.model);
-    if (isChildPost(post)) bits.push('Child post');
+    if (isChildPost(post)) bits.push(post.parentId ? `Child post (${post.parentId.slice(0, 8)}…)` : 'Child post');
+    if (!post.prompt && (post.parentPrompt || post.rootPrompt)) bits.push('Parent prompt');
     subEl.textContent = bits.join(' · ');
+
+    if (!post.prompt && !post.parentPrompt && post.id) {
+      resolveAndApplyPostPrompt(post).then(resolved => {
+        if (resolved && matchedPosts[lightboxIndex]?.id === post.id) {
+          const updated = post.prompt || post.parentPrompt || post.rootPrompt || '';
+          if (updated) {
+            promptEl.textContent = updated;
+            if (!post.prompt && post.parentPrompt) promptEl.title = 'Inherited from parent post';
+            const updatedBits = [];
+            updatedBits.push(`${lightboxIndex + 1} / ${matchedPosts.length.toLocaleString()}`);
+            const d = formatPostDate(post.createTime);
+            if (d) updatedBits.push(d);
+            if (post.model) updatedBits.push(post.model);
+            if (isChildPost(post)) updatedBits.push(post.parentId ? `Child post (${post.parentId.slice(0, 8)}…)` : 'Child post');
+            if (!post.prompt && (post.parentPrompt || post.rootPrompt)) updatedBits.push('Parent prompt');
+            subEl.textContent = updatedBits.join(' · ');
+          }
+        }
+      });
+    }
 
     renderLightboxChildRow(post);
     syncLightboxLikeButton();
@@ -5054,11 +5333,14 @@
     const dateKey = formatPostDateKey(post.createTime);
     const dateStr = formatPostDate(post.createTime);
     const mediaUrl = post.mediaUrl || '';
-    const prompt = post.prompt || '';
+    const prompt = post.prompt || post.parentPrompt || post.rootPrompt || '';
+    const cardTitle = post.prompt
+      ? post.prompt
+      : (post.parentPrompt ? `[Parent prompt]: ${post.parentPrompt}` : (prompt || ''));
 
     if (card.dataset.id !== post.id) card.dataset.id = post.id;
     if (card.dataset.media !== mediaUrl) card.dataset.media = mediaUrl;
-    if (card.title !== prompt) card.title = prompt;
+    if (card.title !== cardTitle) card.title = cardTitle;
     card.classList.toggle('grok-result-card--child', childCard);
     card.classList.toggle('grok-result-card--group', children.length > 0);
     card.classList.toggle('grok-result-card--selected', selected);
@@ -5112,7 +5394,14 @@
     syncCardImage(card, getPostThumbnailUrl(post), prompt);
 
     const promptEl = card.querySelector('.grok-result-prompt');
-    if (promptEl && promptEl.textContent !== prompt) promptEl.textContent = prompt;
+    if (promptEl) {
+      if (promptEl.textContent !== prompt) promptEl.textContent = prompt;
+      if (!post.prompt && post.parentPrompt) {
+        promptEl.title = 'Inherited from parent prompt';
+      } else {
+        promptEl.title = '';
+      }
+    }
 
     const badges = card.querySelector('.grok-result-badges');
     if (badges) {

@@ -132,6 +132,7 @@ function createIndexSandbox() {
       pickDeepRefreshTargets, removeRowsById, reconcileLikedIndex, verifyIndexIntegrity,
       getRootIdOf, removeDescendantsOfRoot, buildPromptById, computeSearchText,
       buildAssetsUrl, fetchAssetPage, assetMediaUrl, assetGenInput, assetMediaType,
+      getAssetParentId, propagateBatchPrompts,
       parseAsset, syncAssetsFeed, isIndexableAsset,
     };
   `;

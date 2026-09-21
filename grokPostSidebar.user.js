@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Post Sidebar (prompt)
 // @namespace    http://tampermonkey.net/
-// @version      1.3.2
+// @version      1.4.0
 // @description  Collapsible sidebar on /imagine/post/{id}: metadata and prompt from IndexedDB and Grok API.
 // @author       Richard Lipka
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -36,6 +36,7 @@
   const DB_VERSION = 1;
   const STORE_NAME = 'posts';
   const POST_GET = 'https://grok.com/rest/media/post/get';
+  const ASSETS_ENDPOINT = 'https://grok.com/rest/assets';
   const POST_ID_RE = /\/imagine\/post\/([0-9a-f-]{36})/i;
   const COLLAPSED_KEY = 'grokPostSidebarCollapsed';
 
@@ -88,12 +89,21 @@
     const childPostCount = fromChildren?.childPostCount ?? c.childPostCount;
     const hasChildFields = childPostCount != null;
 
+    const parentId = r.parentId || c.parentId || null;
+    const parentPrompt = r.parentPrompt || c.parentPrompt || null;
+    const ownPrompt = String(r.prompt || r.originalPrompt || c.prompt || '').trim();
+    const promptInherited = Boolean(r.promptInherited || (!ownPrompt && parentPrompt));
+    const effectivePrompt = ownPrompt || parentPrompt || '';
+
     return {
       id: String(r.id || c.id || getPostIdFromUrl() || ''),
-      prompt: String(r.prompt || r.originalPrompt || c.prompt || '').trim(),
+      prompt: effectivePrompt,
+      parentPrompt,
+      parentId,
+      promptInherited,
       createTime: r.createTime || r.createdAt || r.create_time || c.createTime || '',
-      model: r.modelName || r.model || r.modelId || '',
-      mediaType: r.mediaType || '',
+      model: r.modelName || r.model || r.modelId || c.model || '',
+      mediaType: r.mediaType || c.mediaType || '',
       mediaUrl: r.mediaUrl || r.hdMediaUrl || c.mediaUrl || '',
       thumbnail: r.thumbnailImageUrl || r.thumbnail || c.thumbnail || '',
       childPostCount: hasChildFields ? (childPostCount ?? 0) : null,
@@ -146,6 +156,9 @@
     };
 
     push('Post ID', meta.id, { mono: true, copyValue: meta.id });
+    if (meta.parentId) {
+      push('Parent ID', meta.parentId, { mono: true, copyValue: meta.parentId });
+    }
     push('Date', formatDate(meta.createTime));
     push('Model', meta.model);
     push('Type', formatMediaType(meta.mediaType));
@@ -177,8 +190,73 @@
     });
   }
 
-  function fetchRemotePost(id) {
+  function fetchRemoteAsset(id) {
     return new Promise(resolve => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: `${ASSETS_ENDPOINT}/${encodeURIComponent(id)}`,
+        headers: { Accept: 'application/json' },
+        withCredentials: true,
+        onload: res => {
+          if (res.status < 200 || res.status >= 300) {
+            resolve(null);
+            return;
+          }
+          try {
+            const data = JSON.parse(res.responseText);
+            resolve(data?.asset ?? data);
+          } catch {
+            resolve(null);
+          }
+        },
+        onerror: () => resolve(null),
+      });
+    });
+  }
+
+  function assetGenInput(asset) {
+    const gen = asset?.mediaGenInput;
+    if (!gen || typeof gen !== 'object') return null;
+    const KINDS = ['textToImage', 'imageToImage', 'textToVideo', 'imageToVideo', 'referenceToVideo', 'videoExtension'];
+    for (const k of KINDS) {
+      if (gen[k] && typeof gen[k] === 'object') return gen[k];
+    }
+    for (const value of Object.values(gen)) {
+      if (value && typeof value === 'object' && (value.prompt || value.modelName || value.inputAssets || value.hydratedContext || value.parentPostId)) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  function getAssetParentId(asset, gen) {
+    if (!gen) gen = assetGenInput(asset);
+    const inputAssets = gen?.inputAssets || gen?.input?.inputAssets;
+    if (Array.isArray(inputAssets) && inputAssets.length > 0) {
+      const first = inputAssets[0];
+      const id = typeof first === 'string' ? first : String(first?.assetId || first?.id || '');
+      if (id) return id;
+    } else if (typeof inputAssets === 'string' && inputAssets) {
+      return inputAssets;
+    }
+
+    const ctx = gen?.hydratedContext || gen?.input?.hydratedContext || asset?.mediaGenInput?.hydratedContext;
+    if (ctx?.parentPostId) return String(ctx.parentPostId);
+    if (ctx?.parentAssetId) return String(ctx.parentAssetId);
+
+    if (gen?.parentPostId) return String(gen.parentPostId);
+    if (gen?.parentId) return String(gen.parentId);
+
+    if (asset?.auxKeys?.parent_post_id) return String(asset.auxKeys.parent_post_id);
+    if (asset?.auxKeys?.parent_asset_id) return String(asset.auxKeys.parent_asset_id);
+    if (asset?.auxKeys?.duplicated_from_asset_id && String(asset.auxKeys.imagine_official_asset) !== 'true') {
+      return String(asset.auxKeys.duplicated_from_asset_id);
+    }
+    return null;
+  }
+
+  async function fetchRemotePost(id, depth = 0, maxDepth = 3) {
+    let remote = await new Promise(resolve => {
       GM_xmlhttpRequest({
         method: 'POST',
         url: POST_GET,
@@ -200,6 +278,52 @@
         onerror: () => resolve(null),
       });
     });
+
+    const hasPrompt = Boolean(remote?.prompt?.trim());
+    if (!hasPrompt) {
+      const asset = await fetchRemoteAsset(id);
+      if (asset) {
+        const gen = assetGenInput(asset);
+        const assetParentId = getAssetParentId(asset, gen);
+        const ownPrompt = String(gen?.prompt || asset?.summary || '').trim();
+        const model = gen?.modelName || '';
+        if (remote) {
+          remote.prompt = ownPrompt || remote.prompt || '';
+          if (model && !remote.model) remote.model = model;
+          if (assetParentId && !remote.parentId) remote.parentId = assetParentId;
+        } else {
+          remote = {
+            id,
+            prompt: ownPrompt,
+            model,
+            parentId: assetParentId,
+            mediaType: asset?.mimeType?.startsWith('video/') ? 'MEDIA_POST_TYPE_VIDEO' : 'MEDIA_POST_TYPE_IMAGE',
+            createTime: String(asset?.createTime || ''),
+          };
+        }
+
+        // If prompt is still blank and parent exists, resolve from parent
+        if (!remote.prompt && remote.parentId && depth < maxDepth) {
+          let parent = null;
+          try {
+            if (db) parent = await dbGetPost(remote.parentId);
+          } catch { /* ignore */ }
+          if (parent?.prompt) {
+            remote.parentPrompt = parent.prompt;
+            remote.prompt = parent.prompt;
+            remote.promptInherited = true;
+          } else {
+            const parentRemote = await fetchRemotePost(remote.parentId, depth + 1, maxDepth);
+            if (parentRemote?.prompt) {
+              remote.parentPrompt = parentRemote.prompt;
+              remote.prompt = parentRemote.prompt;
+              remote.promptInherited = true;
+            }
+          }
+        }
+      }
+    }
+    return remote;
   }
 
   function injectStyles() {
@@ -347,6 +471,18 @@
         color: rgba(255, 255, 255, 0.35);
         font-style: italic;
       }
+      .grok-post-prompt-inherited-badge {
+        display: inline-block;
+        margin-bottom: 6px;
+        padding: 2px 7px;
+        font-size: 10px;
+        font-weight: 600;
+        border-radius: 4px;
+        background: rgba(139, 92, 246, 0.25);
+        border: 1px solid rgba(139, 92, 246, 0.45);
+        color: #c4b5fd;
+        letter-spacing: 0.02em;
+      }
     `;
     document.head.appendChild(s);
   }
@@ -450,7 +586,7 @@
     });
   }
 
-  function renderPrompt(text, sourceHint) {
+  function renderPrompt(text, sourceHint, isInherited) {
     const el = document.getElementById('grok-post-sidebar-prompt');
     if (!el) return;
     if (!text) {
@@ -459,9 +595,15 @@
       el.title = '';
       return;
     }
-    el.textContent = text;
-    el.classList.remove('empty');
-    el.title = sourceHint || '';
+    if (isInherited) {
+      el.innerHTML = `<span class="grok-post-prompt-inherited-badge">Inherited from parent post</span><div>${escapeHtml(text)}</div>`;
+      el.classList.remove('empty');
+      el.title = sourceHint ? `${sourceHint} (inherited from parent)` : 'Inherited from parent post';
+    } else {
+      el.textContent = text;
+      el.classList.remove('empty');
+      el.title = sourceHint || '';
+    }
   }
 
   async function refreshContent() {
@@ -508,7 +650,7 @@
       else if (meta.fromIndex) promptSource = 'From GrokSearch IndexedDB';
       else promptSource = 'From Grok API';
     }
-    renderPrompt(meta.prompt, promptSource);
+    renderPrompt(meta.prompt, promptSource, meta.promptInherited);
 
     lastLoadedPostId = postId;
   }
