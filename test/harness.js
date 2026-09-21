@@ -645,7 +645,7 @@ function createThumbnailSandbox({ posts = [] } = {}) {
   return new Function('posts', `${prelude}
 ${region1}
 ${region2}
-return { getPostThumbnailUrl, isVideoPost, isVideoUrl, isLikelyImageUrl, postById, allPosts };`)(posts);
+return { getPostThumbnailUrl, isVideoPost, isVideoUrl, isLikelyImageUrl, postById, allPosts, getRelatedPosts };`)(posts);
 }
 
 module.exports = {

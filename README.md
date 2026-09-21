@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 A standalone project by **Richard Lipka**, grown from [IronSniper1's](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) base script and extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, deletion, and much else — see [Credits and origins](#credits-and-origins).
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.user.js` **v1.70.0** · `grokPostSidebar.user.js` **v1.4.0**  
+**Current versions:** `grokSearch.user.js` **v1.71.0** · `grokPostSidebar.user.js` **v1.4.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Credits and origins
@@ -17,7 +17,7 @@ credit.
 |--------|---------|--------------|
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | 2026-03-07 | **The base this repository was forked from.** |
 | [Strapples — Grok Imagine Favorites Search (Greasy Fork)](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) · [GrokImagineSearchandOrganize](https://github.com/Strapples/GrokImagineSearchandOrganize) | 2026-03-20 | A parallel userscript, also forked from IronSniper1. Its author asks that people link back to their GitHub, so it is linked here. |
-| **This repo** | — | Everything since: `grokSearch.user.js` v1.70.0 + `grokPostSidebar.user.js` v1.4.0 |
+| **This repo** | — | Everything since: `grokSearch.user.js` v1.71.0 + `grokPostSidebar.user.js` v1.4.0 |
 
 Earlier versions of this README described the Greasy Fork script as the original and IronSniper1 as
 downstream of it. That was the wrong way round: IronSniper1 came first, and the Greasy Fork script
@@ -205,12 +205,17 @@ the right of the strip.
 - **Hide childs** and **Compact** are independent: *Hide childs* removes children from the
   results, *Compact* keeps them but folds them in.
 
-#### Parent details
+#### Parent and related posts details
 
-Open any post with descendants and the lightbox footer lists them under the prompt: *N child
-results* followed by a thumbnail for each. Each thumbnail is a real link to that post’s page, so
-ctrl-click or middle-click opens it in a new tab; a plain click moves the lightbox to that child
-when it is in the current result set, and opens its page otherwise.
+When inspecting a selected result in the lightbox:
+- The **Related posts** sidebar on the left displays all associated media:
+  - **Parent** and **Root** ancestors
+  - **Child** and **Descendant** generations
+  - **Sibling** branches sharing the same parent or root
+  - **Batch** siblings generated together in the same generation conversation
+  - **Same prompt** posts matching the prompt text
+- Clicking on any thumbnail in the left sidebar immediately switches the lightbox details to that selected post.
+- The footer lists descendant children with direct links.
 
 ### Downloads and metadata
 

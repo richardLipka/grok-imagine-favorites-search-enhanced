@@ -3,6 +3,23 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.71.0] — 2026-09-21
+
+### Added & Changed (Related Posts Sidebar & JSON Prompt Guarantee)
+
+- **JSON Export & Storage Prompt Guarantee:**
+  - `toStorageRecord(post)` now guarantees prompt completeness: if `post.prompt` is missing or blank, it falls back to `parentPrompt` or `rootPrompt`.
+  - `toStorageRecord(post)` infers `isChild = true` whenever `parentId` is present.
+  - `downloadDatabaseJson()` and `downloadResultsJson()` run `backfillChildParentPrompts()` and `propagateBatchPrompts()` right before serialization so every exported row has its inherited and batch prompts resolved.
+- **Related Posts Sidebar in Lightbox Details:**
+  - Added `getRelatedPosts(post, limit)` to identify related items across multiple relationship dimensions: immediate **Parent**, ancestor **Root**, descendant **Children**, **Sibling** branches, **Batch** generation siblings (same `conversationId`), and **Same prompt** matches.
+  - Added a dedicated left sidebar (`#grok-lightbox-sidebar`) inside the lightbox details view displaying related thumbnails with color-coded relationship badges, video play indicators, timestamps, and prompt tooltips.
+  - Clicking any related image immediately switches the active lightbox details, prompt, metadata, child links, and related sidebar to the selected item.
+  - `openResultLightbox(post)` now supports selecting any post, even if filtered out of the current results grid.
+  - Added responsive layout: on narrow viewports/mobile, the related bar stacks horizontally. If no related posts exist for a post, the sidebar is cleanly hidden and the media stage takes the full width.
+
+---
+
 ## [1.70.0] — 2026-09-21
 
 ### Added & Fixed (Grok V2 Prompt Recovery & Display)

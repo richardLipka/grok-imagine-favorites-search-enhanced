@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.70.0
+// @version      1.71.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -134,7 +134,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.70.0';
+  const SCRIPT_VERSION = '1.71.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -263,6 +263,7 @@
   let pendingSyncReason = null;
   let searchFilterDebounceTimer = null;
   let lightboxIndex = -1;
+  let lightboxActivePost = null;
   let contextMenuPostId = null;
   const selectedPostIds = new Set();
   let bulkDownloadInProgress = false;
@@ -709,16 +710,17 @@
    * (a direct child) pays nothing for it.
    */
   function toStorageRecord(post) {
-    const isChild = Boolean(post.isChild);
+    const isChild = Boolean(post.isChild || post.parentId);
     const parentId = isChild ? String(post.parentId || '') : null;
     const rootId = isChild ? String(post.rootId || post.parentId || '') : null;
     const parentPrompt = isChild ? String(post.parentPrompt || '') : null;
     const rootPrompt = isChild && rootId && rootId !== parentId
       ? String(post.rootPrompt || '')
       : '';
+    const prompt = String(post.prompt || (isChild ? (post.parentPrompt || post.rootPrompt || '') : '') || post.parentPrompt || post.rootPrompt || '');
     const row = {
       id: String(post.id || ''),
-      prompt: String(post.prompt || ''),
+      prompt,
       parentPrompt,
       parentId,
       rootId,
@@ -2367,10 +2369,17 @@
     const exportBtn = document.getElementById('grok-export-json-btn');
     if (exportBtn) exportBtn.disabled = true;
     try {
+      if (typeof allPosts !== 'undefined' && allPosts.length) {
+        backfillChildParentPrompts();
+        propagateBatchPrompts(allPosts);
+      }
       let posts = allPosts.map(toStorageRecord);
       if (!posts.length) {
         if (!db) db = await openDB();
-        posts = (await dbGetAll()).map(toStorageRecord);
+        const rawDbPosts = await dbGetAll();
+        backfillChildParentPrompts();
+        propagateBatchPrompts(rawDbPosts);
+        posts = rawDbPosts.map(toStorageRecord);
       }
       const parentCount = posts.filter(p => !p.isChild).length;
       const childCount = posts.filter(p => p.isChild).length;
@@ -2439,6 +2448,8 @@
     const buttons = document.querySelectorAll('.grok-download-results-btn');
     buttons.forEach(btn => { btn.disabled = true; });
     try {
+      if (typeof backfillChildParentPrompts === 'function') backfillChildParentPrompts();
+      if (typeof propagateBatchPrompts === 'function') propagateBatchPrompts(matchedPosts);
       const posts = matchedPosts.map(toStorageRecord);
       const parentCount = posts.filter(p => !p.isChild).length;
       const childCount = posts.filter(p => p.isChild).length;
@@ -3162,7 +3173,7 @@
     }
     const byParent = new Map();
     for (const p of allPosts) {
-      if (!p.isChild || !p.parentId) continue;
+      if (!p.parentId) continue;
       const parentId = String(p.parentId);
       if (!byParent.has(parentId)) byParent.set(parentId, []);
       byParent.get(parentId).push(p);
@@ -3190,7 +3201,11 @@
       }
     };
     walk(id);
-    out.sort((a, b) => -byCreatedDesc(a, b));
+    if (typeof byCreatedDesc === 'function') {
+      out.sort((a, b) => -byCreatedDesc(a, b));
+    } else {
+      out.sort((a, b) => (Date.parse(a.createTime) || 0) - (Date.parse(b.createTime) || 0));
+    }
     return out;
   }
 
@@ -3283,6 +3298,102 @@
     // 5. Fallback
     if (isLikelyImageUrl(post.mediaUrl)) return post.mediaUrl;
     return post.thumbnail || '';
+  }
+
+  /**
+   * Identifies all posts related to the given post across several relationship dimensions:
+   * 1. Immediate parent (parentId) -> 'Parent'
+   * 2. Root ancestor (rootId) if different from parent and not self -> 'Root'
+   * 3. Descendants / children (direct children and deeper) -> 'Child' / 'Descendant'
+   * 4. Siblings (posts with the same parentId or rootId) -> 'Sibling' / 'Branch'
+   * 5. Batch / conversation siblings (posts with the same conversationId) -> 'Batch'
+   * 6. Similar / identical prompt (posts with matching non-empty prompt text) -> 'Same prompt'
+   *
+   * Returns an array of objects: { post, relation, label } deduplicated by post.id and
+   * ordered by relationship relevance (Parent -> Root -> Child -> Sibling -> Batch -> Prompt).
+   */
+  function getRelatedPosts(post, limit = 40) {
+    if (!post || !post.id) return [];
+    const id = String(post.id);
+    const related = [];
+    const seen = new Set([id]);
+
+    const add = (p, relation, label) => {
+      if (!p || !p.id || seen.has(p.id)) return;
+      seen.add(p.id);
+      related.push({ post: p, relation, label });
+    };
+
+    const parentId = post.parentId ? String(post.parentId) : '';
+    const rootId = post.rootId ? String(post.rootId) : '';
+
+    // 1. Immediate parent
+    if (parentId && parentId !== id) {
+      const parent = (typeof postById !== 'undefined' && postById.get(parentId))
+        || (typeof allPosts !== 'undefined' && allPosts.find(p => p.id === parentId));
+      if (parent) add(parent, 'parent', 'Parent');
+    }
+
+    // 2. Root ancestor (if different from parent and self)
+    if (rootId && rootId !== id && rootId !== parentId) {
+      const root = (typeof postById !== 'undefined' && postById.get(rootId))
+        || (typeof allPosts !== 'undefined' && allPosts.find(p => p.id === rootId));
+      if (root) add(root, 'root', 'Root');
+    }
+
+    // 3. Children and descendants
+    const descendants = typeof getAllDescendantPosts === 'function' ? getAllDescendantPosts(id) : [];
+    for (const child of descendants) {
+      const isDirect = child.parentId === id;
+      add(child, 'child', isDirect ? 'Child' : 'Descendant');
+    }
+
+    // 4. Siblings sharing parentId
+    if (parentId) {
+      if (typeof getChildrenByParent === 'function') {
+        const siblings = getChildrenByParent().get(parentId) || [];
+        for (const s of siblings) {
+          if (s.id !== id) add(s, 'sibling', 'Sibling');
+        }
+      } else if (typeof allPosts !== 'undefined') {
+        for (const s of allPosts) {
+          if (s.parentId === parentId && s.id !== id) add(s, 'sibling', 'Sibling');
+        }
+      }
+    }
+
+    // 5. Siblings sharing rootId (for grandchildren / deep trees)
+    if (rootId && rootId !== parentId) {
+      if (typeof allPosts !== 'undefined') {
+        for (const s of allPosts) {
+          if (s.rootId === rootId && s.id !== id) add(s, 'sibling', 'Branch');
+        }
+      }
+    }
+
+    // 6. Batch siblings via conversationId
+    const convId = String(post.conversationId || '').trim();
+    if (convId && typeof allPosts !== 'undefined') {
+      for (const b of allPosts) {
+        if (b.conversationId === convId && b.id !== id) {
+          add(b, 'batch', 'Batch');
+        }
+      }
+    }
+
+    // 7. Posts with the exact same non-empty prompt
+    const promptText = String(post.prompt || post.parentPrompt || post.rootPrompt || '').trim().toLowerCase();
+    if (promptText.length >= 5 && typeof allPosts !== 'undefined') {
+      for (const p of allPosts) {
+        if (p.id === id || seen.has(p.id)) continue;
+        const pPrompt = String(p.prompt || p.parentPrompt || p.rootPrompt || '').trim().toLowerCase();
+        if (pPrompt === promptText) {
+          add(p, 'prompt', 'Same prompt');
+        }
+      }
+    }
+
+    return limit ? related.slice(0, limit) : related;
   }
 
   function guessMediaExtension(url, mediaType) {
@@ -4538,13 +4649,17 @@
     }
   }
 
+  function getCurrentLightboxPost() {
+    return lightboxActivePost || (lightboxIndex >= 0 ? matchedPosts[lightboxIndex] : null);
+  }
+
   function bindLightboxDownloadButton() {
     const btn = document.getElementById('grok-lightbox-download');
     if (!btn || btn.dataset.grokLightboxBound) return;
     btn.dataset.grokLightboxBound = '1';
     btn.addEventListener('click', e => {
       e.preventDefault();
-      const post = matchedPosts[lightboxIndex];
+      const post = getCurrentLightboxPost();
       if (post) downloadPostMedia(post);
     });
   }
@@ -4575,6 +4690,7 @@
     ensureLightboxLikeButton(lb);
     ensureLightboxDeleteButton(lb);
     ensureLightboxChildRow(lb);
+    ensureLightboxSidebar(lb);
   }
 
   /**
@@ -4596,11 +4712,13 @@
       const link = e.target.closest('.grok-lightbox-kid');
       if (!link) return;
       if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
-      const idx = matchedPosts.findIndex(p => p.id === link.dataset.id);
-      if (idx < 0) return;                     // filtered out — let the link open the post page
-      e.preventDefault();
-      lightboxIndex = idx;
-      renderResultLightbox();
+      const target = (typeof postById !== 'undefined' && postById.get(link.dataset.id))
+        || (typeof allPosts !== 'undefined' && allPosts.find(p => p.id === link.dataset.id))
+        || matchedPosts.find(p => p.id === link.dataset.id);
+      if (target) {
+        e.preventDefault();
+        openResultLightbox(target);
+      }
     });
   }
 
@@ -4635,6 +4753,94 @@
     row.hidden = false;
   }
 
+  /**
+   * Dedicated Related Posts sidebar on the left side of the lightbox details modal.
+   * Identifies parent, root, child descendants, siblings, batch siblings, and prompt matches.
+   * Clicking on any related thumbnail immediately switches the active lightbox details to that post.
+   */
+  function ensureLightboxSidebar(lb) {
+    let sidebar = document.getElementById('grok-lightbox-sidebar');
+    if (!sidebar && lb) {
+      const stage = lb.querySelector('.grok-lightbox-stage');
+      if (stage) {
+        const main = document.createElement('div');
+        main.className = 'grok-lightbox-main';
+        stage.parentNode.insertBefore(main, stage);
+        sidebar = document.createElement('aside');
+        sidebar.id = 'grok-lightbox-sidebar';
+        sidebar.className = 'grok-lightbox-sidebar';
+        sidebar.hidden = true;
+        main.appendChild(sidebar);
+        const stageWrap = document.createElement('div');
+        stageWrap.className = 'grok-lightbox-stage-wrap';
+        const prev = document.getElementById('grok-lightbox-prev');
+        const next = document.getElementById('grok-lightbox-next');
+        if (prev) stageWrap.appendChild(prev);
+        if (next) stageWrap.appendChild(next);
+        stageWrap.appendChild(stage);
+        main.appendChild(stageWrap);
+      }
+    }
+    if (!sidebar || sidebar.dataset.bound) return;
+    sidebar.dataset.bound = '1';
+    sidebar.addEventListener('click', e => {
+      const item = e.target.closest('.grok-lightbox-related-item');
+      if (!item) return;
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+      e.preventDefault();
+      const id = item.dataset.id;
+      if (!id) return;
+      const target = (typeof postById !== 'undefined' && postById.get(id))
+        || (typeof allPosts !== 'undefined' && allPosts.find(p => p.id === id))
+        || matchedPosts.find(p => p.id === id);
+      if (target) {
+        openResultLightbox(target);
+      }
+    });
+  }
+
+  function renderLightboxRelatedSidebar(post) {
+    const sidebar = document.getElementById('grok-lightbox-sidebar');
+    if (!sidebar) return;
+    if (!post) {
+      sidebar.hidden = true;
+      sidebar.innerHTML = '';
+      return;
+    }
+    const items = getRelatedPosts(post);
+    if (!items.length) {
+      sidebar.hidden = true;
+      sidebar.innerHTML = '';
+      return;
+    }
+    const header = `<div class="grok-lightbox-sidebar-header">Related (${items.length})</div>`;
+    const cards = items.map(({ post: p, relation, label }) => {
+      const thumb = getPostThumbnailUrl(p);
+      const isVideo = isVideoPost(p);
+      const promptText = p.prompt || p.parentPrompt || p.rootPrompt || '';
+      const dateStr = formatPostDate(p.createTime);
+      const badgeClass = `grok-lightbox-badge--${relation}`;
+      return `
+        <div class="grok-lightbox-related-item grok-lightbox-related--${relation}"
+             data-id="${escapeHtml(p.id)}"
+             title="${escapeHtml(label)}: ${escapeHtml(promptText || '(no prompt)')}">
+          <div class="grok-lightbox-related-thumb-wrap">
+            <img class="grok-lightbox-related-thumb" loading="lazy" src="${escapeHtml(thumb)}" alt="" />
+            ${isVideo ? '<span class="grok-lightbox-related-play" title="Video">▶</span>' : ''}
+            <span class="grok-lightbox-badge ${badgeClass}">${escapeHtml(label)}</span>
+          </div>
+          <div class="grok-lightbox-related-info">
+            ${dateStr ? `<span class="grok-lightbox-related-date">${escapeHtml(dateStr)}</span>` : ''}
+            <span class="grok-lightbox-related-prompt">${escapeHtml(truncateMetadataText(promptText, 60))}</span>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    sidebar.innerHTML = `${header}<div class="grok-lightbox-sidebar-list">${cards}</div>`;
+    sidebar.hidden = false;
+  }
+
   function ensureLightboxDeleteButton(lb) {
     const actions = lb?.querySelector('.grok-lightbox-actions');
     if (!actions || document.getElementById('grok-lightbox-delete')) return;
@@ -4648,7 +4854,7 @@
     btn.addEventListener('click', async e => {
       e.preventDefault();
       e.stopPropagation();
-      const post = matchedPosts[lightboxIndex];
+      const post = getCurrentLightboxPost();
       if (!post) return;
       btn.disabled = true;
       const res = await deleteSinglePost(post);
@@ -4671,7 +4877,7 @@
     btn.addEventListener('click', async e => {
       e.preventDefault();
       e.stopPropagation();
-      const post = matchedPosts[lightboxIndex];
+      const post = getCurrentLightboxPost();
       if (!post) return;
       btn.disabled = true;
       await togglePostLiked(post);
@@ -4683,7 +4889,7 @@
   function syncLightboxLikeButton() {
     const btn = document.getElementById('grok-lightbox-like');
     if (!btn) return;
-    const post = matchedPosts[lightboxIndex];
+    const post = getCurrentLightboxPost();
     if (!post) { btn.hidden = true; return; }
     const liked = post.isLiked === true;
     btn.hidden = false;
@@ -4709,9 +4915,14 @@
       <div class="grok-lightbox-backdrop" data-grok-lightbox-close></div>
       <div class="grok-lightbox-panel" role="dialog" aria-modal="true" aria-label="Image preview">
         <button type="button" class="grok-lightbox-close" data-grok-lightbox-close title="Close" aria-label="Close">×</button>
-        <button type="button" class="grok-lightbox-nav grok-lightbox-prev" id="grok-lightbox-prev" title="Previous" aria-label="Previous">‹</button>
-        <button type="button" class="grok-lightbox-nav grok-lightbox-next" id="grok-lightbox-next" title="Next" aria-label="Next">›</button>
-        <div class="grok-lightbox-stage" id="grok-lightbox-stage"></div>
+        <div class="grok-lightbox-main" id="grok-lightbox-main">
+          <aside class="grok-lightbox-sidebar" id="grok-lightbox-sidebar" hidden></aside>
+          <div class="grok-lightbox-stage-wrap" id="grok-lightbox-stage-wrap">
+            <button type="button" class="grok-lightbox-nav grok-lightbox-prev" id="grok-lightbox-prev" title="Previous" aria-label="Previous">‹</button>
+            <button type="button" class="grok-lightbox-nav grok-lightbox-next" id="grok-lightbox-next" title="Next" aria-label="Next">›</button>
+            <div class="grok-lightbox-stage" id="grok-lightbox-stage"></div>
+          </div>
+        </div>
         <div class="grok-lightbox-footer">
           <div class="grok-lightbox-meta">
             <div class="grok-lightbox-prompt" id="grok-lightbox-prompt"></div>
@@ -4743,14 +4954,14 @@
     });
     document.getElementById('grok-lightbox-open-tab')?.addEventListener('click', e => {
       e.preventDefault();
-      const post = matchedPosts[lightboxIndex];
+      const post = getCurrentLightboxPost();
       if (!post) return;
       if (post.id) window.open(getPostDetailUrl(post.id), '_blank');
       else window.open(getPostMediaUrl(post), '_blank');
     });
     document.getElementById('grok-lightbox-open-post')?.addEventListener('click', e => {
       e.preventDefault();
-      const post = matchedPosts[lightboxIndex];
+      const post = getCurrentLightboxPost();
       if (post?.id) window.open(getPostDetailUrl(post.id), '_blank');
     });
     bindLightboxDownloadButton();
@@ -4763,7 +4974,7 @@
 
   function renderResultLightbox() {
     const lb = ensureResultLightbox();
-    const post = matchedPosts[lightboxIndex];
+    const post = getCurrentLightboxPost();
     const stage = document.getElementById('grok-lightbox-stage');
     const promptEl = document.getElementById('grok-lightbox-prompt');
     const subEl = document.getElementById('grok-lightbox-sub');
@@ -4786,7 +4997,11 @@
     }
 
     const bits = [];
-    bits.push(`${lightboxIndex + 1} / ${matchedPosts.length.toLocaleString()}`);
+    if (lightboxIndex >= 0) {
+      bits.push(`${lightboxIndex + 1} / ${matchedPosts.length.toLocaleString()}`);
+    } else {
+      bits.push('Related post');
+    }
     const dateStr = formatPostDate(post.createTime);
     if (dateStr) bits.push(dateStr);
     if (post.model) bits.push(post.model);
@@ -4796,13 +5011,17 @@
 
     if (!post.prompt && !post.parentPrompt && post.id) {
       resolveAndApplyPostPrompt(post).then(resolved => {
-        if (resolved && matchedPosts[lightboxIndex]?.id === post.id) {
+        if (resolved && getCurrentLightboxPost()?.id === post.id) {
           const updated = post.prompt || post.parentPrompt || post.rootPrompt || '';
           if (updated) {
             promptEl.textContent = updated;
             if (!post.prompt && post.parentPrompt) promptEl.title = 'Inherited from parent post';
             const updatedBits = [];
-            updatedBits.push(`${lightboxIndex + 1} / ${matchedPosts.length.toLocaleString()}`);
+            if (lightboxIndex >= 0) {
+              updatedBits.push(`${lightboxIndex + 1} / ${matchedPosts.length.toLocaleString()}`);
+            } else {
+              updatedBits.push('Related post');
+            }
             const d = formatPostDate(post.createTime);
             if (d) updatedBits.push(d);
             if (post.model) updatedBits.push(post.model);
@@ -4815,23 +5034,25 @@
     }
 
     renderLightboxChildRow(post);
+    renderLightboxRelatedSidebar(post);
     syncLightboxLikeButton();
     if (prevBtn) prevBtn.disabled = lightboxIndex <= 0;
-    if (nextBtn) nextBtn.disabled = lightboxIndex >= matchedPosts.length - 1;
+    if (nextBtn) nextBtn.disabled = lightboxIndex < 0 || lightboxIndex >= matchedPosts.length - 1;
     lb.hidden = false;
     document.documentElement.classList.add('grok-lightbox-open');
   }
 
   function openResultLightbox(post) {
-    const idx = matchedPosts.findIndex(p => p.id === post.id);
-    if (idx < 0) return;
+    if (!post) return;
     hideResultContextMenu();
+    const idx = matchedPosts.findIndex(p => p.id === post.id);
     lightboxIndex = idx;
+    lightboxActivePost = post;
     renderResultLightbox();
   }
 
   function isResultLightboxOpen() {
-    return lightboxIndex >= 0 && !document.getElementById('grok-result-lightbox')?.hidden;
+    return (lightboxIndex >= 0 || lightboxActivePost != null) && !document.getElementById('grok-result-lightbox')?.hidden;
   }
 
   function closeResultLightbox() {
@@ -4843,6 +5064,7 @@
     }
     document.documentElement.classList.remove('grok-lightbox-open');
     lightboxIndex = -1;
+    lightboxActivePost = null;
   }
 
   function stepResultLightbox(delta) {
@@ -4850,6 +5072,7 @@
     const next = Math.max(0, Math.min(matchedPosts.length - 1, lightboxIndex + delta));
     if (next === lightboxIndex) return;
     lightboxIndex = next;
+    lightboxActivePost = matchedPosts[next];
     renderResultLightbox();
   }
 
@@ -6784,7 +7007,7 @@
       .grok-lightbox-panel {
         position: relative;
         z-index: 1;
-        width: min(1100px, 96vw);
+        width: min(1180px, 96vw);
         max-height: 92vh;
         display: flex;
         flex-direction: column;
@@ -6798,7 +7021,7 @@
         position: absolute;
         top: 10px;
         right: 10px;
-        z-index: 3;
+        z-index: 4;
         width: 34px;
         height: 34px;
         border: 1px solid rgba(255, 255, 255, 0.18);
@@ -6808,6 +7031,138 @@
         font-size: 22px;
         line-height: 1;
         cursor: pointer;
+      }
+      .grok-lightbox-main {
+        display: flex;
+        flex-direction: row;
+        min-height: 280px;
+        max-height: calc(92vh - 150px);
+        background: #0b0b10;
+        overflow: hidden;
+      }
+      .grok-lightbox-sidebar {
+        width: 200px;
+        flex-shrink: 0;
+        display: flex;
+        flex-direction: column;
+        background: #111118;
+        border-right: 1px solid rgba(255, 255, 255, 0.1);
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+      }
+      .grok-lightbox-sidebar[hidden] {
+        display: none !important;
+      }
+      .grok-lightbox-sidebar-header {
+        padding: 10px 12px 6px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.55);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        position: sticky;
+        top: 0;
+        background: #111118;
+        z-index: 2;
+      }
+      .grok-lightbox-sidebar-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 8px;
+      }
+      .grok-lightbox-related-item {
+        display: flex;
+        flex-direction: column;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.04);
+        padding: 5px;
+        cursor: pointer;
+        transition: border-color 0.15s, background 0.15s, transform 0.1s;
+      }
+      .grok-lightbox-related-item:hover {
+        border-color: rgba(255, 255, 255, 0.35);
+        background: rgba(255, 255, 255, 0.08);
+        transform: translateY(-1px);
+      }
+      .grok-lightbox-related-thumb-wrap {
+        position: relative;
+        width: 100%;
+        height: 100px;
+        border-radius: 6px;
+        overflow: hidden;
+        background: #000;
+      }
+      .grok-lightbox-related-thumb {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+      .grok-lightbox-related-play {
+        position: absolute;
+        bottom: 5px;
+        right: 5px;
+        background: rgba(0, 0, 0, 0.65);
+        color: #fff;
+        font-size: 10px;
+        padding: 2px 5px;
+        border-radius: 4px;
+        line-height: 1;
+      }
+      .grok-lightbox-badge {
+        position: absolute;
+        top: 4px;
+        left: 4px;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 10px;
+        font-weight: 600;
+        line-height: 1.2;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+        color: #fff;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+      }
+      .grok-lightbox-badge--parent { background: #2563eb; }
+      .grok-lightbox-badge--root { background: #7c3aed; }
+      .grok-lightbox-badge--child { background: #059669; }
+      .grok-lightbox-badge--sibling { background: #d97706; }
+      .grok-lightbox-badge--batch { background: #db2777; }
+      .grok-lightbox-badge--prompt { background: #4f46e5; }
+      .grok-lightbox-related-info {
+        margin-top: 4px;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        padding: 0 2px;
+      }
+      .grok-lightbox-related-date {
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.4);
+      }
+      .grok-lightbox-related-prompt {
+        font-size: 11px;
+        line-height: 1.3;
+        color: rgba(255, 255, 255, 0.8);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+      }
+      .grok-lightbox-stage-wrap {
+        position: relative;
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #0b0b10;
       }
       .grok-lightbox-nav {
         position: absolute;
@@ -6834,9 +7189,10 @@
         display: flex;
         align-items: center;
         justify-content: center;
+        width: 100%;
+        height: 100%;
         min-height: 240px;
         max-height: calc(92vh - 150px);
-        background: #0b0b10;
         padding: 16px;
       }
       .grok-lightbox-media {
@@ -6844,6 +7200,25 @@
         max-height: calc(92vh - 180px);
         object-fit: contain;
         border-radius: 10px;
+      }
+      @media (max-width: 768px) {
+        .grok-lightbox-main {
+          flex-direction: column;
+        }
+        .grok-lightbox-sidebar {
+          width: 100%;
+          height: 140px;
+          border-right: none;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .grok-lightbox-sidebar-list {
+          flex-direction: row;
+          overflow-x: auto;
+        }
+        .grok-lightbox-related-item {
+          width: 110px;
+          flex-shrink: 0;
+        }
       }
       .grok-lightbox-footer {
         display: flex;

@@ -20,6 +20,15 @@ module.exports = {
         'childVideoCount', 'videoCount'].every(k => k in stored),
       Object.keys(stored));
 
+    const inheritedChild = m.toStorageRecord({ id: 'c0', parentId: 'p0', parentPrompt: 'Fox in snow' });
+    t.equal('child inherits parentPrompt as prompt when prompt is missing', inheritedChild.prompt, 'Fox in snow');
+    t.equal('child inherits parentPrompt field', inheritedChild.parentPrompt, 'Fox in snow');
+    t.ok('isChild is inferred from parentId', inheritedChild.isChild === true);
+
+    const rootChild = m.toStorageRecord({ id: 'c0b', parentId: 'p0', rootId: 'r0', rootPrompt: 'Fox in snow' });
+    t.equal('child inherits rootPrompt when prompt and parentPrompt are empty', rootChild.prompt, 'Fox in snow');
+    t.equal('rootPrompt preserved on storage record', rootChild.rootPrompt, 'Fox in snow');
+
     t.group('missing / malformed values');
     const blank = m.normalizePost({ id: 'b' });
     t.equal('absent createTime becomes 0', blank._ms, 0);
