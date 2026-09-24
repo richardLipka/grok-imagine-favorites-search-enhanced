@@ -3,6 +3,81 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.74.0] — 2026-09-24
+
+### Added & Enhanced (Power Features)
+
+- **Lightbox Power Keyboard Shortcuts:**
+  - `C`: Instant copy prompt to clipboard with status toast.
+  - `L`: Instant toggle Like / Unlike state with button sync.
+  - `D`: Download active media file directly.
+  - `Delete` / `Backspace`: Open single-post delete / prune confirmation dialog.
+  - `/` or `Ctrl+F` / `Cmd+F`: Global focus and text selection of search input from anywhere (safely ignored when focus is within inputs, textareas, or selects).
+  - Added shortcut hint badges to action tooltips for faster discovery.
+
+- **Date Range Quick Presets:**
+  - Added quick-filter chips next to the date navigation stepper: **Today**, **Yesterday**, **Last 7 Days**, **This Month**.
+  - Clicking any chip automatically computes date boundaries, populates `dateStart`/`dateEnd`, updates the day navigation buttons, and triggers the filter immediately.
+  - Clicking an active preset toggles and clears the date filter.
+  - Dynamically synchronizes chip active states when dates are manually typed, shifted via day stepper, or cleared.
+
+- **Export Filtered Results & Selected Subsets (JSON & CSV):**
+  - Added **Export results** / **Export selected (N)** button (`#grok-export-results-btn`) in the actions toolbar next to `Export JSON`.
+  - Opens format picker dialog allowing users to choose between **JSON** and **CSV**.
+  - **CSV Export:** Fully RFC-4180 compliant escaping with UTF-8 BOM, including `id,prompt,model,date,mediaType,mediaUrl,thumbnail,isChild,parentId,rootId,isLiked,isUploaded,conversationId`.
+  - **JSON Export:** Schema v5 structure containing full record fields, active filter snapshot, and detailed total/parent/child counts.
+
+- **Stacking / Grouping by Batch Generation:**
+  - Added **Batch groups** toggle (`#grok-batch-groups`) in the display controls row.
+  - Groups generations sharing the same batch conversation (`conversationId`) into a single primary card with small preview thumbnails (`.grok-result-kids`).
+  - Seamlessly interoperates with **Compact** mode: parent-child hierarchies fold first, followed by batch siblings under the primary card, with complete child thumbnail deduplication.
+  - Preserves flat selection, download, deletion, and lightbox navigation indexing without modifying the underlying match set.
+
+---
+
+## [1.73.0] — 2026-09-24
+
+### Performance & Optimizations
+
+- **`buildPromptById` Memoization:** Cached `buildPromptById()` against `indexRevision`, eliminating full-index Map allocations and garbage collection spikes on every search input keystroke.
+- **Search Filter Short-Circuiting:** Reordered `applyFilter()` predicates so fast boolean, model, liked, and date bounds checks execute before expensive prompt substring searches (`terms.every(...)`).
+- **Batch Sibling Indexing (`getPostsByConversation`):** Added memoized `getPostsByConversation()` indexing, replacing linear O(N) scans across `allPosts` with instant O(1) Map lookups for batch generation siblings.
+- **`getRelatedPosts` Early Termination:** Added threshold guards (`limit && related.length >= limit`) to child, sibling, batch, and prompt relationship discovery loops, stopping immediately once the requested limit is reached.
+- **CORS-Free Media Probing:** Updated `checkMediaUrlExists()` to prioritize `GM_xmlhttpRequest` HEAD requests directly, avoiding browser console CORS warnings on cross-origin CDN media.
+
+### Fixed
+
+- **Lightbox Prompt Subtitle Persistence:** Fixed subtitle recreation in `renderResultLightbox` when prompts are resolved asynchronously, ensuring the `'Uploaded image'` badge indicator remains visible.
+- **Child Upload Parsing:** Added `isUploaded` propagation in `parseChildPost()` so uploaded child/variation posts preserve their upload classification.
+- **Upload Metadata Diffing:** Added `isUploaded` comparison to `postMetadataChanged()` so newly discovered uploaded states trigger persistence in IndexedDB.
+- **Pruning Accurate Count:** Fixed `removeRowsById()` to return the exact number of deleted rows removed from memory rather than the length of the input ID set.
+
+### Grok Post Sidebar (v1.5.0)
+
+- Added upload detection via `isUploadedPost()` to `grokPostSidebar.user.js`.
+- Displays `Source: User upload` in the sidebar metadata table on post detail pages.
+
+---
+
+## [1.72.0] — 2026-09-24
+
+### Added & Changed (Deleted / Missing Media Handling & Upload Tagging/Filter)
+
+- **Deleted & Missing Media Handling (All 3 Steps):**
+  - **Step 1 (Graceful Missing Detection):** Added `error` listeners on card thumbnails and lightbox media. When an image has been deleted on Grok servers (HTTP 404/410), cards automatically show a styled missing placeholder (`.grok-result-broken-overlay`) reading "Media deleted", mark the card with `.grok-result-card--broken`, and prevent broken image layout artifacts.
+  - **Step 2 (Instant Quick Removal):** Broken cards show a quick-action prune button (`.grok-result-prune-btn`) to remove the phantom record directly from the local IndexedDB database. In the lightbox details view, missing media displays an error banner with a "Remove from index" button and a "Copy prompt" button to save the prompt before deleting.
+  - **Step 3 (Bulk "Prune Missing" Utility):** Added a `Prune missing` button to the main actions toolbar (`#grok-prune-missing-btn`). Probes indexed media via lightweight `HEAD` requests with bounded concurrency (`runPool`). If 404/410 deleted items are detected, prompts the user with an in-page confirmation dialog (`confirmDangerousAction`) before safely purging the dead records and refreshing the index and results grid.
+
+- **Uploaded Images Detection, Tagging & Filter:**
+  - **Upload Detection:** Added `isUploadedPost(post)` recognizing uploaded media from `fileSource: 'IMAGINE_SELF_UPLOAD_FILE_SOURCE'`, `/upload/` CDN path patterns, and `isUploaded` flags. Persisted `isUploaded` across storage records, asset feed parsing, and parent/child normalization.
+  - **Uploaded Badge & Tags:**
+    - Cards in the results grid display a green **Upload** badge (`.grok-badge-uploaded`) with an upload icon.
+    - Lightbox details header displays an `'Uploaded image'` subtitle indicator.
+    - Lightbox Related Posts sidebar renders an `Upload` badge (`.grok-lightbox-badge--uploaded`) on related items that were user-uploaded.
+  - **GUI "Uploaded only" Filter:** Added an `Uploaded only` checkbox (`#grok-filter-uploaded-only`) to the search filters row in the main GUI, allowing users to instantly filter the library to only uploaded assets. Remembers state in `localStorage` (`grokSearchFilterUploadedOnly`) and clears with the Clear button.
+
+---
+
 ## [1.71.0] — 2026-09-21
 
 ### Added & Changed (Related Posts Sidebar & JSON Prompt Guarantee)

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.71.0
+// @version      1.74.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -134,7 +134,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.71.0';
+  const SCRIPT_VERSION = '1.74.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -191,6 +191,7 @@
   const RESULTS_ONLY_KEY = 'grokSearchResultsOnly';
   const FILTER_VIDEO_ONLY_KEY = 'grokSearchFilterVideoOnly';
   const FILTER_WITH_VIDEO_KEY = 'grokSearchFilterWithVideo';
+  const FILTER_UPLOADED_ONLY_KEY = 'grokSearchFilterUploadedOnly';
   /** @deprecated legacy — migrated to FILTER_WITH_VIDEO_KEY */
   const FILTER_VIDEO_KEY = 'grokSearchFilterVideo';
   const FILTER_CHILDREN_KEY = 'grokSearchFilterChildren';
@@ -201,6 +202,8 @@
   const PAGE_SIZE_KEY = 'grokSearchPageSize';
   const GRID_SIZE_PCT_KEY = 'grokSearchGridSizePct';
   const COMPACT_GROUPS_KEY = 'grokSearchCompactGroups';
+  const BATCH_GROUPS_KEY = 'grokSearchBatchGroups';
+  const DEFAULT_BATCH_GROUPS = false;
   const TOGGLE_POS_KEY = 'grokSearchTogglePos';
   const SEARCH_BAR_COLLAPSED_KEY = 'grokSearchBarCollapsed';
   const MEDIA_MIN_OPTIONS = [1, 3, 5, 7, 10];
@@ -230,6 +233,7 @@
   let filterWithVideo = false;
   let filterOnlyChildren = false;
   let filterHideChilds = false;
+  let filterUploadedOnly = false;
   let filterMinChildren = 1;
   let filterModel = '';
   let filterLikedOnly = false;
@@ -239,6 +243,7 @@
   let pageSize = DEFAULT_PAGE_SIZE;
   let gridSizePercent = DEFAULT_GRID_SIZE_PCT;
   let compactGroups = DEFAULT_COMPACT_GROUPS;
+  let batchGroups = DEFAULT_BATCH_GROUPS;
   let togglePosition = DEFAULT_TOGGLE_POS;
   /** What the grid pages over: one entry per card, `{ post, children }`. See getDisplayEntries(). */
   let displayEntries = [];
@@ -654,6 +659,19 @@
     return isVideoMediaType(post?.mediaType) || isVideoUrl(post?.mediaUrl) || isVideoUrl(post?.thumbnail);
   }
 
+  function isUploadedPost(post) {
+    if (!post) return false;
+    if (post.isUploaded === true) return true;
+    if (post.fileSource === 'IMAGINE_SELF_UPLOAD_FILE_SOURCE' ||
+        String(post.fileSource || '').toUpperCase().includes('UPLOAD') ||
+        String(post.mediaPostSource || '').toUpperCase().includes('UPLOAD') ||
+        String(post.source || '').toUpperCase().includes('UPLOAD')) {
+      return true;
+    }
+    const url = String(post.mediaUrl || post.thumbnail || '').toLowerCase();
+    return url.includes('/upload/') || url.includes('/uploaded/') || url.includes('/user_upload/');
+  }
+
   function matchesWithVideoFilter(post) {
     return !isChildPost(post)
       && !isVideoPost(post)
@@ -736,6 +754,7 @@
       childVideoCount: post.childVideoCount ?? 0,
       videoCount: post.videoCount ?? 0,
       isLiked: typeof post.isLiked === 'boolean' ? post.isLiked : null,
+      isUploaded: Boolean(post.isUploaded || isUploadedPost(post)),
       // Which generation an asset came from. Siblings of a multi-image generation share it,
       // which is the grouping the asset feed offers in place of a parent/child tree.
       conversationId: String(post.conversationId || ''),
@@ -815,6 +834,9 @@
         || String(current.parentId || '') !== String(next.parentId || '')) {
       childrenByParentSource = null;
     }
+    if (current.prompt !== next.prompt) {
+      cachedPromptById = null;
+    }
     for (const key of Object.keys(current)) {
       if (!(key in next)) delete current[key];
     }
@@ -822,13 +844,22 @@
     return current;
   }
 
+  let cachedPromptById = null;
+  let cachedPromptByIdRev = -1;
+
   /**
    * id → prompt for *every* row, not just top-level ones. A grandchild's parent is itself a
    * child row, so restricting this to parents used to make its parent prompt unresolvable.
+   * Cached against indexRevision so typing in search does not reallocate a large map per keystroke.
    */
   function buildPromptById() {
+    if (cachedPromptById && cachedPromptByIdRev === indexRevision) {
+      return cachedPromptById;
+    }
     const map = new Map();
     for (const p of allPosts) map.set(p.id, String(p.prompt || ''));
+    cachedPromptById = map;
+    cachedPromptByIdRev = indexRevision;
     return map;
   }
 
@@ -871,6 +902,7 @@
       parentId: null,
       parentPrompt: null,
       isLiked: detectLikedState(post),
+      isUploaded: isUploadedPost(post),
       ...counts,
     };
   }
@@ -935,6 +967,7 @@
       model: childRaw.modelName || childRaw.model || parentParsed.model || '',
       mediaType: childRaw.mediaType || '',
       isLiked: detectLikedState(childRaw),
+      isUploaded: isUploadedPost(childRaw),
       childPostCount: counts.childPostCount,
       childImageCount: counts.childImageCount,
       childVideoCount: counts.childVideoCount,
@@ -1381,7 +1414,8 @@
       || (before.rootId || '') !== (after.rootId || '')
       || (before.rootPrompt || '') !== (after.rootPrompt || '')
       || (before.conversationId || '') !== (after.conversationId || '')
-      || (before.isLiked ?? null) !== (after.isLiked ?? null);
+      || (before.isLiked ?? null) !== (after.isLiked ?? null)
+      || Boolean(before.isUploaded) !== Boolean(after.isUploaded);
   }
 
   function verifyIndexIntegrity() {
@@ -1667,14 +1701,16 @@
   function removeRowsById(ids, writer) {
     const doomed = new Set(ids);
     if (!doomed.size) return 0;
+    const initialLen = allPosts.length;
     allPosts = allPosts.filter(p => !doomed.has(p.id));
+    const deletedCount = initialLen - allPosts.length;
     for (const id of doomed) {
       knownIds.delete(id);
       selectedPostIds.delete(id);
       writer.del(id);
     }
     rebuildPostIndex();
-    return doomed.size;
+    return deletedCount;
   }
 
   /**
@@ -1822,6 +1858,128 @@
     } finally {
       reconcileInProgress = false;
       if (btn) btn.disabled = false;
+    }
+  }
+
+  // ─── Missing / deleted media pruning (Step 3) ────────────────────────────────
+  let pruneMissingInProgress = false;
+
+  function probeMediaUrlGm(url) {
+    return new Promise(resolve => {
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        resolve({ ok: true, status: 0 });
+        return;
+      }
+      GM_xmlhttpRequest({
+        method: 'HEAD',
+        url,
+        timeout: 10000,
+        onload(res) {
+          resolve({ ok: res.status >= 200 && res.status < 400, status: res.status });
+        },
+        onerror() {
+          resolve({ ok: false, status: 0 });
+        },
+        ontimeout() {
+          resolve({ ok: false, status: 408 });
+        },
+      });
+    });
+  }
+
+  async function checkMediaUrlExists(url) {
+    if (!url) return false;
+    if (typeof GM_xmlhttpRequest === 'function') {
+      const gmRes = await probeMediaUrlGm(url);
+      if (gmRes.status === 404 || gmRes.status === 410) return false;
+      if (gmRes.ok) return true;
+    }
+    try {
+      const res = await getPageWindow().fetch(url, { method: 'HEAD' });
+      if (res.status === 404 || res.status === 410) return false;
+      if (res.ok) return true;
+    } catch { /* probe failure / CORS */ }
+    return true;
+  }
+
+  async function runPruneMissingMedia({ manual = false } = {}) {
+    if (indexing || syncInProgress || reconcileInProgress || pruneMissingInProgress || !loaded) return null;
+    pruneMissingInProgress = true;
+    const statusEl = document.getElementById('grok-stamp-status');
+    const btn = document.getElementById('grok-prune-missing-btn');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Scanning…';
+    }
+    try {
+      if (!allPosts.length) {
+        if (manual) flashStampStatus('index is empty');
+        return { checked: 0, missing: [] };
+      }
+      setLoadStatus(`scanning media (0/${allPosts.length})…`);
+      const missing = [];
+      let checked = 0;
+      const targets = [...allPosts];
+
+      await runPool(targets, 8, async post => {
+        checked++;
+        if (checked % 10 === 0 || checked === targets.length) {
+          setLoadStatus(`probing media ${checked}/${targets.length}… (${missing.length} missing)`);
+        }
+        if (post._mediaUnavailable) {
+          missing.push(post);
+          return;
+        }
+        const url = getPostThumbnailUrl(post) || post.mediaUrl || post.thumbnail;
+        if (!url) {
+          missing.push(post);
+          return;
+        }
+        const exists = await checkMediaUrlExists(url);
+        if (!exists) {
+          post._mediaUnavailable = true;
+          missing.push(post);
+        }
+      });
+
+      if (!missing.length) {
+        setLoadStatus('all media verified — no missing images found');
+        flashStampStatus('no missing media');
+        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
+        return { checked: targets.length, missing: [] };
+      }
+
+      setLoadStatus(`found ${missing.length} missing image${missing.length === 1 ? '' : 's'}`);
+
+      const confirmed = await confirmDangerousAction({
+        title: 'Prune missing / deleted images',
+        message: `Found ${missing.length} image${missing.length === 1 ? '' : 's'} that no longer exist on Grok servers (HTTP 404 / deleted). Remove them from the local database?`,
+        okLabel: `Prune ${missing.length} item${missing.length === 1 ? '' : 's'}`,
+      });
+
+      if (!confirmed) {
+        setLoadStatus('pruning cancelled');
+        return { checked: targets.length, missing, pruned: 0 };
+      }
+
+      const writer = createIndexWriter();
+      const removedCount = removeRowsById(missing.map(p => p.id), writer);
+      await writer.flush();
+      applyFilter();
+      setLoadStatus(`removed ${removedCount} missing image${removedCount === 1 ? '' : 's'} from index`);
+      flashStampStatus(`pruned ${removedCount}`);
+      setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 5000);
+      return { checked: targets.length, missing, pruned: removedCount };
+    } catch (e) {
+      console.error('[GrokSearch] Prune missing media failed:', e);
+      setLoadStatus('prune failed');
+      return null;
+    } finally {
+      pruneMissingInProgress = false;
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Prune missing';
+      }
     }
   }
 
@@ -2019,6 +2177,14 @@
     }
 
     const effectivePrompt = ownPrompt || parentPrompt || rootPrompt || '';
+    const isUploaded = Boolean(
+      asset?.fileSource === 'IMAGINE_SELF_UPLOAD_FILE_SOURCE' ||
+      String(asset?.fileSource || '').toUpperCase().includes('UPLOAD') ||
+      String(asset?.file_source || '').toUpperCase().includes('UPLOAD') ||
+      String(asset?.auxKeys?.file_source || '').toUpperCase().includes('UPLOAD') ||
+      String(asset?.key || '').toLowerCase().includes('/upload') ||
+      asset?.isUploaded === true
+    );
 
     return {
       id,
@@ -2035,6 +2201,7 @@
       rootPrompt,
       conversationId: String(asset?.sourceConversationId || ''),
       isLiked: detectLikedState(asset),
+      isUploaded,
       childPostCount: 0,
       childImageCount: 0,
       childVideoCount: 0,
@@ -2158,6 +2325,7 @@
           videoCount: cached.videoCount ?? parsed.videoCount,
           prompt: parsed.prompt || cached.prompt || parsed.parentPrompt || cached.parentPrompt || '',
           isLiked: parsed.isLiked ?? cached.isLiked ?? null,
+          isUploaded: Boolean(parsed.isUploaded || cached.isUploaded || isUploadedPost(cached) || isUploadedPost(parsed)),
         });
         if (postMetadataChanged(cached, merged)) {
           writer.put(updatePostRow(merged) || cached);
@@ -2435,6 +2603,7 @@
       filterWithVideo,
       filterOnlyChildren,
       filterHideChilds,
+      filterUploadedOnly,
       filterMinChildren,
       filterModel,
       filterLikedOnly,
@@ -2443,58 +2612,178 @@
     };
   }
 
-  function downloadResultsJson() {
-    const statusEl = document.getElementById('grok-stamp-status');
-    const buttons = document.querySelectorAll('.grok-download-results-btn');
-    buttons.forEach(btn => { btn.disabled = true; });
-    try {
-      if (typeof backfillChildParentPrompts === 'function') backfillChildParentPrompts();
-      if (typeof propagateBatchPrompts === 'function') propagateBatchPrompts(matchedPosts);
-      const posts = matchedPosts.map(toStorageRecord);
-      const parentCount = posts.filter(p => !p.isChild).length;
-      const childCount = posts.filter(p => p.isChild).length;
-      const payload = {
-        exportedAt: new Date().toISOString(),
-        schemaVersion: INDEX_SCHEMA_VERSION,
-        source: 'grok-search-results',
-        count: posts.length,
-        counts: {
-          total: posts.length,
-          parents: parentCount,
-          children: childCount,
-        },
-        filters: getActiveResultsFilters(),
-        recordFields: [
-          'id', 'prompt', 'parentPrompt', 'parentId', 'rootId', 'rootPrompt', 'isChild',
-          'thumbnail', 'mediaUrl', 'createTime', 'model', 'mediaType',
-          'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount', 'isLiked',
-          'conversationId',
-          METADATA_REFRESH_KEY,
-        ],
-        posts,
-      };
-      const json = JSON.stringify(payload, null, 2);
-      const blob = new Blob([json], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const stamp = new Date().toISOString().slice(0, 10);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `grok-search-results-${stamp}.json`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      if (statusEl) {
-        statusEl.textContent = `downloaded ${posts.length.toLocaleString()}`;
-        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
-      }
-      console.log(`[GrokSearch] Downloaded ${posts.length} result row(s)`);
-    } catch (e) {
-      console.error('[GrokSearch] Results download failed:', e);
-      if (statusEl) statusEl.textContent = 'download failed';
-    } finally {
-      syncDownloadResultsButtons();
+  function csvEscape(val) {
+    if (val == null) return '';
+    const str = String(val);
+    if (/[",\r\n]/.test(str)) {
+      return `"${str.replace(/"/g, '""')}"`;
     }
+    return str;
+  }
+
+  function triggerBlobDownload(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function exportSubsetAsCsv(posts, filename) {
+    const headers = [
+      'id', 'prompt', 'model', 'date', 'mediaType', 'mediaUrl', 'thumbnail',
+      'isChild', 'parentId', 'rootId', 'isLiked', 'isUploaded', 'conversationId'
+    ];
+    const rows = [headers.join(',')];
+    for (const post of posts) {
+      const prompt = post.prompt || post.parentPrompt || post.rootPrompt || '';
+      const date = post.createTime ? new Date(post.createTime).toISOString() : '';
+      const row = [
+        csvEscape(post.id),
+        csvEscape(prompt),
+        csvEscape(post.model || ''),
+        csvEscape(date),
+        csvEscape(post.mediaType || ''),
+        csvEscape(getPostMediaUrl(post)),
+        csvEscape(getPostThumbnailUrl(post)),
+        csvEscape(isChildPost(post) ? 'true' : 'false'),
+        csvEscape(post.parentId || ''),
+        csvEscape(post.rootId || ''),
+        csvEscape(post.isLiked === true ? 'true' : (post.isLiked === false ? 'false' : '')),
+        csvEscape(isUploadedPost(post) ? 'true' : 'false'),
+        csvEscape(post.conversationId || ''),
+      ];
+      rows.push(row.join(','));
+    }
+    const blob = new Blob(['\uFEFF' + rows.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+    triggerBlobDownload(blob, filename);
+  }
+
+  function exportSubsetAsJson(posts, filename, isSelected) {
+    if (typeof backfillChildParentPrompts === 'function') backfillChildParentPrompts();
+    if (typeof propagateBatchPrompts === 'function') propagateBatchPrompts(posts);
+    const storagePosts = posts.map(toStorageRecord);
+    const parentCount = storagePosts.filter(p => !p.isChild).length;
+    const childCount = storagePosts.filter(p => p.isChild).length;
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      schemaVersion: INDEX_SCHEMA_VERSION,
+      source: isSelected ? 'grok-search-selected' : 'grok-search-results',
+      subset: isSelected ? 'selected' : 'filtered',
+      count: storagePosts.length,
+      counts: {
+        total: storagePosts.length,
+        parents: parentCount,
+        children: childCount,
+      },
+      filters: getActiveResultsFilters(),
+      recordFields: [
+        'id', 'prompt', 'parentPrompt', 'parentId', 'rootId', 'rootPrompt', 'isChild',
+        'thumbnail', 'mediaUrl', 'createTime', 'model', 'mediaType',
+        'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount', 'isLiked',
+        'conversationId', 'isUploaded',
+        METADATA_REFRESH_KEY,
+      ],
+      posts: storagePosts,
+    };
+    const json = JSON.stringify(payload, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    triggerBlobDownload(blob, filename);
+  }
+
+  function ensureExportFormatDialog() {
+    let dlg = document.getElementById('grok-export-format-dialog');
+    if (dlg) return dlg;
+    dlg = document.createElement('div');
+    dlg.id = 'grok-export-format-dialog';
+    dlg.className = 'grok-bulk-download-confirm';
+    dlg.hidden = true;
+    dlg.innerHTML = `
+      <div class="grok-bulk-download-confirm-backdrop" data-grok-export-cancel></div>
+      <div class="grok-bulk-download-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="grok-export-format-title">
+        <div class="grok-bulk-download-confirm-title" id="grok-export-format-title">Export subset</div>
+        <p class="grok-bulk-download-confirm-message" id="grok-export-format-message"></p>
+        <div class="grok-bulk-download-confirm-actions">
+          <button type="button" class="grok-toolbar-btn grok-export-format-cancel" data-grok-export-cancel>Cancel</button>
+          <button type="button" class="grok-toolbar-btn grok-export-btn-csv">Export CSV</button>
+          <button type="button" class="grok-toolbar-btn grok-export-btn-json">Export JSON</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(dlg);
+
+    dlg.querySelectorAll('[data-grok-export-cancel]').forEach(el => {
+      el.addEventListener('click', () => { dlg.hidden = true; });
+    });
+    dlg.querySelector('.grok-export-btn-csv')?.addEventListener('click', () => {
+      dlg.hidden = true;
+      executeSubsetExport('csv');
+    });
+    dlg.querySelector('.grok-export-btn-json')?.addEventListener('click', () => {
+      dlg.hidden = true;
+      executeSubsetExport('json');
+    });
+    document.addEventListener('keydown', e => {
+      if (!dlg.hidden && e.key === 'Escape') {
+        e.preventDefault();
+        dlg.hidden = true;
+      }
+    });
+    return dlg;
+  }
+
+  function showExportSubsetDialog() {
+    const isSelected = selectedPostIds.size > 0;
+    const posts = isSelected ? getSelectedPostsInOrder() : matchedPosts.slice();
+    if (!posts.length) {
+      flashStampStatus('nothing to export');
+      return;
+    }
+    const dlg = ensureExportFormatDialog();
+    const titleEl = document.getElementById('grok-export-format-title');
+    const msgEl = document.getElementById('grok-export-format-message');
+    const noun = posts.length === 1 ? 'item' : 'items';
+    if (titleEl) {
+      titleEl.textContent = isSelected ? 'Export selected items' : 'Export filtered results';
+    }
+    if (msgEl) {
+      msgEl.textContent = isSelected
+        ? `Export ${posts.length} selected ${noun} as JSON or CSV table:`
+        : `Export ${posts.length} filtered ${noun} as JSON or CSV table:`;
+    }
+    dlg.hidden = false;
+    dlg.querySelector('.grok-export-btn-json')?.focus();
+  }
+
+  function executeSubsetExport(format) {
+    const isSelected = selectedPostIds.size > 0;
+    const posts = isSelected ? getSelectedPostsInOrder() : matchedPosts.slice();
+    if (!posts.length) {
+      flashStampStatus('nothing to export');
+      return;
+    }
+    const stamp = new Date().toISOString().slice(0, 10);
+    const prefix = isSelected ? 'selected' : 'filtered';
+    const filename = `grok-${prefix}-${posts.length}-${stamp}.${format}`;
+
+    try {
+      if (format === 'csv') {
+        exportSubsetAsCsv(posts, filename);
+      } else {
+        exportSubsetAsJson(posts, filename, isSelected);
+      }
+      flashStampStatus(`exported ${posts.length} ${format.toUpperCase()}`);
+    } catch (err) {
+      console.error('[GrokSearch] Subset export failed:', err);
+      flashStampStatus('export failed');
+    }
+  }
+
+  function downloadResultsJson() {
+    showExportSubsetDialog();
   }
 
   function byCreatedDesc(a, b) {
@@ -3239,6 +3528,31 @@
     return byConv;
   }
 
+  let postsByConversation = new Map();
+  let postsByConversationSource = null;
+  let postsByConversationLength = -1;
+
+  function getPostsByConversation() {
+    if (postsByConversationSource === allPosts && postsByConversationLength === allPosts.length) {
+      return postsByConversation;
+    }
+    const byConv = new Map();
+    for (const p of allPosts) {
+      if (!p.conversationId) continue;
+      const convId = String(p.conversationId);
+      let list = byConv.get(convId);
+      if (!list) {
+        list = [];
+        byConv.set(convId, list);
+      }
+      list.push(p);
+    }
+    postsByConversation = byConv;
+    postsByConversationSource = allPosts;
+    postsByConversationLength = allPosts.length;
+    return byConv;
+  }
+
   /**
    * Resolves an image thumbnail URL for a post/asset.
    *
@@ -3344,28 +3658,32 @@
     // 3. Children and descendants
     const descendants = typeof getAllDescendantPosts === 'function' ? getAllDescendantPosts(id) : [];
     for (const child of descendants) {
+      if (limit && related.length >= limit) break;
       const isDirect = child.parentId === id;
       add(child, 'child', isDirect ? 'Child' : 'Descendant');
     }
 
     // 4. Siblings sharing parentId
-    if (parentId) {
+    if (parentId && (!limit || related.length < limit)) {
       if (typeof getChildrenByParent === 'function') {
         const siblings = getChildrenByParent().get(parentId) || [];
         for (const s of siblings) {
+          if (limit && related.length >= limit) break;
           if (s.id !== id) add(s, 'sibling', 'Sibling');
         }
       } else if (typeof allPosts !== 'undefined') {
         for (const s of allPosts) {
+          if (limit && related.length >= limit) break;
           if (s.parentId === parentId && s.id !== id) add(s, 'sibling', 'Sibling');
         }
       }
     }
 
     // 5. Siblings sharing rootId (for grandchildren / deep trees)
-    if (rootId && rootId !== parentId) {
+    if (rootId && rootId !== parentId && (!limit || related.length < limit)) {
       if (typeof allPosts !== 'undefined') {
         for (const s of allPosts) {
+          if (limit && related.length >= limit) break;
           if (s.rootId === rootId && s.id !== id) add(s, 'sibling', 'Branch');
         }
       }
@@ -3373,18 +3691,28 @@
 
     // 6. Batch siblings via conversationId
     const convId = String(post.conversationId || '').trim();
-    if (convId && typeof allPosts !== 'undefined') {
-      for (const b of allPosts) {
-        if (b.conversationId === convId && b.id !== id) {
-          add(b, 'batch', 'Batch');
+    if (convId && (!limit || related.length < limit)) {
+      if (typeof getPostsByConversation === 'function') {
+        const batch = getPostsByConversation().get(convId) || [];
+        for (const b of batch) {
+          if (limit && related.length >= limit) break;
+          if (b.id !== id) add(b, 'batch', 'Batch');
+        }
+      } else if (typeof allPosts !== 'undefined') {
+        for (const b of allPosts) {
+          if (limit && related.length >= limit) break;
+          if (b.conversationId === convId && b.id !== id) {
+            add(b, 'batch', 'Batch');
+          }
         }
       }
     }
 
     // 7. Posts with the exact same non-empty prompt
     const promptText = String(post.prompt || post.parentPrompt || post.rootPrompt || '').trim().toLowerCase();
-    if (promptText.length >= 5 && typeof allPosts !== 'undefined') {
+    if (promptText.length >= 5 && (!limit || related.length < limit) && typeof allPosts !== 'undefined') {
       for (const p of allPosts) {
+        if (limit && related.length >= limit) break;
         if (p.id === id || seen.has(p.id)) continue;
         const pPrompt = String(p.prompt || p.parentPrompt || p.rootPrompt || '').trim().toLowerCase();
         if (pPrompt === promptText) {
@@ -4672,7 +5000,7 @@
     btn.className = 'grok-toolbar-btn';
     btn.id = 'grok-lightbox-download';
     btn.textContent = 'Download';
-    btn.title = 'Download current image or video';
+    btn.title = 'Download current image or video (D)';
     actions.appendChild(btn);
     bindLightboxDownloadButton();
   }
@@ -4817,6 +5145,7 @@
     const cards = items.map(({ post: p, relation, label }) => {
       const thumb = getPostThumbnailUrl(p);
       const isVideo = isVideoPost(p);
+      const isUploaded = isUploadedPost(p);
       const promptText = p.prompt || p.parentPrompt || p.rootPrompt || '';
       const dateStr = formatPostDate(p.createTime);
       const badgeClass = `grok-lightbox-badge--${relation}`;
@@ -4828,6 +5157,7 @@
             <img class="grok-lightbox-related-thumb" loading="lazy" src="${escapeHtml(thumb)}" alt="" />
             ${isVideo ? '<span class="grok-lightbox-related-play" title="Video">▶</span>' : ''}
             <span class="grok-lightbox-badge ${badgeClass}">${escapeHtml(label)}</span>
+            ${isUploaded ? '<span class="grok-lightbox-badge grok-lightbox-badge--uploaded" title="Uploaded image">Upload</span>' : ''}
           </div>
           <div class="grok-lightbox-related-info">
             ${dateStr ? `<span class="grok-lightbox-related-date">${escapeHtml(dateStr)}</span>` : ''}
@@ -4849,7 +5179,7 @@
     btn.className = 'grok-toolbar-btn grok-lightbox-delete-btn';
     btn.id = 'grok-lightbox-delete';
     btn.textContent = 'Delete';
-    btn.title = 'Permanently delete this item from your Grok library';
+    btn.title = 'Permanently delete this item from your Grok library (Delete / Backspace)';
     actions.appendChild(btn);
     btn.addEventListener('click', async e => {
       e.preventDefault();
@@ -4897,7 +5227,7 @@
     btn.classList.toggle('is-liked', liked);
     btn.textContent = liked ? '♥ Liked' : '♡ Like';
     btn.title = hasLikeSupport()
-      ? (liked ? 'Unlike this post' : 'Like this post')
+      ? (liked ? 'Unlike this post (L)' : 'Like this post (L)')
       : 'Liking is not set up yet — run tools/capture-like.js once';
   }
 
@@ -4931,7 +5261,7 @@
           <div class="grok-lightbox-actions">
             <button type="button" class="grok-toolbar-btn" id="grok-lightbox-open-tab">Open on new tab</button>
             <button type="button" class="grok-toolbar-btn" id="grok-lightbox-open-post">Open post</button>
-            <button type="button" class="grok-toolbar-btn" id="grok-lightbox-download" title="Download current image or video">Download</button>
+            <button type="button" class="grok-toolbar-btn" id="grok-lightbox-download" title="Download current image or video (D)">Download</button>
           </div>
         </div>
       </div>
@@ -4988,6 +5318,40 @@
       ? `<video class="grok-lightbox-media" src="${escapeHtml(mediaUrl)}" controls autoplay playsinline></video>`
       : `<img class="grok-lightbox-media" src="${escapeHtml(mediaUrl)}" alt="${escapeHtml(imageAltText(post.prompt))}" />`;
 
+    const mediaEl = stage.querySelector('.grok-lightbox-media');
+    if (mediaEl) {
+      const onMediaError = () => {
+        post._mediaUnavailable = true;
+        let errBox = stage.querySelector('.grok-lightbox-media-error');
+        if (!errBox) {
+          errBox = document.createElement('div');
+          errBox.className = 'grok-lightbox-media-error';
+          errBox.innerHTML = `
+            <div class="grok-lightbox-error-icon">
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                <circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>
+              </svg>
+            </div>
+            <div class="grok-lightbox-error-title">Media not found on Grok server (HTTP 404 / deleted)</div>
+            <div class="grok-lightbox-error-actions">
+              <button type="button" class="grok-toolbar-btn grok-lightbox-prune-btn" title="Remove this record from local database">Remove from index</button>
+              <button type="button" class="grok-toolbar-btn grok-lightbox-copy-prompt-btn" title="Copy prompt text before removing">Copy prompt</button>
+            </div>`;
+          stage.appendChild(errBox);
+          errBox.querySelector('.grok-lightbox-prune-btn')?.addEventListener('click', async () => {
+            await pruneSingleBrokenPost(post);
+            closeResultLightbox();
+          });
+          errBox.querySelector('.grok-lightbox-copy-prompt-btn')?.addEventListener('click', async () => {
+            const text = post.prompt || post.parentPrompt || post.rootPrompt || '';
+            if (await copyText(text)) flashStampStatus('prompt copied');
+          });
+        }
+        mediaEl.style.display = 'none';
+      };
+      mediaEl.addEventListener('error', onMediaError, { once: true });
+    }
+
     const displayPrompt = post.prompt || post.parentPrompt || post.rootPrompt || '';
     promptEl.textContent = displayPrompt || '(no prompt)';
     if (!post.prompt && post.parentPrompt) {
@@ -5005,6 +5369,7 @@
     const dateStr = formatPostDate(post.createTime);
     if (dateStr) bits.push(dateStr);
     if (post.model) bits.push(post.model);
+    if (isUploadedPost(post)) bits.push('Uploaded image');
     if (isChildPost(post)) bits.push(post.parentId ? `Child post (${post.parentId.slice(0, 8)}…)` : 'Child post');
     if (!post.prompt && (post.parentPrompt || post.rootPrompt)) bits.push('Parent prompt');
     subEl.textContent = bits.join(' · ');
@@ -5025,6 +5390,7 @@
             const d = formatPostDate(post.createTime);
             if (d) updatedBits.push(d);
             if (post.model) updatedBits.push(post.model);
+            if (isUploadedPost(post)) updatedBits.push('Uploaded image');
             if (isChildPost(post)) updatedBits.push(post.parentId ? `Child post (${post.parentId.slice(0, 8)}…)` : 'Child post');
             if (!post.prompt && (post.parentPrompt || post.rootPrompt)) updatedBits.push('Parent prompt');
             subEl.textContent = updatedBits.join(' · ');
@@ -5076,6 +5442,20 @@
     renderResultLightbox();
   }
 
+  function focusSearchInputFromShortcut(e) {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    if (isResultLightboxOpen()) closeResultLightbox();
+    setSearchBarExpanded(true);
+    const searchInput = document.getElementById('grok-search-input');
+    if (searchInput) {
+      searchInput.focus();
+      searchInput.select();
+    }
+  }
+
   function bindGlobalResultUiListeners() {
     if (document.body.dataset.grokResultUiBound) return;
     document.body.dataset.grokResultUiBound = '1';
@@ -5087,6 +5467,15 @@
     window.addEventListener('resize', hideResultContextMenu);
 
     document.addEventListener('keydown', e => {
+      const isInput = e.target && (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName) || e.target.isContentEditable);
+      const isSlash = e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey;
+      const isCtrlF = (e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'f' || e.key === 'F');
+
+      if ((isSlash && !isInput) || isCtrlF) {
+        focusSearchInputFromShortcut(e);
+        return;
+      }
+
       if (isResultLightboxOpen()) {
         if (e.key === 'Escape') {
           e.preventDefault();
@@ -5099,6 +5488,60 @@
           e.stopPropagation();
           stepResultLightbox(e.key === 'ArrowRight' ? 1 : -1);
           return;
+        }
+
+        if (!isInput) {
+          const keyLower = e.key ? e.key.toLowerCase() : '';
+          const hasModifier = e.ctrlKey || e.metaKey || e.altKey;
+
+          if (!hasModifier && keyLower === 'c') {
+            const post = getCurrentLightboxPost();
+            if (post) {
+              e.preventDefault();
+              e.stopPropagation();
+              const text = post.prompt || post.parentPrompt || post.rootPrompt || '';
+              copyText(text).then(ok => {
+                if (ok) flashStampStatus('prompt copied');
+              });
+            }
+            return;
+          }
+
+          if (!hasModifier && keyLower === 'l') {
+            const post = getCurrentLightboxPost();
+            if (post) {
+              e.preventDefault();
+              e.stopPropagation();
+              togglePostLiked(post).then(() => {
+                syncLightboxLikeButton();
+                flashStampStatus(post.isLiked ? 'liked' : 'unliked');
+              });
+            }
+            return;
+          }
+
+          if (!hasModifier && keyLower === 'd') {
+            const post = getCurrentLightboxPost();
+            if (post) {
+              e.preventDefault();
+              e.stopPropagation();
+              downloadPostMedia(post);
+              flashStampStatus('downloading');
+            }
+            return;
+          }
+
+          if (!hasModifier && (e.key === 'Delete' || e.key === 'Backspace')) {
+            const post = getCurrentLightboxPost();
+            if (post) {
+              e.preventDefault();
+              e.stopPropagation();
+              deleteSinglePost(post).then(res => {
+                if (res && res.deleted > 0) closeResultLightbox();
+              });
+            }
+            return;
+          }
         }
       }
       if (e.key === 'Escape') hideResultContextMenu();
@@ -5179,6 +5622,14 @@
         if (kidPost) openResultLightbox(kidPost);
         return;
       }
+      const pruneBtn = e.target.closest('.grok-result-prune-btn');
+      if (pruneBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        const post = getPostById(pruneBtn.closest('.grok-result-card')?.dataset.id);
+        if (post) pruneSingleBrokenPost(post);
+        return;
+      }
       const likeBtn = e.target.closest('.grok-result-like');
       if (likeBtn) {
         e.preventDefault();
@@ -5204,6 +5655,15 @@
         window.open(card.dataset.media, '_blank');
       }
     });
+  }
+
+  async function pruneSingleBrokenPost(post) {
+    if (!post || !post.id) return;
+    const writer = createIndexWriter();
+    removeRowsById([post.id], writer);
+    await writer.flush();
+    applyFilter();
+    flashStampStatus('removed from index');
   }
 
   function showResults() {
@@ -5297,15 +5757,16 @@
     matchedPosts = allPosts.filter(post => {
       if (filterHideChilds && isChildPost(post)) return false;
       if (filterOnlyChildren && isChildPost(post)) return false;
-      if (terms.length > 0) {
-        const p = getSearchablePromptText(post, parentPromptById);
-        if (!terms.every(t => p.includes(t))) return false;
-      }
+      if (filterUploadedOnly && !isUploadedPost(post)) return false;
       if (dateBounds && !matchesDateBounds(post, dateBounds)) return false;
       if (!matchesModelFilter(post)) return false;
       if (!matchesLikedFilter(post)) return false;
       if (!matchesVideoFilters(post)) return false;
       if (filterOnlyChildren && (post.childPostCount ?? 0) < filterMinChildren) return false;
+      if (terms.length > 0) {
+        const p = getSearchablePromptText(post, parentPromptById);
+        if (!terms.every(t => p.includes(t))) return false;
+      }
       return true;
     });
 
@@ -5369,7 +5830,7 @@
     const n = matchedPosts.length.toLocaleString();
     const hasText = Boolean(currentQuery.trim());
     const hasDates = hasDateFilter();
-    if (hasText || hasDates || filterVideoOnly || filterWithVideo || filterOnlyChildren || filterHideChilds) {
+    if (hasText || hasDates || filterVideoOnly || filterWithVideo || filterOnlyChildren || filterHideChilds || filterUploadedOnly) {
       countText = `${n} match${matchedPosts.length !== 1 ? 'es' : ''}`;
     } else {
       countText = `${n} saved`;
@@ -5400,19 +5861,38 @@
   }
 
   function renderResultBadgesInner(post) {
+    const isUploaded = isUploadedPost(post);
     if (isChildPost(post)) {
       const videos = post.videoCount ?? 0;
+      const parts = [];
       if (videos > 0) {
-        return `
+        parts.push(`
           <span class="grok-badge grok-badge-video" title="Video">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
-          </span>`;
+          </span>`);
       }
-      return '';
+      if (isUploaded) {
+        parts.push(`
+          <span class="grok-badge grok-badge-uploaded" title="Uploaded image">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <span>Upload</span>
+          </span>`);
+      }
+      return parts.join('');
     }
     const videos = post.videoCount ?? 0;
     const childImages = post.childImageCount ?? 0;
     const parts = [];
+    if (isUploaded) {
+      parts.push(`<span class="grok-badge grok-badge-uploaded" title="Uploaded image">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <span>Upload</span>
+      </span>`);
+    }
     if (videos > 0) {
       parts.push(`<span class="grok-badge grok-badge-video" title="${videos} video${videos !== 1 ? 's' : ''} (incl. all descendants)">
         <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
@@ -5498,19 +5978,42 @@
    * `:scope > img` matters: the compact strip's thumbnails are `<img>` elements inside this card
    * too, and a bare `querySelector('img')` only avoids them by DOM order.
    */
-  function syncCardImage(card, thumb, prompt) {
+  function syncCardImage(card, thumb, prompt, post = null) {
     const img = card.querySelector(':scope > img');
     if (!img) return null;
 
     const alt = imageAltText(prompt);
     const previous = img.getAttribute('src') || '';
+
+    const markBroken = isBroken => {
+      if (card.classList) card.classList.toggle('grok-result-card--broken', isBroken);
+      if (post) post._mediaUnavailable = isBroken;
+      try {
+        const overlay = card.querySelector?.('.grok-result-broken-overlay');
+        if (overlay) overlay.hidden = !isBroken;
+        const pruneBtn = card.querySelector?.('.grok-result-prune-btn');
+        if (pruneBtn) pruneBtn.hidden = !isBroken;
+      } catch { /* ignore on FakeCard in tests */ }
+    };
+
+    const attachListeners = targetImg => {
+      targetImg.onerror = () => markBroken(true);
+      targetImg.onload = () => markBroken(false);
+    };
+
+    if (!thumb) {
+      markBroken(true);
+    }
+
     if (previous === thumb) {
       if (img.alt !== alt) img.alt = alt;
+      attachListeners(img);
       return img;
     }
     if (!previous) {
       if (thumb) img.setAttribute('src', thumb);
       img.alt = alt;
+      attachListeners(img);
       return img;
     }
 
@@ -5520,6 +6023,7 @@
     fresh.style.cssText = img.style.cssText;
     fresh.className = img.className;
     fresh.alt = alt;
+    attachListeners(fresh);
     if (thumb) fresh.setAttribute('src', thumb);
     img.replaceWith(fresh);
     return fresh;
@@ -5535,7 +6039,14 @@
       </label>
       <span class="grok-result-child-mark" title="Child post" hidden>${CHILD_MARK_SVG}</span>
       <button type="button" class="grok-result-like" aria-pressed="false">${HEART_SVG}</button>
+      <button type="button" class="grok-result-prune-btn" title="Remove broken image from database" hidden>✕</button>
       <div class="grok-result-date" hidden></div>
+      <div class="grok-result-broken-overlay" hidden>
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>
+        </svg>
+        <span>Media deleted</span>
+      </div>
       <img loading="lazy" style="width:100%; display:block; border-radius:14px; aspect-ratio:3/4; object-fit:cover;" />
       <div class="grok-result-prompt"></div>
       <div class="grok-result-badges" hidden></div>
@@ -5614,7 +6125,14 @@
       }
     }
 
-    syncCardImage(card, getPostThumbnailUrl(post), prompt);
+    const isBroken = Boolean(post._mediaUnavailable);
+    card.classList.toggle('grok-result-card--broken', isBroken);
+    const brokenOverlay = card.querySelector('.grok-result-broken-overlay');
+    if (brokenOverlay) brokenOverlay.hidden = !isBroken;
+    const pruneBtn = card.querySelector('.grok-result-prune-btn');
+    if (pruneBtn) pruneBtn.hidden = !isBroken;
+
+    syncCardImage(card, getPostThumbnailUrl(post), prompt, post);
 
     const promptEl = card.querySelector('.grok-result-prompt');
     if (promptEl) {
@@ -5719,6 +6237,7 @@
     if (dateEndEl) dateEndEl.value = dateEnd;
     currentPage = 0;
     updateClearButton();
+    updateDateNavButtons();
     applyFilter();
   }
 
@@ -5728,6 +6247,7 @@
     const enabled = hasSingleDayFilter();
     if (prevBtn) prevBtn.disabled = !enabled;
     if (nextBtn) nextBtn.disabled = !enabled;
+    syncDatePresetChips();
   }
 
   function applyDateFilterForDay(dateKey) {
@@ -5770,54 +6290,87 @@
    * the grandparent keeps it visible instead of stranding it in a group nobody rendered.
    */
   function buildDisplayEntries() {
-    if (!compactGroups) return matchedPosts.map(post => ({ post, children: [] }));
+    const isBatch = typeof batchGroups !== 'undefined' && Boolean(batchGroups);
+    if (!compactGroups && !isBatch) return matchedPosts.map(post => ({ post, children: [] }));
 
-    const entryById = new Map();
-    for (const post of matchedPosts) entryById.set(post.id, { post, children: [] });
+    let entries;
+    if (compactGroups) {
+      const entryById = new Map();
+      for (const post of matchedPosts) entryById.set(post.id, { post, children: [] });
 
-    /**
-     * The *outermost* matched ancestor, not the nearest one. Walking only as far as the first
-     * match folds a grandchild into a parent that is itself folded somewhere else, and that
-     * inner entry is never rendered — the row would vanish from the grid.
-     */
-    const ownerIdOf = post => {
-      let cursor = post;
-      let ownerId = null;
-      const seen = new Set([post.id]);
-      while (isChildPost(cursor) && cursor.parentId) {
-        const parentId = String(cursor.parentId);
-        if (seen.has(parentId)) break;         // a cycle in the tree
-        seen.add(parentId);
-        if (entryById.has(parentId)) ownerId = parentId;
-        const parent = getPostById(parentId);
-        if (!parent) break;                    // chain leaves the index; keep what was found
-        cursor = parent;
+      const ownerIdOf = post => {
+        let cursor = post;
+        let ownerId = null;
+        const seen = new Set([post.id]);
+        while (isChildPost(cursor) && cursor.parentId) {
+          const parentId = String(cursor.parentId);
+          if (seen.has(parentId)) break;         // a cycle in the tree
+          seen.add(parentId);
+          if (entryById.has(parentId)) ownerId = parentId;
+          const parent = getPostById(parentId);
+          if (!parent) break;                    // chain leaves the index; keep what was found
+          cursor = parent;
+        }
+        return ownerId;
+      };
+
+      const ownerById = new Map();
+      for (const post of matchedPosts) ownerById.set(post.id, ownerIdOf(post));
+
+      entries = [];
+      for (const post of matchedPosts) {
+        const ownerId = ownerById.get(post.id);
+        if (ownerId && !ownerById.get(ownerId)) entryById.get(ownerId).children.push(post);
+        else entries.push(entryById.get(post.id));
       }
-      return ownerId;
-    };
-
-    const ownerById = new Map();
-    for (const post of matchedPosts) ownerById.set(post.id, ownerIdOf(post));
-
-    const out = [];
-    for (const post of matchedPosts) {
-      // Fold only into a card that is itself rendered. If the owner turns out to be folded too —
-      // which a cycle makes true of everyone — give the row its own cell rather than posting it
-      // into an entry nobody draws.
-      const ownerId = ownerById.get(post.id);
-      if (ownerId && !ownerById.get(ownerId)) entryById.get(ownerId).children.push(post);
-      else out.push(entryById.get(post.id));
+    } else {
+      entries = matchedPosts.map(post => ({ post, children: [] }));
     }
+
+    if (!isBatch) return entries;
+
+    const convLeaders = new Map();
+    const out = [];
+
+    for (const entry of entries) {
+      const convId = String(entry.post.conversationId || '').trim();
+      if (!convId) {
+        out.push(entry);
+        continue;
+      }
+      const leader = convLeaders.get(convId);
+      if (!leader) {
+        convLeaders.set(convId, entry);
+        out.push(entry);
+      } else {
+        const seenChildIds = new Set(leader.children.map(c => c.id));
+        seenChildIds.add(leader.post.id);
+        if (!seenChildIds.has(entry.post.id)) {
+          leader.children.push(entry.post);
+          seenChildIds.add(entry.post.id);
+        }
+        if (entry.children && entry.children.length > 0) {
+          for (const c of entry.children) {
+            if (!seenChildIds.has(c.id)) {
+              leader.children.push(c);
+              seenChildIds.add(c.id);
+            }
+          }
+        }
+      }
+    }
+
     return out;
   }
 
   /**
-   * Cached until `matchedPosts` is replaced or the compact switch moves. The identity check is
+   * Cached until `matchedPosts` is replaced or the compact/batch switch moves. The identity check is
    * the safety net: applyFilter() invalidates explicitly, but every other path that rebuilds the
    * match set does so by assigning a fresh array, and that is enough to be noticed here.
    */
   function getDisplayEntries() {
-    const signature = `${compactGroups ? 1 : 0}:${matchedPosts.length}`;
+    const isBatch = typeof batchGroups !== 'undefined' && Boolean(batchGroups);
+    const signature = `${compactGroups ? 1 : 0}:${isBatch ? 1 : 0}:${matchedPosts.length}`;
     if (displayEntriesSource !== matchedPosts || displayEntriesSignature !== signature) {
       displayEntriesSource = matchedPosts;
       displayEntriesSignature = signature;
@@ -5833,16 +6386,18 @@
   /**
    * How many cards the grid has, and one page of them.
    *
-   * With compact off these deliberately never touch getDisplayEntries(): the entry list would be
+   * With compact and batch off these deliberately never touch getDisplayEntries(): the entry list would be
    * a 1:1 wrapper around the whole match set, and building it would mean allocating an object per
    * indexed post on every keystroke. Only the page actually rendered gets wrapped.
    */
   function getDisplayCount() {
-    return compactGroups ? getDisplayEntries().length : matchedPosts.length;
+    const isBatch = typeof batchGroups !== 'undefined' && Boolean(batchGroups);
+    return (compactGroups || isBatch) ? getDisplayEntries().length : matchedPosts.length;
   }
 
   function getDisplayPage(start, size) {
-    if (!compactGroups) {
+    const isBatch = typeof batchGroups !== 'undefined' && Boolean(batchGroups);
+    if (!compactGroups && !isBatch) {
       return matchedPosts.slice(start, start + size).map(post => ({ post, children: [] }));
     }
     return getDisplayEntries().slice(start, start + size);
@@ -5869,6 +6424,7 @@
       localStorage.setItem(PAGE_SIZE_KEY, String(pageSize));
       localStorage.setItem(GRID_SIZE_PCT_KEY, String(gridSizePercent));
       localStorage.setItem(COMPACT_GROUPS_KEY, compactGroups ? '1' : '0');
+      localStorage.setItem(BATCH_GROUPS_KEY, batchGroups ? '1' : '0');
       localStorage.setItem(TOGGLE_POS_KEY, togglePosition);
     } catch { /* ignore */ }
   }
@@ -5892,6 +6448,15 @@
       return stored === null || stored === '' ? DEFAULT_COMPACT_GROUPS : stored === '1';
     } catch {
       return DEFAULT_COMPACT_GROUPS;
+    }
+  }
+
+  function readStoredBatchGroups() {
+    try {
+      const stored = localStorage.getItem(BATCH_GROUPS_KEY);
+      return stored === null || stored === '' ? DEFAULT_BATCH_GROUPS : stored === '1';
+    } catch {
+      return DEFAULT_BATCH_GROUPS;
     }
   }
 
@@ -5921,6 +6486,16 @@
     else updatePager();
   }
 
+  function applyBatchGroupsSetting(on) {
+    batchGroups = Boolean(on);
+    invalidateDisplayEntries();
+    syncDisplayControlLabels();
+    persistDisplaySettings();
+    currentPage = 0;
+    if (shouldShowSearchResults() && matchedPosts.length > 0) showResults();
+    else updatePager();
+  }
+
   function applyPageSizeSetting(newSize, rerender) {
     pageSize = clampPageSize(newSize);
     syncDisplayControlLabels();
@@ -5942,6 +6517,7 @@
     pageSize = clampPageSize(DEFAULT_PAGE_SIZE);
     gridSizePercent = clampGridSizePercent(DEFAULT_GRID_SIZE_PCT);
     compactGroups = DEFAULT_COMPACT_GROUPS;
+    batchGroups = DEFAULT_BATCH_GROUPS;
     invalidateDisplayEntries();
     applyTogglePosition(DEFAULT_TOGGLE_POS, false);
     syncDisplayControlLabels();
@@ -5973,6 +6549,8 @@
     if (gridSlider) gridSlider.value = String(gridSizePercent);
     const compactEl = document.getElementById('grok-compact-groups');
     if (compactEl && compactEl.checked !== compactGroups) compactEl.checked = compactGroups;
+    const batchEl = document.getElementById('grok-batch-groups');
+    if (batchEl && batchEl.checked !== batchGroups) batchEl.checked = batchGroups;
     const posEl = document.getElementById('grok-toggle-pos-select');
     if (posEl && posEl.value !== togglePosition) posEl.value = togglePosition;
   }
@@ -6071,6 +6649,8 @@
     if (filterChildrenEl) filterChildrenEl.checked = filterOnlyChildren;
     const filterHideChildsEl = document.getElementById('grok-filter-hide-childs');
     if (filterHideChildsEl) filterHideChildsEl.checked = filterHideChilds;
+    const filterUploadedOnlyEl = document.getElementById('grok-filter-uploaded-only');
+    if (filterUploadedOnlyEl) filterUploadedOnlyEl.checked = filterUploadedOnly;
   }
 
   function hasDateFilter() {
@@ -6080,7 +6660,7 @@
   function hasActiveFilter() {
     return Boolean(
       currentQuery.trim() || hasDateFilter() || filterVideoOnly || filterWithVideo
-      || filterOnlyChildren || filterHideChilds || filterModel || filterLikedOnly
+      || filterOnlyChildren || filterHideChilds || filterUploadedOnly || filterModel || filterLikedOnly
     );
   }
 
@@ -6115,6 +6695,7 @@
     const clearBtn = document.getElementById('grok-search-clear');
     if (clearBtn) clearBtn.classList.toggle('visible', hasActiveFilter());
     updateDateNavButtons();
+    syncDatePresetChips();
   }
 
   const DATE_NAV_PREV_SVG = `<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="7,1 3,5 7,9"/></svg>`;
@@ -6161,6 +6742,102 @@
       nextBtn.addEventListener('click', () => shiftSingleDayFilter(1));
     }
     updateDateNavButtons();
+  }
+
+  function getLocalDateKey(d = new Date()) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  function getDatePresetBounds(preset) {
+    const now = new Date();
+    const todayKey = getLocalDateKey(now);
+    if (preset === 'today') {
+      return { start: todayKey, end: todayKey };
+    }
+    if (preset === 'yesterday') {
+      const yDate = new Date(now);
+      yDate.setDate(yDate.getDate() - 1);
+      const yKey = getLocalDateKey(yDate);
+      return { start: yKey, end: yKey };
+    }
+    if (preset === 'last7') {
+      const d7 = new Date(now);
+      d7.setDate(d7.getDate() - 6);
+      return { start: getLocalDateKey(d7), end: todayKey };
+    }
+    if (preset === 'thisMonth') {
+      const mStart = new Date(now.getFullYear(), now.getMonth(), 1);
+      return { start: getLocalDateKey(mStart), end: todayKey };
+    }
+    return null;
+  }
+
+  function applyDatePreset(preset) {
+    const bounds = getDatePresetBounds(preset);
+    if (!bounds) return;
+    if (dateStart === bounds.start && dateEnd === bounds.end) {
+      dateStart = '';
+      dateEnd = '';
+    } else {
+      dateStart = bounds.start;
+      dateEnd = bounds.end;
+    }
+    const startEl = document.getElementById('grok-date-start');
+    const endEl = document.getElementById('grok-date-end');
+    if (startEl) startEl.value = dateStart;
+    if (endEl) endEl.value = dateEnd;
+    currentPage = 0;
+    updateClearButton();
+    updateDateNavButtons();
+    syncDatePresetChips();
+    applyFilter();
+  }
+
+  function syncDatePresetChips() {
+    const wrap = document.getElementById('grok-date-presets');
+    if (!wrap) return;
+    const btns = wrap.querySelectorAll('.grok-date-preset-btn');
+    btns.forEach(btn => {
+      const preset = btn.dataset.preset;
+      const bounds = getDatePresetBounds(preset);
+      const active = Boolean(bounds && dateStart === bounds.start && dateEnd === bounds.end);
+      btn.classList.toggle('grok-date-preset-active', active);
+      btn.setAttribute('aria-pressed', String(active));
+    });
+  }
+
+  function ensureDatePresetChips() {
+    let wrap = document.getElementById('grok-date-presets');
+    if (!wrap) {
+      const filters = getFiltersRow();
+      if (!filters) return;
+      wrap = document.createElement('div');
+      wrap.id = 'grok-date-presets';
+      wrap.className = 'grok-date-presets';
+      wrap.innerHTML = `
+        <button type="button" class="grok-date-preset-btn" data-preset="today" title="Filter to today">Today</button>
+        <button type="button" class="grok-date-preset-btn" data-preset="yesterday" title="Filter to yesterday">Yesterday</button>
+        <button type="button" class="grok-date-preset-btn" data-preset="last7" title="Filter to last 7 days">Last 7 Days</button>
+        <button type="button" class="grok-date-preset-btn" data-preset="thisMonth" title="Filter to this month">This Month</button>
+      `;
+      const nextBtn = document.getElementById('grok-date-next');
+      if (nextBtn) nextBtn.insertAdjacentElement('afterend', wrap);
+      else filters.appendChild(wrap);
+    }
+    if (!wrap.dataset.grokDatePresetsBound) {
+      wrap.dataset.grokDatePresetsBound = '1';
+      wrap.addEventListener('click', e => {
+        const btn = e.target.closest('.grok-date-preset-btn');
+        if (!btn) return;
+        e.preventDefault();
+        e.stopPropagation();
+        applyDatePreset(btn.dataset.preset);
+      });
+    }
+    syncDatePresetChips();
   }
 
   // ─── Styles ────────────────────────────────────────────────────────────────
@@ -6392,6 +7069,36 @@
         pointer-events: none;
       }
       .grok-date-nav-btn svg { display: block; }
+      .grok-date-presets {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        margin-left: 2px;
+      }
+      .grok-date-preset-btn {
+        background: rgba(255, 255, 255, 0.07);
+        color: rgba(255, 255, 255, 0.72);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 12px;
+        padding: 2px 7px;
+        font-size: 11px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+        white-space: nowrap;
+        user-select: none;
+      }
+      .grok-date-preset-btn:hover {
+        background: rgba(255, 255, 255, 0.14);
+        color: #fff;
+        border-color: rgba(255, 255, 255, 0.22);
+      }
+      .grok-date-preset-btn.grok-date-preset-active {
+        background: rgba(59, 130, 246, 0.25);
+        color: #93c5fd;
+        border-color: rgba(96, 165, 250, 0.45);
+        font-weight: 600;
+      }
       #grok-search-bar:focus-within {
         border-color: rgba(139,92,246,0.6);
         box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 0 3px rgba(139,92,246,0.15);
@@ -6701,6 +7408,59 @@
       .grok-result-card--child {
         box-shadow: inset 0 0 0 2px rgba(139, 92, 246, 0.45);
       }
+      .grok-result-card--broken {
+        box-shadow: inset 0 0 0 2px rgba(239, 68, 68, 0.55);
+        opacity: 0.9;
+      }
+      .grok-result-broken-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 3;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: rgba(12, 12, 16, 0.88);
+        color: #ef4444;
+        gap: 8px;
+        font-size: 11px;
+        font-weight: 600;
+        pointer-events: none;
+        border-radius: 14px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .grok-result-broken-overlay svg {
+        opacity: 0.85;
+      }
+      .grok-result-prune-btn {
+        position: absolute;
+        top: 8px;
+        right: 38px;
+        z-index: 6;
+        width: 26px;
+        height: 26px;
+        border-radius: 8px;
+        background: rgba(220, 38, 38, 0.85);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        color: #fff;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        line-height: 1;
+        transition: background 0.15s, transform 0.15s;
+      }
+      .grok-result-prune-btn:hover {
+        background: #ef4444;
+        transform: scale(1.08);
+      }
       /* The heart owns the top-right corner, so the child marker moves to the bottom-left. */
       .grok-result-child-mark {
         position: absolute;
@@ -6876,6 +7636,12 @@
       }
       .grok-badge-video svg { flex-shrink: 0; }
       .grok-badge-images svg { flex-shrink: 0; }
+      .grok-badge-uploaded {
+        background: rgba(16, 185, 129, 0.22);
+        color: #34d399;
+        border-color: rgba(16, 185, 129, 0.45);
+      }
+      .grok-badge-uploaded svg { flex-shrink: 0; }
       .grok-toolbar-btn {
         background: rgba(255,255,255,0.07);
         border: 1px solid rgba(255,255,255,0.15);
@@ -7134,6 +7900,7 @@
       .grok-lightbox-badge--sibling { background: #d97706; }
       .grok-lightbox-badge--batch { background: #db2777; }
       .grok-lightbox-badge--prompt { background: #4f46e5; }
+      .grok-lightbox-badge--uploaded { background: #059669; }
       .grok-lightbox-related-info {
         margin-top: 4px;
         display: flex;
@@ -7200,6 +7967,41 @@
         max-height: calc(92vh - 180px);
         object-fit: contain;
         border-radius: 10px;
+      }
+      .grok-lightbox-media-error {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        gap: 12px;
+        padding: 32px 24px;
+        background: rgba(220, 38, 38, 0.08);
+        border: 1px dashed rgba(239, 68, 68, 0.45);
+        border-radius: 12px;
+        color: #fca5a5;
+        max-width: 440px;
+      }
+      .grok-lightbox-error-icon {
+        color: #ef4444;
+      }
+      .grok-lightbox-error-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: #fee2e2;
+      }
+      .grok-lightbox-error-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 4px;
+      }
+      .grok-lightbox-prune-btn {
+        background: rgba(220, 38, 38, 0.25) !important;
+        border-color: rgba(239, 68, 68, 0.6) !important;
+        color: #fee2e2 !important;
+      }
+      .grok-lightbox-prune-btn:hover:not(:disabled) {
+        background: rgba(220, 38, 38, 0.5) !important;
       }
       @media (max-width: 768px) {
         .grok-lightbox-main {
@@ -7437,7 +8239,7 @@
     btn.className = 'grok-display-default-btn';
     btn.textContent = 'Default';
     btn.title = `Reset to ${DEFAULT_PAGE_SIZE} per page, ${DEFAULT_GRID_SIZE_PCT}% size, `
-      + 'compact off and the button in the top-right corner';
+      + 'compact and batch off, and the button in the top-right corner';
     row.appendChild(btn);
   }
 
@@ -7473,6 +8275,14 @@
       compact.title = 'Fold child results into their parent card instead of giving each one its own cell';
       compact.innerHTML = '<input type="checkbox" id="grok-compact-groups" /> Compact';
       row.appendChild(compact);
+    }
+    if (!document.getElementById('grok-batch-groups')) {
+      const batch = document.createElement('label');
+      batch.id = 'grok-batch-groups-label';
+      batch.className = 'grok-display-control';
+      batch.title = 'Group generations from the same batch / conversation into a single card';
+      batch.innerHTML = '<input type="checkbox" id="grok-batch-groups" /> Batch groups';
+      row.appendChild(batch);
     }
     if (!document.getElementById('grok-toggle-pos-select')) {
       const posCtrl = document.createElement('label');
@@ -7534,6 +8344,15 @@
       compactEl.checked = compactGroups;
       invalidateDisplayEntries();
       compactEl.addEventListener('change', () => applyCompactGroupsSetting(compactEl.checked));
+    }
+
+    const batchEl = document.getElementById('grok-batch-groups');
+    if (batchEl && !batchEl.dataset.grokDisplayBound) {
+      batchEl.dataset.grokDisplayBound = '1';
+      batchGroups = readStoredBatchGroups();
+      batchEl.checked = batchGroups;
+      invalidateDisplayEntries();
+      batchEl.addEventListener('change', () => applyBatchGroupsSetting(batchEl.checked));
     }
 
     const posEl = document.getElementById('grok-toggle-pos-select');
@@ -7780,6 +8599,7 @@
       (withVideoLabel || dateEnd || filters).insertAdjacentElement('afterend', childLabel);
     }
     ensureHideChildsCheckbox();
+    ensureUploadedCheckbox();
 
     ensureMediaMinSelect('grok-filter-children-min', document.getElementById('grok-filter-children-label'));
 
@@ -7800,6 +8620,15 @@
     } catch { /* ignore */ }
   }
 
+  function loadUploadedFilterFromStorage() {
+    try {
+      const stored = localStorage.getItem(FILTER_UPLOADED_ONLY_KEY);
+      if (stored !== null && stored !== '') {
+        filterUploadedOnly = stored === '1';
+      }
+    } catch { /* ignore */ }
+  }
+
   function ensureHideChildsCheckbox() {
     document.getElementById('grok-filter-show-childs-label')?.remove();
     const filters = getFiltersRow();
@@ -7815,12 +8644,29 @@
     (childFilterLabel || dateEnd || filters).insertAdjacentElement('afterend', hideChildsLabel);
   }
 
+  function ensureUploadedCheckbox() {
+    const filters = getFiltersRow();
+    const dateEnd = document.getElementById('grok-date-end');
+    if (!filters || document.getElementById('grok-filter-uploaded-only')) return;
+
+    const uploadedLabel = document.createElement('label');
+    uploadedLabel.id = 'grok-filter-uploaded-only-label';
+    uploadedLabel.className = 'grok-filter-check-label';
+    uploadedLabel.title = 'Show only uploaded images (hide generated media)';
+    uploadedLabel.innerHTML = '<input type="checkbox" id="grok-filter-uploaded-only" /> Uploaded only';
+    const hideChildsLabel = document.getElementById('grok-filter-hide-childs-label');
+    const childFilterLabel = document.getElementById('grok-filter-children-label');
+    (hideChildsLabel || childFilterLabel || dateEnd || filters).insertAdjacentElement('afterend', uploadedLabel);
+  }
+
   function bindMediaFilterListeners() {
     ensureHideChildsCheckbox();
+    ensureUploadedCheckbox();
     const filterVideoOnlyEl = document.getElementById('grok-filter-video-only');
     const filterWithVideoEl = document.getElementById('grok-filter-with-video');
     const filterChildrenEl = document.getElementById('grok-filter-children');
     const filterHideChildsEl = document.getElementById('grok-filter-hide-childs');
+    const filterUploadedOnlyEl = document.getElementById('grok-filter-uploaded-only');
     const childrenMinEl = document.getElementById('grok-filter-children-min');
     if (!filterVideoOnlyEl || !filterWithVideoEl || !filterChildrenEl || !filterHideChildsEl || !childrenMinEl) return;
 
@@ -7830,6 +8676,7 @@
         localStorage.setItem(FILTER_WITH_VIDEO_KEY, filterWithVideo ? '1' : '0');
         localStorage.setItem(FILTER_CHILDREN_KEY, filterOnlyChildren ? '1' : '0');
         localStorage.setItem(FILTER_HIDE_CHILDS_KEY, filterHideChilds ? '1' : '0');
+        localStorage.setItem(FILTER_UPLOADED_ONLY_KEY, filterUploadedOnly ? '1' : '0');
         localStorage.setItem(FILTER_CHILDREN_MIN_KEY, String(filterMinChildren));
       } catch { /* ignore */ }
     };
@@ -7839,6 +8686,7 @@
       filterWithVideo = filterWithVideoEl.checked;
       filterOnlyChildren = filterChildrenEl.checked;
       filterHideChilds = filterHideChildsEl.checked;
+      if (filterUploadedOnlyEl) filterUploadedOnly = filterUploadedOnlyEl.checked;
       filterMinChildren = parseMediaMin(childrenMinEl.value);
       syncMediaMinSelects();
       persistMediaFilters();
@@ -7863,12 +8711,22 @@
     }
 
     loadHideChildsFilterFromStorage();
+    loadUploadedFilterFromStorage();
     syncMediaMinSelects();
 
     if (!filterHideChildsEl.dataset.grokFilterBound) {
       filterHideChildsEl.dataset.grokFilterBound = '1';
       filterHideChildsEl.addEventListener('change', onMediaFilterChange);
       filterHideChildsEl.addEventListener('input', onMediaFilterChange);
+    }
+
+    if (filterUploadedOnlyEl) {
+      filterUploadedOnlyEl.checked = filterUploadedOnly;
+      if (!filterUploadedOnlyEl.dataset.grokFilterBound) {
+        filterUploadedOnlyEl.dataset.grokFilterBound = '1';
+        filterUploadedOnlyEl.addEventListener('change', onMediaFilterChange);
+        filterUploadedOnlyEl.addEventListener('input', onMediaFilterChange);
+      }
     }
   }
 
@@ -7923,6 +8781,7 @@
     document.querySelectorAll('.grok-download-results-btn').forEach(btn => {
       btn.disabled = disabled;
     });
+    syncExportResultsButton();
   }
 
   function appendSelectionToolbarButton(wrap, className, text, title) {
@@ -8086,6 +8945,7 @@
       btn.textContent = `Retry ${pending} file${pending === 1 ? '' : 's'}`;
       btn.title = `Download the ${pending} file${pending === 1 ? '' : 's'} the last run did not finish`;
     });
+    syncExportResultsButton();
   }
 
   function ensureImportJsonButton() {
@@ -8144,6 +9004,42 @@
     actions.prepend(btn);
   }
 
+  function ensureExportResultsButton() {
+    if (document.getElementById('grok-export-results-btn')) return;
+    const actions = getActionsRow();
+    if (!actions) return;
+    const btn = document.createElement('button');
+    btn.id = 'grok-export-results-btn';
+    btn.className = 'grok-toolbar-btn';
+    btn.type = 'button';
+    btn.textContent = 'Export results';
+    btn.title = 'Export filtered results or selected subset as JSON or CSV';
+    btn.addEventListener('click', () => showExportSubsetDialog());
+    const exportJsonBtn = document.getElementById('grok-export-json-btn');
+    if (exportJsonBtn && exportJsonBtn.nextSibling) {
+      actions.insertBefore(btn, exportJsonBtn.nextSibling);
+    } else {
+      actions.appendChild(btn);
+    }
+    syncExportResultsButton();
+  }
+
+  function syncExportResultsButton() {
+    const btn = document.getElementById('grok-export-results-btn');
+    if (!btn) return;
+    const selectedCount = selectedPostIds ? selectedPostIds.size : 0;
+    const totalCount = matchedPosts ? matchedPosts.length : 0;
+    if (selectedCount > 0) {
+      btn.textContent = `Export selected (${selectedCount})`;
+      btn.title = `Export ${selectedCount} selected items as JSON or CSV`;
+      btn.disabled = false;
+    } else {
+      btn.textContent = 'Export results';
+      btn.title = 'Export filtered results as JSON or CSV';
+      btn.disabled = totalCount === 0;
+    }
+  }
+
   function ensureReindexButton() {
     if (document.getElementById('grok-reindex-btn')) return;
     const actions = getActionsRow();
@@ -8155,6 +9051,20 @@
     btn.textContent = 'Reindex';
     btn.title = 'Clear cache and reindex from Grok (refreshes child image/video counts)';
     btn.addEventListener('click', () => reindexDatabase());
+    actions.appendChild(btn);
+  }
+
+  function ensurePruneMissingButton() {
+    if (document.getElementById('grok-prune-missing-btn')) return;
+    const actions = getActionsRow();
+    if (!actions) return;
+    const btn = document.createElement('button');
+    btn.id = 'grok-prune-missing-btn';
+    btn.className = 'grok-toolbar-btn';
+    btn.type = 'button';
+    btn.textContent = 'Prune missing';
+    btn.title = 'Scan database for deleted / 404 images and remove them from local index';
+    btn.addEventListener('click', () => runPruneMissingMedia({ manual: true }));
     actions.appendChild(btn);
   }
 
@@ -8286,13 +9196,16 @@
     ensurePageJumpInput();
     ensureImportJsonButton();
     ensureExportJsonButton();
+    ensureExportResultsButton();
     ensureVerifyButton();
     ensureReindexButton();
+    ensurePruneMissingButton();
     ensureMediaFilterCheckboxes();
     ensureLikedFilterCheckbox();
     ensureModelFilterSelect();
     ensureDisplayControls();
     ensureDateNavButtons();
+    ensureDatePresetChips();
     ensureSearchBarToggle();
     ensureDownloadResultsButtons();
     ensureDownloadSelectedButtons();
@@ -8349,6 +9262,12 @@
             <span class="grok-date-sep">–</span>
             <input id="grok-date-end" class="grok-date-input" type="date" title="To date" aria-label="To date" />
             <button type="button" id="grok-date-next" class="grok-date-nav-btn icon-only" title="Next day" aria-label="Next day" disabled>${DATE_NAV_NEXT_SVG}</button>
+            <div id="grok-date-presets" class="grok-date-presets">
+              <button type="button" class="grok-date-preset-btn" data-preset="today" title="Filter to today">Today</button>
+              <button type="button" class="grok-date-preset-btn" data-preset="yesterday" title="Filter to yesterday">Yesterday</button>
+              <button type="button" class="grok-date-preset-btn" data-preset="last7" title="Filter to last 7 days">Last 7 Days</button>
+              <button type="button" class="grok-date-preset-btn" data-preset="thisMonth" title="Filter to this month">This Month</button>
+            </div>
             <label id="grok-filter-video-only-label" class="grok-filter-check-label" title="Show only video posts (hide images)">
               <input type="checkbox" id="grok-filter-video-only" />
               Video only
@@ -8368,6 +9287,10 @@
               <input type="checkbox" id="grok-filter-hide-childs" />
               Hide childs
             </label>
+            <label id="grok-filter-uploaded-only-label" class="grok-filter-check-label" title="Show only uploaded images (hide generated media)">
+              <input type="checkbox" id="grok-filter-uploaded-only" />
+              Uploaded only
+            </label>
             <button id="grok-search-clear" class="grok-toolbar-btn grok-clear-filters-btn" type="button" title="Clear all filters">
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2">
                 <line x1="1" y1="1" x2="11" y2="11"/><line x1="11" y1="1" x2="1" y2="11"/>
@@ -8376,14 +9299,16 @@
           </div>
           <div id="grok-bar-actions" class="grok-bar-actions">
             <button id="grok-export-json-btn" class="grok-toolbar-btn" type="button" title="Download full indexed database as JSON">Export JSON</button>
+            <button id="grok-export-results-btn" class="grok-toolbar-btn" type="button" title="Export filtered results or selected subset as JSON or CSV">Export results</button>
             <button id="grok-reindex-btn" class="grok-toolbar-btn" type="button" title="Clear cache and reindex from Grok (refreshes child image/video counts)">Reindex</button>
+            <button id="grok-prune-missing-btn" class="grok-toolbar-btn" type="button" title="Scan database for deleted / 404 images and remove them from local index">Prune missing</button>
           </div>
         </div>
       </div>
       <div id="grok-pager">
         <button class="grok-page-btn icon-only" id="grok-page-first" title="First page">
           <svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="1" y1="1" x2="1" y2="10"/><polyline points="10,1 4,5.5 10,10"/>
+            <line x1="1" y1="1" x2="11" y2="10"/><polyline points="10,1 4,5.5 10,10"/>
           </svg>
         </button>
         <button class="grok-page-btn" id="grok-page-prev">
@@ -8422,7 +9347,9 @@
     const dateEndEl = document.getElementById('grok-date-end');
     const clearBtn = document.getElementById('grok-search-clear');
     const reindexBtn = document.getElementById('grok-reindex-btn');
+    const pruneMissingBtn = document.getElementById('grok-prune-missing-btn');
     const exportJsonBtn = document.getElementById('grok-export-json-btn');
+    const exportResultsBtn = document.getElementById('grok-export-results-btn');
     const sortSel = document.getElementById('grok-sort-select');
     const resultsOnlyEl = document.getElementById('grok-results-only');
     const filterChildrenEl = document.getElementById('grok-filter-children');
@@ -8433,6 +9360,7 @@
       loadVideoFiltersFromStorage();
       filterOnlyChildren = localStorage.getItem(FILTER_CHILDREN_KEY) === '1';
       loadHideChildsFilterFromStorage();
+      loadUploadedFilterFromStorage();
       loadModelFilterFromStorage();
       loadLikedFilterFromStorage();
       currentSort = localStorage.getItem(SORT_KEY) === 'oldest' ? 'oldest' : 'newest';
@@ -8443,6 +9371,7 @@
     syncMediaMinSelects();
     // The same chain the migration path runs -- see ensureSearchBarParts().
     ensureSearchBarParts();
+    bindGlobalResultUiListeners();
     if (sortSel) sortSel.value = currentSort;
     bindDisplayControlListeners();
     bindMediaFilterListeners();
@@ -8463,6 +9392,7 @@
       dateStart = dateStartEl.value;
       dateEnd = dateEndEl.value;
       updateClearButton();
+      updateDateNavButtons();
       onFilterInput();
     };
     dateStartEl.addEventListener('change', onDateChange);
@@ -8471,7 +9401,9 @@
     dateEndEl.addEventListener('input', onDateChange);
 
     if (reindexBtn) reindexBtn.addEventListener('click', () => reindexDatabase());
+    if (pruneMissingBtn) pruneMissingBtn.addEventListener('click', () => runPruneMissingMedia({ manual: true }));
     if (exportJsonBtn) exportJsonBtn.addEventListener('click', () => downloadDatabaseJson());
+    if (exportResultsBtn) exportResultsBtn.addEventListener('click', () => showExportSubsetDialog());
 
     clearBtn.addEventListener('click', () => {
       clearTimeout(searchFilterDebounceTimer);
@@ -8486,11 +9418,14 @@
       filterWithVideo = false;
       filterOnlyChildren = false;
       filterHideChilds = false;
+      filterUploadedOnly = false;
       filterMinChildren = 1;
       filterModel = '';
       filterLikedOnly = false;
       const likedEl = document.getElementById('grok-filter-liked');
       if (likedEl) likedEl.checked = false;
+      const uploadedEl = document.getElementById('grok-filter-uploaded-only');
+      if (uploadedEl) uploadedEl.checked = false;
       syncMediaMinSelects();
       const modelSel = document.getElementById('grok-filter-model');
       if (modelSel) modelSel.value = '';
@@ -8499,12 +9434,14 @@
         localStorage.setItem(FILTER_WITH_VIDEO_KEY, '0');
         localStorage.setItem(FILTER_CHILDREN_KEY, '0');
         localStorage.setItem(FILTER_HIDE_CHILDS_KEY, '0');
+        localStorage.setItem(FILTER_UPLOADED_ONLY_KEY, '0');
         localStorage.setItem(FILTER_CHILDREN_MIN_KEY, '1');
         localStorage.setItem(FILTER_MODEL_KEY, '');
         localStorage.setItem(FILTER_LIKED_KEY, '0');
       } catch { /* ignore */ }
       currentPage = 0;
       updateClearButton();
+      updateDateNavButtons();
       applyFilter();
       input.focus();
     });
@@ -8552,7 +9489,8 @@
       const typingInPageJump = active?.id === 'grok-page-jump';
       const bulkConfirmOpen = (() => {
         const dlg = document.getElementById('grok-bulk-download-confirm');
-        return Boolean(dlg && !dlg.hidden);
+        const exportDlg = document.getElementById('grok-export-format-dialog');
+        return Boolean((dlg && !dlg.hidden) || (exportDlg && !exportDlg.hidden));
       })();
       if (
         shouldShowSearchResults()

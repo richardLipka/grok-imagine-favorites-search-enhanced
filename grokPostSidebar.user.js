@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Post Sidebar (prompt)
 // @namespace    http://tampermonkey.net/
-// @version      1.4.0
+// @version      1.5.0
 // @description  Collapsible sidebar on /imagine/post/{id}: metadata and prompt from IndexedDB and Grok API.
 // @author       Richard Lipka
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -64,6 +64,19 @@
     return t === 'MEDIA_POST_TYPE_VIDEO' || t.includes('VIDEO');
   }
 
+  function isUploadedPost(post) {
+    if (!post) return false;
+    if (post.isUploaded === true) return true;
+    if (post.fileSource === 'IMAGINE_SELF_UPLOAD_FILE_SOURCE' ||
+        String(post.fileSource || '').toUpperCase().includes('UPLOAD') ||
+        String(post.mediaPostSource || '').toUpperCase().includes('UPLOAD') ||
+        String(post.source || '').toUpperCase().includes('UPLOAD')) {
+      return true;
+    }
+    const url = String(post.mediaUrl || post.thumbnail || '').toLowerCase();
+    return url.includes('/upload/') || url.includes('/uploaded/') || url.includes('/user_upload/');
+  }
+
   function extractChildMediaCounts(post) {
     const children = post?.childPosts || [];
     let childImageCount = 0;
@@ -110,6 +123,7 @@
       childImageCount: fromChildren?.childImageCount ?? c.childImageCount ?? null,
       childVideoCount: fromChildren?.childVideoCount ?? c.childVideoCount ?? null,
       videoCount: fromChildren?.videoCount ?? c.videoCount ?? null,
+      isUploaded: Boolean(c.isUploaded || r.isUploaded || isUploadedPost(c) || isUploadedPost(r)),
       fromIndex: Boolean(c.id),
       fromApi: Boolean(r.id),
     };
@@ -167,6 +181,9 @@
       push('Child images', formatCount(meta.childImageCount), { showZero: true });
       push('Child videos', formatCount(meta.childVideoCount), { showZero: true });
       push('Videos total', formatCount(meta.videoCount), { showZero: true });
+    }
+    if (meta.isUploaded) {
+      push('Source', 'User upload');
     }
     push('Data', formatDataSource(meta));
 

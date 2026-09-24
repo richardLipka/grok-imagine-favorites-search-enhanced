@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 A standalone project by **Richard Lipka**, grown from [IronSniper1's](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) base script and extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, deletion, and much else — see [Credits and origins](#credits-and-origins).
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.user.js` **v1.71.0** · `grokPostSidebar.user.js` **v1.4.0**  
+**Current versions:** `grokSearch.user.js` **v1.74.0** · `grokPostSidebar.user.js` **v1.5.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Credits and origins
@@ -17,7 +17,7 @@ credit.
 |--------|---------|--------------|
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | 2026-03-07 | **The base this repository was forked from.** |
 | [Strapples — Grok Imagine Favorites Search (Greasy Fork)](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) · [GrokImagineSearchandOrganize](https://github.com/Strapples/GrokImagineSearchandOrganize) | 2026-03-20 | A parallel userscript, also forked from IronSniper1. Its author asks that people link back to their GitHub, so it is linked here. |
-| **This repo** | — | Everything since: `grokSearch.user.js` v1.71.0 + `grokPostSidebar.user.js` v1.4.0 |
+| **This repo** | — | Everything since: `grokSearch.user.js` v1.74.0 + `grokPostSidebar.user.js` v1.5.0 |
 
 Earlier versions of this README described the Greasy Fork script as the original and IronSniper1 as
 downstream of it. That was the wrong way round: IronSniper1 came first, and the Greasy Fork script
@@ -129,24 +129,29 @@ Indexing time depends on library size. Leave the tab open until the status finis
 | Text field | **AND** search on prompt (parents); child rows also match **parent prompt** (`parentPrompt`). Filters **400 ms** after you stop typing. |
 | **From / To** dates | Filter by post date (child cards use **their own** date) |
 | **‹ / ›** (beside dates) | Previous / next day — **only** when a **single day** is selected (same From and To) |
+| **Date presets** | Quick filter chips next to date stepper: **Today**, **Yesterday**, **Last 7 Days**, **This Month** (click to set, click active chip to clear) |
 | **Results only** | Hide Grok’s native grid; show paginated results panel (when bar is visible) |
 | **Video only** | Show only video posts (parent or child video rows; hides images) |
 | **With video** | Parents only — image posts that have at least one video in child/descendant results |
 | **With child** | Parents only; min descendant count (full tree, not just first generation) |
 | **Hide childs** | Hide child post rows from results (show parents only) |
+| **Uploaded only** | Show only user-uploaded images (hide generated media) |
 | **Liked only** | Show only posts you have liked (posts whose like state is unknown are excluded) |
 | **Model** | Filter by generation model; the list is built from the models present in your index (hidden when none are recorded) |
 | **Per page / Size** | Pagination size (1–300) and thumbnail scale (10–200%) |
 | **Compact** | Fold child results into their parent’s card as a thumbnail strip, one card per family (see [Compact groups](#compact-groups)) |
+| **Batch groups** | Group multi-image generations sharing the same batch conversation into a single card with thumbnail previews (see [Batch groups](#batch-groups)) |
 | **Button** | Which corner the show/hide button sits in — top right (default), bottom right, top left, bottom left |
-| **Default** | Reset to 44 per page, 100% size, **Compact** off, button in the top-right corner |
+| **Default** | Reset to 44 per page, 100% size, **Compact** off, **Batch groups** off, button in the top-right corner |
 | **Sort** | Newest or oldest (remembered between sessions) |
 | **Clear** | Clears text, dates, model, liked, and media filters |
 | **Download selected** | In the match-count area — save checked images to a folder (Chrome/Edge) |
 | **Import JSON** | Merge a previously exported index file back in (adds and updates; never deletes) |
 | **Export JSON** | Download full index (schema v5, parents + children) |
+| **Export results** | Export filtered results or selected subset as **JSON** (schema v5) or **CSV** (RFC-4180 table with prompt, model, media URLs, parent/child IDs) |
 | **Verify** | Reconcile the index against the feed — removes posts that are gone and repairs anything a truncated sync missed |
 | **Reindex** | Clear DB and rebuild from API (use after upgrades or bad cache) |
+| **Prune missing** | Probes indexed media for HTTP 404/deleted images and bulk-removes them from local index after user confirmation |
 
 ### Results panel header
 
@@ -205,6 +210,15 @@ the right of the strip.
 - **Hide childs** and **Compact** are independent: *Hide childs* removes children from the
   results, *Compact* keeps them but folds them in.
 
+<a id="batch-groups"></a>
+
+#### Batch generation groups
+
+**Batch groups** (display row, off by default) groups generations originating from the same batch conversation (`conversationId`) into a single primary card with small thumbnail previews.
+- Multi-image prompts generated together collapse into a single card, drastically reducing grid clutter.
+- Works seamlessly in tandem with **Compact** mode: parent-child trees are folded first, then remaining generation siblings are grouped under the primary card.
+- Selections, downloads, and lightbox navigation preserve every item in the generation without losing individual media links.
+
 #### Parent and related posts details
 
 When inspecting a selected result in the lightbox:
@@ -259,9 +273,13 @@ downloads, untagged.
 
 | Key | Action |
 |-----|--------|
-| Ctrl/Cmd+F | Show search bar + focus input |
-| Esc | Close lightbox, bulk-download confirm, or context menu; blur search input when focused |
-| ← / → | Lightbox prev/next when open; otherwise previous/next results page |
+| `/` or `Ctrl/Cmd+F` | Expand search bar and focus search input from anywhere (safely ignored when typing in input/textarea) |
+| `Esc` | Close lightbox, export dialog, bulk-download confirm, or context menu; blur search input when focused |
+| `←` / `→` | Lightbox prev/next when open; otherwise previous/next results page |
+| `C` | (Lightbox) Instant copy prompt to clipboard with status toast |
+| `L` | (Lightbox) Instant toggle Like / Unlike state |
+| `D` | (Lightbox) Download active media file |
+| `Delete` / `Backspace` | (Lightbox) Open single-post delete / prune confirmation dialog |
 
 ---
 

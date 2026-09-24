@@ -128,13 +128,16 @@ module.exports = {
       ['ensureImportJsonButton', 'Import JSON'],
       ['ensureVerifyButton', 'Verify'],
       ['ensureReindexButton', 'Reindex'],
+      ['ensurePruneMissingButton', 'Prune missing'],
       ['ensureExportJsonButton', 'Export JSON'],
+      ['ensureExportResultsButton', 'Export results'],
       ['ensureLikedFilterCheckbox', 'Liked only'],
       ['ensureModelFilterSelect', 'Model filter'],
       ['ensureDownloadSelectedButtons', 'Download selected / Cancel / Retry'],
       ['ensureMediaFilterCheckboxes', 'video / child filters'],
       ['ensureDisplayControls', 'per-page and size sliders'],
       ['ensureDateNavButtons', 'day stepper'],
+      ['ensureDatePresetChips', 'date preset chips'],
     ]) {
       t.ok(`${label} is reached from both paths`, chainCalls.has(`${fn}()`), [...chainCalls]);
     }

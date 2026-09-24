@@ -133,7 +133,7 @@ function createIndexSandbox() {
       getRootIdOf, removeDescendantsOfRoot, buildPromptById, computeSearchText,
       buildAssetsUrl, fetchAssetPage, assetMediaUrl, assetGenInput, assetMediaType,
       getAssetParentId, propagateBatchPrompts,
-      parseAsset, syncAssetsFeed, isIndexableAsset,
+      parseAsset, syncAssetsFeed, isIndexableAsset, isUploadedPost,
     };
   `;
 
@@ -527,13 +527,14 @@ ${epilogue}`)(control);
  * delete and the lightbox all still see the flat list -- so the tests here check the *entries*
  * and never assume a post moved.
  */
-function createCompactSandbox({ posts = [], compact = false, index = null } = {}) {
+function createCompactSandbox({ posts = [], compact = false, batch = false, index = null } = {}) {
   const region = sliceBetween(readSource(),
     '  function buildDisplayEntries() {', '  function getPageSize()');
 
   const prelude = `
     let matchedPosts = posts.slice();
     let compactGroups = Boolean(compact);
+    let batchGroups = Boolean(batch);
     let displayEntries = [];
     let displayEntriesSource = null;
     let displayEntriesSignature = '';
@@ -551,15 +552,16 @@ function createCompactSandbox({ posts = [], compact = false, index = null } = {}
       getDisplayCount, getDisplayPage,
       get matchedPosts() { return matchedPosts; },
       setCompact(v) { compactGroups = Boolean(v); invalidateDisplayEntries(); },
+      setBatch(v) { batchGroups = Boolean(v); invalidateDisplayEntries(); },
       setPageSize(v) { pageSize = v; },
       setMatched(list) { matchedPosts = list.slice(); invalidateDisplayEntries(); },
       mutateMatchedInPlace(fn) { fn(matchedPosts); },
     };
   `;
 
-  return new Function('posts', 'compact', 'index', `${prelude}
+  return new Function('posts', 'compact', 'batch', 'index', `${prelude}
 ${region}
-${epilogue}`)(posts, compact, index);
+${epilogue}`)(posts, compact, batch, index);
 }
 
 /**
