@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.74.0
+// @version      1.75.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -134,7 +134,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.74.0';
+  const SCRIPT_VERSION = '1.75.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -5408,13 +5408,67 @@
     document.documentElement.classList.add('grok-lightbox-open');
   }
 
+  /** Where focus goes when the lightbox closes; see focusLightboxOnOpen(). */
+  let lightboxReturnFocus = null;
+
+  function lightboxFocusables() {
+    const lb = document.getElementById('grok-result-lightbox');
+    if (!lb || lb.hidden) return [];
+    return [...lb.querySelectorAll('button, a[href], input, select, textarea, [tabindex]')]
+      .filter(el => {
+        if (el.disabled || el.getAttribute('tabindex') === '-1') return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+  }
+
+  /**
+   * Keeps Tab inside the dialog.
+   *
+   * `aria-modal` hides the rest of the page from assistive tech but does nothing about the Tab
+   * key, so without this the next Tab leaves for Grok's own UI behind the backdrop -- measured at
+   * 184 reachable controls, none of them visible.
+   */
+  function trapLightboxFocus(e) {
+    const items = lightboxFocusables();
+    if (!items.length) return;
+    const lb = document.getElementById('grok-result-lightbox');
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (!lb.contains(document.activeElement)) {
+      e.preventDefault();
+      (e.shiftKey ? last : first).focus();
+      return;
+    }
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
+  /** Only on open -- stepping through results must not yank focus off the button being used. */
+  function focusLightboxOnOpen() {
+    const lb = document.getElementById('grok-result-lightbox');
+    if (!lb || lb.hidden) return;
+    const close = lb.querySelector('.grok-lightbox-close');
+    try {
+      (close || lightboxFocusables()[0])?.focus();
+    } catch { /* ignore */ }
+  }
+
   function openResultLightbox(post) {
     if (!post) return;
     hideResultContextMenu();
+    const alreadyOpen = isResultLightboxOpen();
+    if (!alreadyOpen) lightboxReturnFocus = document.activeElement;
     const idx = matchedPosts.findIndex(p => p.id === post.id);
     lightboxIndex = idx;
     lightboxActivePost = post;
     renderResultLightbox();
+    if (!alreadyOpen) focusLightboxOnOpen();
   }
 
   function isResultLightboxOpen() {
@@ -5431,6 +5485,12 @@
     document.documentElement.classList.remove('grok-lightbox-open');
     lightboxIndex = -1;
     lightboxActivePost = null;
+    // Back to the card that opened it, so keyboard users do not land at the top of the document.
+    const returnTo = lightboxReturnFocus;
+    lightboxReturnFocus = null;
+    if (returnTo && returnTo.isConnected) {
+      try { returnTo.focus(); } catch { /* ignore */ }
+    }
   }
 
   function stepResultLightbox(delta) {
@@ -5477,6 +5537,10 @@
       }
 
       if (isResultLightboxOpen()) {
+        if (e.key === 'Tab') {
+          trapLightboxFocus(e);
+          return;
+        }
         if (e.key === 'Escape') {
           e.preventDefault();
           e.stopPropagation();
@@ -6035,11 +6099,11 @@
     card.className = 'grok-result-card';
     card.innerHTML = `
       <label class="grok-result-select" title="Select for download">
-        <input type="checkbox" class="grok-result-select-input" />
+        <input type="checkbox" class="grok-result-select-input" aria-label="Select for download" />
       </label>
       <span class="grok-result-child-mark" title="Child post" hidden>${CHILD_MARK_SVG}</span>
       <button type="button" class="grok-result-like" aria-pressed="false">${HEART_SVG}</button>
-      <button type="button" class="grok-result-prune-btn" title="Remove broken image from database" hidden>✕</button>
+      <button type="button" class="grok-result-prune-btn" aria-label="Remove broken image from database" title="Remove broken image from database" hidden>✕</button>
       <div class="grok-result-date" hidden></div>
       <div class="grok-result-broken-overlay" hidden>
         <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
@@ -6098,6 +6162,11 @@
         ? `Select this group (${children.length + 1} items) for download`
         : 'Select for download';
       if (selectLabel.title !== selectTitle) selectLabel.title = selectTitle;
+      // The checkbox carries the name, not the label wrapping it: a group checkbox selects more
+      // than itself and should say so.
+      if (input && input.getAttribute('aria-label') !== selectTitle) {
+        input.setAttribute('aria-label', selectTitle);
+      }
     }
 
     const mark = card.querySelector('.grok-result-child-mark');
@@ -6924,9 +6993,10 @@
         align-items: center;
         gap: 6px;
         font-size: 11px;
-        color: rgba(255,255,255,0.55);
+        color: rgba(255,255,255,0.62);
         white-space: nowrap;
         user-select: none;
+        min-height: 24px;
       }
       .grok-display-control span.grok-display-val {
         min-width: 2.2em;
@@ -7050,7 +7120,7 @@
       }
       .grok-date-input:hover { border-color: rgba(139,92,246,0.5); }
       .grok-date-input:focus { border-color: rgba(139,92,246,0.6); color: #fff; }
-      .grok-date-sep { color: rgba(255,255,255,0.35); font-size: 11px; flex-shrink: 0; }
+      .grok-date-sep { color: rgba(255,255,255,0.62); font-size: 11px; flex-shrink: 0; }
       .grok-date-nav-btn {
         display: flex; align-items: center; justify-content: center;
         flex-shrink: 0; width: 28px; height: 28px; padding: 0;
@@ -7113,7 +7183,7 @@
       #grok-search-count {
         display: flex;
         align-items: center;
-        font-size: 11px; color: rgba(255,255,255,0.4);
+        font-size: 11px; color: rgba(255,255,255,0.64);
         white-space: nowrap; font-variant-numeric: tabular-nums; flex-shrink: 0;
         line-height: 1;
       }
@@ -7165,7 +7235,7 @@
         background: rgba(251,191,36,0.15);
         color: #fff;
       }
-      #grok-stamp-status { font-size: 10px; color: rgba(255,255,255,0.22); white-space: nowrap; flex-shrink: 0; }
+      #grok-stamp-status { font-size: 10px; color: rgba(255,255,255,0.62); white-space: nowrap; flex-shrink: 0; }
       #grok-search-clear,
       .grok-clear-filters-btn {
         display: flex; align-items: center; justify-content: center;
@@ -7205,7 +7275,7 @@
       .grok-page-btn:disabled { opacity: 0.25; cursor: default; }
       .grok-page-btn.icon-only { padding: 4px 8px; }
       #grok-page-label {
-        font-size: 12px; color: rgba(255,255,255,0.45);
+        font-size: 12px; color: rgba(255,255,255,0.6);
         font-variant-numeric: tabular-nums; min-width: 40px; text-align: center;
       }
       .grok-page-jump {
@@ -7331,7 +7401,7 @@
         display: flex;
         align-items: center;
         font-size: 12px;
-        color: rgba(255, 255, 255, 0.45);
+        color: rgba(255, 255, 255, 0.6);
         font-variant-numeric: tabular-nums;
         white-space: nowrap;
         line-height: 1;
@@ -7642,6 +7712,25 @@
         border-color: rgba(16, 185, 129, 0.45);
       }
       .grok-badge-uploaded svg { flex-shrink: 0; }
+      /* Focus indicator.
+         Grok's own stylesheets are served cross-origin, so what they reset cannot be read from
+         the page and cannot be relied on either. Five of our controls also clear the outline
+         themselves, two of them -- Sort and the button-corner picker -- with nothing in its
+         place. So every injected control states its own ring rather than hoping the browser
+         default survives, and states it twice: overriding the outline still leaves the shadow. */
+      #grok-search-wrap :focus-visible,
+      #grok-results-panel :focus-visible,
+      #grok-results-grid :focus-visible,
+      #grok-result-lightbox :focus-visible,
+      #grok-result-context-menu :focus-visible,
+      #grok-bulk-download-confirm :focus-visible,
+      #grok-export-format-dialog :focus-visible,
+      #grok-pager :focus-visible,
+      #grok-search-toggle:focus-visible {
+        outline: 2px solid #c4b5fd;
+        outline-offset: 2px;
+        box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.45);
+      }
       .grok-toolbar-btn {
         background: rgba(255,255,255,0.07);
         border: 1px solid rgba(255,255,255,0.15);
@@ -7649,6 +7738,7 @@
         color: rgba(255,255,255,0.75);
         font-size: 11px;
         padding: 4px 8px;
+        min-height: 24px;
         cursor: pointer;
         flex-shrink: 0;
         font-family: -apple-system, BlinkMacSystemFont, sans-serif;
@@ -8147,13 +8237,17 @@
       }
       .grok-filter-check-label {
         display: flex; align-items: center; gap: 5px;
-        font-size: 11px; color: rgba(255,255,255,0.55);
+        font-size: 11px; color: rgba(255,255,255,0.62);
         white-space: nowrap; flex-shrink: 0; cursor: pointer;
         user-select: none; transition: color 0.15s;
+        /* Clicking the label toggles the box, so the label is the target that has to clear
+           24px -- the 13px checkbox inside it never was the thing being aimed at. */
+        min-height: 24px;
       }
       .grok-filter-check-label:hover { color: rgba(255,255,255,0.85); }
       .grok-filter-check-label input {
         accent-color: #8b5cf6; cursor: pointer; margin: 0;
+        width: 15px; height: 15px;
       }
       .grok-filter-min-select {
         font-size: 11px; padding: 2px 4px; margin: 0;
@@ -9192,7 +9286,26 @@
    * Adding a control to the template is therefore not enough on its own; add its `ensure*` here.
    * Each one is create-or-return, so calling them on both paths is free.
    */
+  /**
+   * Accessible names for the controls whose own markup does not supply one.
+   *
+   * This lives in the chain rather than only in the template so a bar left behind by an older
+   * version gets them too. The search box had a placeholder, which is not a name; the JSON file
+   * input had nothing.
+   */
+  function ensureAccessibleNames() {
+    const input = document.getElementById('grok-search-input');
+    if (input && !input.getAttribute('aria-label')) {
+      input.setAttribute('aria-label', 'Search saved images by prompt');
+    }
+    const importInput = document.getElementById('grok-import-json-input');
+    if (importInput && !importInput.getAttribute('aria-label')) {
+      importInput.setAttribute('aria-label', 'Choose an exported index file to import');
+    }
+  }
+
   function ensureSearchBarParts() {
+    ensureAccessibleNames();
     ensurePageJumpInput();
     ensureImportJsonButton();
     ensureExportJsonButton();
@@ -9244,7 +9357,7 @@
           <svg id="grok-search-icon" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
             <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
           </svg>
-          <input id="grok-search-input" type="text" placeholder="Search saved images by prompt…" autocomplete="off" spellcheck="false" />
+          <input id="grok-search-input" type="text" aria-label="Search saved images by prompt" placeholder="Search saved images by prompt…" autocomplete="off" spellcheck="false" />
           <span id="grok-stamp-status"></span>
           <span id="grok-search-count-wrap" class="grok-results-count-wrap">
             <span id="grok-search-count"></span>
@@ -9476,13 +9589,23 @@
 
     if (pageJumpEl) bindPageJumpListeners(pageJumpEl);
 
+    // Guarded like every other document-level listener in here. buildSearchBar() only reaches
+    // this on its fresh-build path, so an SPA re-init is already safe -- but React removing
+    // #grok-search-wrap would rebuild it, and the previous listener would stay bound to document
+    // holding a dead `input`, paging twice per keypress.
+    if (!document.body.dataset.grokPagingKeysBound) {
+      document.body.dataset.grokPagingKeysBound = '1';
+      bindPagingShortcuts(input);
+    }
+  }
+
+  /**
+   * Arrow-key paging. Ctrl+F is deliberately *not* handled here: bindGlobalResultUiListeners()
+   * owns the shortcuts, and its focusSearchInputFromShortcut() already expands the bar, closes an
+   * open lightbox and selects the text. Two handlers for one key drift apart.
+   */
+  function bindPagingShortcuts(input) {
     document.addEventListener('keydown', e => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
-        e.preventDefault();
-        setSearchBarExpanded(true);
-        input.focus();
-        input.select();
-      }
       if (e.key === 'Escape' && document.activeElement === input) input.blur();
       const active = document.activeElement;
       const typingInSearch = active === input;

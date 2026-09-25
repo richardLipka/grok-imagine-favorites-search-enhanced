@@ -11,8 +11,8 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.70.0, ~8.2k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
-| `grokPostSidebar.user.js` (v1.4.0, ~680 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
+| `grokSearch.user.js` (v1.75.0, ~9.6k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokPostSidebar.user.js` (v1.5.0, ~710 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
 writer and the only script with `onupgradeneeded`); the sidebar is a read-only consumer that falls back
@@ -376,6 +376,33 @@ This is the fragile part of the codebase and the usual source of bugs:
   `applyTogglePosition()` on every init rather than only when the button is created. Both
   `injectStyles()` and `patchSearchBarCollapseStyles()` define all four, and each rule resets all
   four offsets — leaving one out lets the previous corner linger.
+### Accessibility
+
+Audited against WCAG 2.1/2.2 AA in v1.75.0. Four rules came out of it, and each exists because the
+failure is invisible from a screenshot:
+
+- **State the focus ring; never inherit it.** Grok's stylesheets are served cross-origin from
+  `cdn.grok.com`, so what they reset cannot be read from the page (`sheet.cssRules` throws) and
+  cannot be relied on. Our own CSS clears the outline on five controls besides, two of them with
+  nothing in its place. `injectStyles()` therefore declares `:focus-visible` for every injected
+  container, with **both** an `outline` and a `box-shadow` so overriding one still leaves the
+  other. Adding a new container means adding it to that selector list.
+- **A `title` is not an accessible name, and neither is a glyph.** Text content beats `title` in
+  the name calculation, so an icon button whose text is `✕` announces as the glyph.
+  `imageAltText()` handles thumbnails; `ensureAccessibleNames()` handles the controls, and it is
+  **in the `ensureSearchBarParts()` chain** rather than only in the template, so a bar an older
+  version left in the DOM is fixed too.
+- **`aria-modal` does nothing about the Tab key.** It hides the rest of the page from assistive
+  tech only. The open lightbox measured 184 still-reachable controls behind its backdrop, so
+  `trapLightboxFocus()` wraps Tab at both ends, `openResultLightbox()` records where focus came
+  from and moves it in, and `closeResultLightbox()` puts it back. Focus moves **only on open** —
+  stepping through results with the arrows must not yank focus off the button being used.
+- **The click target is the label, not the box inside it.** The filter checkboxes render at 13px,
+  but the `<label>` wrapping each one is what gets clicked, so that is what carries
+  `min-height: 24px` (WCAG 2.2 2.5.8). Note 2.5.5 (44×44) is AAA, not AA — 24×24 is the AA bar.
+
+`test/suites/accessibility.test.js` pins all of it structurally.
+
 - **The toolbar's filter and action groups must stay `flex-wrap: wrap` with a shrinkable
   `min-width: 0`.** Their children are all `flex-shrink: 0`, so a `nowrap` group whose box gets
   squeezed overflows and paints over its neighbour rather than reflowing — that is how v1.63.0 put

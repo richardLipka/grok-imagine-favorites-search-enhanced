@@ -3,6 +3,51 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.75.0] — 2026-09-25
+
+### Fixed
+
+- **Accessibility pass over the whole injected UI**, audited against WCAG 2.1/2.2 AA on a live
+  library and fixed:
+  - **Focus indicator (2.4.7).** Keyboard focus was invisible. Grok's stylesheets are served
+    cross-origin so what they reset cannot be read from the page, and our own CSS clears the
+    outline on five controls — two of them (**Sort**, and the button-corner picker) with nothing
+    in its place. Every injected control now states its own ring, as an outline *and* a
+    box-shadow, so overriding one still leaves the other.
+  - **Accessible names (4.1.2).** The search box had a placeholder but no name; the per-card
+    selection checkbox had none; the broken-image prune button announced as its own glyph
+    "✕", because text content beats `title`. All named now, and the group checkbox says how
+    many items it selects. The names are applied from the shared `ensure*` chain, so a toolbar
+    left behind by an older version gets them too.
+  - **Lightbox focus (2.4.3).** It had the right ARIA — `role="dialog"`, `aria-modal="true"`,
+    a label — but `aria-modal` does nothing about the Tab key: **184 controls behind the backdrop
+    stayed reachable**, focus never entered the dialog, and closing it dropped you at the top of
+    the document. Tab now wraps inside the dialog, focus moves to **Close** on open, and returns
+    to the card that opened it on close.
+  - **Contrast (1.4.3).** Five text elements sat below 4.5:1 — the sync status worst at
+    **2.05:1**, then the date separator at 3.20, the match count at 3.76, and the page label and
+    panel count at 4.46. All raised to between 6.7:1 and 7.4:1, measured against the real panel
+    background.
+  - **Target size (2.2 AA, 2.5.8).** Filter checkbox labels are the click target and were 17px
+    tall; they and the toolbar buttons now clear 24px. Checked from 380px to 900px wide — no
+    overflow and no overlap at any width.
+- **A latent duplicate of the paging shortcut.** `buildSearchBar()` registered its `keydown`
+  listener on `document` from the fresh-build path, unguarded. SPA re-inits take the early-return
+  migration path so nothing stacked in practice — verified, one arrow press moved exactly one
+  page — but React removing `#grok-search-wrap` would have rebuilt it and left the previous
+  listener bound to `document` holding a dead input, paging twice per keypress. It is now guarded
+  by a `document.body.dataset` flag like every other document-level listener here.
+
+### Changed
+
+- **Ctrl+F had two handlers racing on the same keypress.** `bindGlobalResultUiListeners()` owns
+  the shortcuts; the paging listener no longer carries its own copy, which did less
+  (`focusSearchInputFromShortcut()` also closes an open lightbox and selects the text).
+- Filter labels, display controls and toolbar buttons are a few pixels taller, which is the one
+  change here you will actually see.
+
+---
+
 ## [1.74.0] — 2026-09-24
 
 ### Added & Enhanced (Power Features)
