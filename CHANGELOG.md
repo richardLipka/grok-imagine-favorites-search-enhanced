@@ -3,6 +3,20 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.75.1] — 2026-09-25
+
+### Fixed
+
+- **`ensureAccessibleNames()` ran before the controls it names existed.** It was first in the
+  `ensureSearchBarParts()` chain, so on a fresh build it labelled only what had already been
+  created — the import file input is built further down and never got its label. Caught by
+  checking the installed build rather than the source. It now runs last, and the test asserts the
+  ordering rather than mere membership. (No visible effect: that input is `display: none` and so
+  is not in the accessibility tree. It shipped as its own version because the fix changed the
+  file after 1.75.0 was already tagged, and two different files must not claim one version.)
+
+---
+
 ## [1.75.0] — 2026-09-25
 
 ### Fixed
