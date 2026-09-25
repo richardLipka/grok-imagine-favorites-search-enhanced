@@ -391,7 +391,9 @@ failure is invisible from a screenshot:
   the name calculation, so an icon button whose text is `✕` announces as the glyph.
   `imageAltText()` handles thumbnails; `ensureAccessibleNames()` handles the controls, and it is
   **in the `ensureSearchBarParts()` chain** rather than only in the template, so a bar an older
-  version left in the DOM is fixed too.
+  version left in the DOM is fixed too. It runs **last** in that chain: naming a control the
+  builders above it have not created yet is a silent no-op, which is what happened to the import
+  file input when it ran first.
 - **`aria-modal` does nothing about the Tab key.** It hides the rest of the page from assistive
   tech only. The open lightbox measured 184 still-reachable controls behind its backdrop, so
   `trapLightboxFocus()` wraps Tab at both ends, `openResultLightbox()` records where focus came

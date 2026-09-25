@@ -17,8 +17,8 @@ Versions match the `@version` in each userscript header.
   - **Accessible names (4.1.2).** The search box had a placeholder but no name; the per-card
     selection checkbox had none; the broken-image prune button announced as its own glyph
     "✕", because text content beats `title`. All named now, and the group checkbox says how
-    many items it selects. The names are applied from the shared `ensure*` chain, so a toolbar
-    left behind by an older version gets them too.
+    many items it selects. The names are applied from the end of the shared `ensure*` chain, so a
+    toolbar left behind by an older version gets them too and every control exists by then.
   - **Lightbox focus (2.4.3).** It had the right ARIA — `role="dialog"`, `aria-modal="true"`,
     a label — but `aria-modal` does nothing about the Tab key: **184 controls behind the backdrop
     stayed reachable**, focus never entered the dialog, and closing it dropped you at the top of

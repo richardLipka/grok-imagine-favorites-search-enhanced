@@ -9305,7 +9305,6 @@
   }
 
   function ensureSearchBarParts() {
-    ensureAccessibleNames();
     ensurePageJumpInput();
     ensureImportJsonButton();
     ensureExportJsonButton();
@@ -9324,6 +9323,9 @@
     ensureDownloadSelectedButtons();
     ensureLoadingIndicator();
     ensureSearchInputListener();
+    // Last, not first: it names controls the builders above create, so running it ahead of them
+    // silently skipped whatever did not exist yet.
+    ensureAccessibleNames();
   }
 
   function buildSearchBar() {

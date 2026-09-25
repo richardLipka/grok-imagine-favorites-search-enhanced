@@ -23,9 +23,13 @@ module.exports = {
     const src = readSource();
 
     t.group('every control has a name of its own');
-    t.ok('ensureAccessibleNames() is in the shared chain',
-      /ensureSearchBarParts\(\) \{\s*ensureAccessibleNames\(\);/.test(stripComments(src)),
-      'not first in the chain');
+    // It has to run *after* the builders: naming a control the chain has not created yet is a
+    // silent no-op, which is exactly what happened to the import file input on a fresh build.
+    const chain = stripComments(sliceBetween(src, '  function ensureSearchBarParts() {', '\n  }\n'));
+    const calls = (chain.match(/ensure[A-Za-z]+\(\)/g) || []);
+    t.ok('ensureAccessibleNames() is in the shared chain', calls.includes('ensureAccessibleNames()'), calls);
+    t.equal('and runs last, after every builder',
+      calls[calls.length - 1], 'ensureAccessibleNames()');
     // In the chain as well as the template, so a bar an older version left behind is fixed too.
     const names = stripComments(sliceBetween(src, '  function ensureAccessibleNames() {', '\n  }\n'));
     t.ok('it names the search box', /grok-search-input/.test(names) && /aria-label/.test(names));
