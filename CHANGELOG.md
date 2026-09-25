@@ -3,6 +3,20 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.76.0] — 2026-09-25
+
+### Changed
+
+- **Reorganized Main GUI Panel into Four Clean Structured Lines:**
+  - **Line 1 (Search & Counts):** Search input bar with SVG icon, Models filter dropdown, Newest/Oldest sort dropdown, and result counter plus background sync / reindexing status indicator (`#grok-search-count-wrap`).
+  - **Line 2 (Date Controls & Clear Filter):** Previous day button (`<`), Start date picker, date range separator (`–`), End date picker, Next day button (`>`), quick-range date preset chips (*Today*, *Yesterday*, *Last 7 Days*, *This Month*), and dedicated **Clear filter** button (`#grok-search-clear`) with clear icon and text label.
+  - **Line 3 (Media & Content Checkboxes):** All filter toggles: *Video only*, *With video*, *With child* (paired with minimum child count combo box), *Hide childs*, *Liked only*, and *Uploaded only*.
+  - **Line 4 (Action & Maintenance Buttons):** All primary action buttons grouped together, moving **Download selected** (and its active *Cancel* and *Retry failed* companion buttons) to line 4 alongside *Import JSON*, *Export JSON*, *Export results*, *Reindex*, *Verify*, and *Prune missing*.
+- **DOM Migration & Backwards Compatibility:**
+  - Enhanced `migrateSearchBarLayout()` to reconstruct existing DOM nodes from previous versions cleanly into the 4 structured lines on script updates or SPA navigations without losing control state or bound listeners.
+- **Tests:**
+  - Added structural assertions in `test/suites/search-bar-parts.test.js` verifying that the 4-line layout template cleanly contains all designated elements in their respective rows.
+
 ## [1.75.2] — 2026-09-25
 
 ### Fixed

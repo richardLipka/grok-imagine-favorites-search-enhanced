@@ -141,5 +141,45 @@ module.exports = {
     ]) {
       t.ok(`${label} is reached from both paths`, chainCalls.has(`${fn}()`), [...chainCalls]);
     }
+
+    t.group('the 4-line main GUI panel layout');
+    const barTemplate = sliceBetween(src, "wrap.id = 'grok-search-wrap';\n    wrap.innerHTML = `", '      <div id="grok-pager">');
+    t.ok('line 1 has search, model filter, sort, count, and stamp status',
+      barTemplate.includes('grok-bar-line-1')
+      && barTemplate.includes('grok-search-input')
+      && barTemplate.includes('grok-filter-model')
+      && barTemplate.includes('grok-sort-select')
+      && barTemplate.includes('grok-search-count')
+      && barTemplate.includes('grok-stamp-status'));
+
+    t.ok('line 2 has date navigation, date inputs, date presets, and clear filter button',
+      barTemplate.includes('grok-bar-date-row')
+      && barTemplate.includes('grok-date-prev')
+      && barTemplate.includes('grok-date-start')
+      && barTemplate.includes('grok-date-end')
+      && barTemplate.includes('grok-date-next')
+      && barTemplate.includes('grok-date-presets')
+      && barTemplate.includes('grok-search-clear')
+      && /Clear filter/.test(barTemplate));
+
+    t.ok('line 3 has all filter checkboxes with child combo box',
+      barTemplate.includes('grok-bar-line-3')
+      && barTemplate.includes('grok-filter-video-only')
+      && barTemplate.includes('grok-filter-with-video')
+      && barTemplate.includes('grok-filter-children')
+      && barTemplate.includes('grok-filter-children-min')
+      && barTemplate.includes('grok-filter-hide-childs')
+      && barTemplate.includes('grok-filter-liked')
+      && barTemplate.includes('grok-filter-uploaded-only'));
+
+    t.ok('line 4 has all action buttons and Download selected',
+      barTemplate.includes('grok-bar-line-4')
+      && barTemplate.includes('grok-download-selected-btn')
+      && barTemplate.includes('grok-import-json-btn')
+      && barTemplate.includes('grok-export-json-btn')
+      && barTemplate.includes('grok-export-results-btn')
+      && barTemplate.includes('grok-reindex-btn')
+      && barTemplate.includes('grok-verify-btn')
+      && barTemplate.includes('grok-prune-missing-btn'));
   },
 };

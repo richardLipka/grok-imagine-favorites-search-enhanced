@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.75.2
+// @version      1.76.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -134,7 +134,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.75.2';
+  const SCRIPT_VERSION = '1.76.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -6868,8 +6868,8 @@
   }
 
   function ensureDateNavButtons() {
-    const filters = getFiltersRow();
-    if (!filters) return;
+    const dateRow = getDateRow();
+    if (!dateRow) return;
 
     let prevBtn = document.getElementById('grok-date-prev');
     let nextBtn = document.getElementById('grok-date-next');
@@ -6878,13 +6878,13 @@
 
     if (!prevBtn) {
       prevBtn = createDateNavButton('grok-date-prev', 'Previous day', DATE_NAV_PREV_SVG);
-      if (startEl) filters.insertBefore(prevBtn, startEl);
-      else filters.prepend(prevBtn);
+      if (startEl) dateRow.insertBefore(prevBtn, startEl);
+      else dateRow.prepend(prevBtn);
     }
     if (!nextBtn) {
       nextBtn = createDateNavButton('grok-date-next', 'Next day', DATE_NAV_NEXT_SVG);
       if (endEl) endEl.insertAdjacentElement('afterend', nextBtn);
-      else filters.appendChild(nextBtn);
+      else dateRow.appendChild(nextBtn);
     }
 
     if (!prevBtn.dataset.grokDateNavBound) {
@@ -6966,8 +6966,8 @@
   function ensureDatePresetChips() {
     let wrap = document.getElementById('grok-date-presets');
     if (!wrap) {
-      const filters = getFiltersRow();
-      if (!filters) return;
+      const dateRow = getDateRow();
+      if (!dateRow) return;
       wrap = document.createElement('div');
       wrap.id = 'grok-date-presets';
       wrap.className = 'grok-date-presets';
@@ -6979,7 +6979,7 @@
       `;
       const nextBtn = document.getElementById('grok-date-next');
       if (nextBtn) nextBtn.insertAdjacentElement('afterend', wrap);
-      else filters.appendChild(wrap);
+      else dateRow.appendChild(wrap);
     }
     if (!wrap.dataset.grokDatePresetsBound) {
       wrap.dataset.grokDatePresetsBound = '1';
@@ -7150,50 +7150,66 @@
       #grok-search-bar {
         display: flex;
         flex-direction: column;
-        gap: 10px;
+        gap: 8px;
         background: rgba(15,15,20,0.93);
         border: 1px solid rgba(255,255,255,0.12);
         border-radius: 14px;
-        padding: 12px 16px;
+        padding: 10px 14px;
         box-shadow: 0 8px 32px rgba(0,0,0,0.5);
         backdrop-filter: blur(16px);
         -webkit-backdrop-filter: blur(16px);
         transition: box-shadow 0.2s, border-color 0.2s;
       }
+      .grok-bar-line {
+        display: flex;
+        align-items: center;
+        width: 100%;
+        gap: 8px;
+        flex-wrap: wrap;
+        min-width: 0;
+      }
+      .grok-bar-line-1,
       .grok-bar-top {
         display: flex;
         align-items: center;
         gap: 8px;
         width: 100%;
-      }
-      /* Filters and actions both wrap: their children are flex-shrink:0, so a nowrap row
-         overflows its own box and paints over the neighbouring group instead of reflowing. */
-      .grok-bar-bottom {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: 8px 12px;
-        width: 100%;
         flex-wrap: wrap;
       }
-      .grok-bar-filters {
+      .grok-bar-line-2,
+      #grok-bar-date-row {
         display: flex;
         align-items: center;
         gap: 6px 8px;
+        width: 100%;
         flex-wrap: wrap;
-        flex: 1 1 auto;
-        min-width: 0;
       }
+      .grok-bar-line-3,
+      #grok-bar-filters,
+      .grok-bar-filters {
+        display: flex;
+        align-items: center;
+        gap: 6px 14px;
+        width: 100%;
+        flex-wrap: wrap;
+      }
+      .grok-bar-line-4,
+      #grok-bar-actions,
       .grok-bar-actions {
         display: flex;
         align-items: center;
-        gap: 6px;
+        gap: 6px 8px;
+        width: 100%;
         flex-wrap: wrap;
-        justify-content: flex-end;
-        /* Must be shrinkable, or on a narrow bar the group keeps its max-content width and
-           the last buttons hang outside the panel instead of wrapping. */
+        justify-content: flex-start;
         min-width: 0;
-        margin-left: auto;
+        margin-left: 0;
+      }
+      .grok-bar-bottom {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        width: 100%;
       }
       .grok-date-input {
         background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.15);
@@ -7284,6 +7300,9 @@
       }
       #grok-search-count-wrap {
         display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-left: auto;
       }
       .grok-download-results-btn,
       .grok-download-selected-btn,
@@ -7323,8 +7342,9 @@
       #grok-stamp-status { font-size: 10px; color: rgba(255,255,255,0.62); white-space: nowrap; flex-shrink: 0; }
       #grok-search-clear,
       .grok-clear-filters-btn {
-        display: flex; align-items: center; justify-content: center;
-        flex-shrink: 0; min-width: 32px; padding: 4px 8px;
+        display: inline-flex; align-items: center; justify-content: center;
+        gap: 5px; flex-shrink: 0; min-width: 32px; padding: 4px 8px;
+        margin-left: auto;
       }
       #grok-search-clear:not(.visible) {
         opacity: 0.35; pointer-events: none;
@@ -8394,6 +8414,10 @@
   }
 
   // ─── UI ────────────────────────────────────────────────────────────────────
+  function getDateRow() {
+    return document.getElementById('grok-bar-date-row') || document.getElementById('grok-bar-filters');
+  }
+
   function getFiltersRow() {
     return document.getElementById('grok-bar-filters');
   }
@@ -8543,66 +8567,99 @@
   }
 
   function migrateSearchBarLayout() {
-    if (document.getElementById('grok-results-only-row')) return;
     const wrap = document.getElementById('grok-search-wrap');
     const bar = document.getElementById('grok-search-bar');
     if (!wrap || !bar) return;
 
+    if (!document.getElementById('grok-results-only-row')) {
+      const resultsRow = document.createElement('div');
+      resultsRow.id = 'grok-results-only-row';
+      const label = document.getElementById('grok-results-only-label');
+      if (label) resultsRow.appendChild(label);
+      if (resultsRow.childElementCount > 0) wrap.insertBefore(resultsRow, bar);
+    }
+
+    if (document.getElementById('grok-bar-date-row')) return;
+
     const ids = [
-      'grok-results-only-label', 'grok-search-icon', 'grok-search-input',
-      'grok-stamp-status', 'grok-search-count', 'grok-sort-select',
+      'grok-search-icon', 'grok-search-input', 'grok-filter-model',
+      'grok-sort-select', 'grok-stamp-status', 'grok-search-count',
+      'grok-search-count-wrap',
       'grok-date-prev', 'grok-date-start', 'grok-date-end', 'grok-date-next',
-      'grok-filter-video-only-label',
-      'grok-filter-with-video-label',
-      'grok-filter-children-label', 'grok-filter-hide-childs-label', 'grok-search-clear',
-      'grok-export-json-btn', 'grok-reindex-btn',
+      'grok-date-presets', 'grok-search-clear',
+      'grok-filter-video-only-label', 'grok-filter-with-video-label',
+      'grok-filter-children-label', 'grok-filter-hide-childs-label',
+      'grok-filter-liked-label', 'grok-filter-uploaded-only-label',
+      'grok-download-selected-btn', 'grok-import-json-btn', 'grok-import-json-input',
+      'grok-export-json-btn', 'grok-export-results-btn', 'grok-reindex-btn',
+      'grok-verify-btn', 'grok-prune-missing-btn',
     ];
     const nodes = {};
     ids.forEach(id => {
-      const el = document.getElementById(id);
+      const el = document.getElementById(id) || bar.querySelector('.' + id);
       if (el) nodes[id] = el;
     });
     const dateSep = bar.querySelector('.grok-date-sep');
 
-    const resultsRow = document.createElement('div');
-    resultsRow.id = 'grok-results-only-row';
-    if (nodes['grok-results-only-label']) resultsRow.appendChild(nodes['grok-results-only-label']);
-
     bar.innerHTML = '';
-    const top = document.createElement('div');
-    top.className = 'grok-bar-top';
-    ['grok-search-icon', 'grok-search-input', 'grok-stamp-status', 'grok-search-count', 'grok-sort-select']
-      .forEach(id => { if (nodes[id]) top.appendChild(nodes[id]); });
 
-    const bottom = document.createElement('div');
-    bottom.className = 'grok-bar-bottom';
-    const filters = document.createElement('div');
-    filters.id = 'grok-bar-filters';
-    filters.className = 'grok-bar-filters';
-    ['grok-date-prev', 'grok-date-start'].forEach(id => { if (nodes[id]) filters.appendChild(nodes[id]); });
-    if (dateSep) filters.appendChild(dateSep);
+    // Line 1: search, model filter, sort, stamp status, count
+    const line1 = document.createElement('div');
+    line1.className = 'grok-bar-line grok-bar-line-1 grok-bar-top';
+    ['grok-search-icon', 'grok-search-input', 'grok-filter-model', 'grok-sort-select'].forEach(id => {
+      if (nodes[id]) line1.appendChild(nodes[id]);
+    });
+    let countWrap = nodes['grok-search-count-wrap'];
+    if (!countWrap) {
+      countWrap = document.createElement('span');
+      countWrap.id = 'grok-search-count-wrap';
+      countWrap.className = 'grok-results-count-wrap';
+    }
+    if (nodes['grok-search-count']) countWrap.appendChild(nodes['grok-search-count']);
+    if (nodes['grok-stamp-status']) countWrap.appendChild(nodes['grok-stamp-status']);
+    line1.appendChild(countWrap);
+
+    // Line 2: date controls and clear filter
+    const line2 = document.createElement('div');
+    line2.id = 'grok-bar-date-row';
+    line2.className = 'grok-bar-line grok-bar-line-2';
+    ['grok-date-prev', 'grok-date-start'].forEach(id => { if (nodes[id]) line2.appendChild(nodes[id]); });
+    if (dateSep) line2.appendChild(dateSep);
     else {
       const sep = document.createElement('span');
       sep.className = 'grok-date-sep';
       sep.textContent = '–';
-      filters.appendChild(sep);
+      line2.appendChild(sep);
     }
-    if (nodes['grok-date-end']) filters.appendChild(nodes['grok-date-end']);
-    if (nodes['grok-date-next']) filters.appendChild(nodes['grok-date-next']);
-    ['grok-filter-video-only-label', 'grok-filter-with-video-label', 'grok-filter-children-label', 'grok-filter-hide-childs-label', 'grok-search-clear']
-      .forEach(id => { if (nodes[id]) filters.appendChild(nodes[id]); });
+    ['grok-date-end', 'grok-date-next', 'grok-date-presets', 'grok-search-clear'].forEach(id => {
+      if (nodes[id]) line2.appendChild(nodes[id]);
+    });
 
-    const actions = document.createElement('div');
-    actions.id = 'grok-bar-actions';
-    actions.className = 'grok-bar-actions';
-    ['grok-export-json-btn', 'grok-reindex-btn'].forEach(id => { if (nodes[id]) actions.appendChild(nodes[id]); });
+    // Line 3: checkboxes
+    const line3 = document.createElement('div');
+    line3.id = 'grok-bar-filters';
+    line3.className = 'grok-bar-line grok-bar-line-3 grok-bar-filters';
+    [
+      'grok-filter-video-only-label', 'grok-filter-with-video-label',
+      'grok-filter-children-label', 'grok-filter-hide-childs-label',
+      'grok-filter-liked-label', 'grok-filter-uploaded-only-label',
+    ].forEach(id => { if (nodes[id]) line3.appendChild(nodes[id]); });
 
-    bottom.appendChild(filters);
-    bottom.appendChild(actions);
-    bar.appendChild(top);
-    bar.appendChild(bottom);
+    // Line 4: all buttons (including Download selected)
+    const line4 = document.createElement('div');
+    line4.id = 'grok-bar-actions';
+    line4.className = 'grok-bar-line grok-bar-line-4 grok-bar-actions';
+    [
+      'grok-download-selected-btn', 'grok-import-json-input', 'grok-import-json-btn',
+      'grok-export-json-btn', 'grok-export-results-btn', 'grok-reindex-btn',
+      'grok-verify-btn', 'grok-prune-missing-btn',
+    ].forEach(id => { if (nodes[id]) line4.appendChild(nodes[id]); });
 
-    if (resultsRow.childElementCount > 0) wrap.insertBefore(resultsRow, bar);
+    bar.appendChild(line1);
+    bar.appendChild(line2);
+    bar.appendChild(line3);
+    bar.appendChild(line4);
+
     ensureDateNavButtons();
     bindMediaFilterListeners();
   }
@@ -8618,48 +8675,61 @@
   }
 
   function ensureLikedFilterCheckbox() {
-    if (document.getElementById('grok-filter-liked-label')) return;
     const filters = getFiltersRow();
     if (!filters) return;
-    const label = document.createElement('label');
-    label.id = 'grok-filter-liked-label';
-    label.className = 'grok-filter-check-label';
-    label.title = 'Show only posts you have liked';
-    label.innerHTML = '<input type="checkbox" id="grok-filter-liked" /> Liked only';
-    const hideChilds = document.getElementById('grok-filter-hide-childs-label');
-    if (hideChilds) hideChilds.insertAdjacentElement('afterend', label);
-    else filters.appendChild(label);
-
+    let label = document.getElementById('grok-filter-liked-label');
+    if (!label) {
+      label = document.createElement('label');
+      label.id = 'grok-filter-liked-label';
+      label.className = 'grok-filter-check-label';
+      label.title = 'Show only posts you have liked';
+      label.innerHTML = '<input type="checkbox" id="grok-filter-liked" /> Liked only';
+      const hideChilds = document.getElementById('grok-filter-hide-childs-label');
+      if (hideChilds) hideChilds.insertAdjacentElement('afterend', label);
+      else filters.appendChild(label);
+    }
     const input = label.querySelector('input');
-    input.checked = filterLikedOnly;
-    input.addEventListener('change', () => {
-      filterLikedOnly = input.checked;
-      writeStoredString(FILTER_LIKED_KEY, filterLikedOnly ? '1' : '0');
-      currentPage = 0;
-      updateClearButton();
-      applyFilter();
-    });
+    if (input && !input.dataset.grokLikedBound) {
+      input.dataset.grokLikedBound = '1';
+      input.checked = filterLikedOnly;
+      input.addEventListener('change', () => {
+        filterLikedOnly = input.checked;
+        writeStoredString(FILTER_LIKED_KEY, filterLikedOnly ? '1' : '0');
+        currentPage = 0;
+        updateClearButton();
+        applyFilter();
+      });
+    } else if (input) {
+      input.checked = filterLikedOnly;
+    }
   }
 
   function ensureModelFilterSelect() {
-    if (document.getElementById('grok-filter-model')) return;
-    const filters = getFiltersRow();
-    if (!filters) return;
-    const sel = document.createElement('select');
-    sel.id = 'grok-filter-model';
-    sel.className = 'grok-filter-model-select';
-    sel.title = 'Filter by generation model';
-    sel.setAttribute('aria-label', 'Filter by model');
-    sel.addEventListener('change', () => {
-      filterModel = sel.value;
-      writeStoredString(FILTER_MODEL_KEY, filterModel);
-      currentPage = 0;
-      updateClearButton();
-      applyFilter();
-    });
-    const hideChilds = document.getElementById('grok-filter-hide-childs-label');
-    if (hideChilds) hideChilds.insertAdjacentElement('afterend', sel);
-    else filters.appendChild(sel);
+    const line1 = document.querySelector('.grok-bar-line-1') || document.querySelector('.grok-bar-top');
+    const sortSel = document.getElementById('grok-sort-select');
+    let sel = document.getElementById('grok-filter-model');
+    if (!sel) {
+      if (!line1) return;
+      sel = document.createElement('select');
+      sel.id = 'grok-filter-model';
+      sel.className = 'grok-filter-model-select';
+      sel.title = 'Filter by generation model';
+      sel.setAttribute('aria-label', 'Filter by model');
+      if (sortSel) line1.insertBefore(sel, sortSel);
+      else line1.appendChild(sel);
+    } else if (line1 && sortSel && sel.parentElement !== line1) {
+      line1.insertBefore(sel, sortSel);
+    }
+    if (!sel.dataset.grokModelBound) {
+      sel.dataset.grokModelBound = '1';
+      sel.addEventListener('change', () => {
+        filterModel = sel.value;
+        writeStoredString(FILTER_MODEL_KEY, filterModel);
+        currentPage = 0;
+        updateClearButton();
+        applyFilter();
+      });
+    }
     syncModelFilterOptions();
   }
 
@@ -8745,7 +8815,6 @@
 
   function ensureMediaFilterCheckboxes() {
     const filters = getFiltersRow();
-    const dateEnd = document.getElementById('grok-date-end');
     if (!filters) return;
 
     migrateLegacyVideoFilterUi();
@@ -8756,8 +8825,7 @@
       videoOnlyLabel.className = 'grok-filter-check-label';
       videoOnlyLabel.title = 'Show only video posts (hide images)';
       videoOnlyLabel.innerHTML = '<input type="checkbox" id="grok-filter-video-only" /> Video only';
-      if (dateEnd) dateEnd.insertAdjacentElement('afterend', videoOnlyLabel);
-      else filters.appendChild(videoOnlyLabel);
+      filters.appendChild(videoOnlyLabel);
     }
     if (!document.getElementById('grok-filter-with-video')) {
       const withVideoLabel = document.createElement('label');
@@ -8766,7 +8834,7 @@
       withVideoLabel.title = 'Show image posts that have video in child results';
       withVideoLabel.innerHTML = '<input type="checkbox" id="grok-filter-with-video" /> With video';
       const videoOnlyLabel = document.getElementById('grok-filter-video-only-label');
-      (videoOnlyLabel || dateEnd || filters).insertAdjacentElement('afterend', withVideoLabel);
+      (videoOnlyLabel || filters).insertAdjacentElement('afterend', withVideoLabel);
     }
     if (!document.getElementById('grok-filter-children')) {
       const childLabel = document.createElement('label');
@@ -8775,9 +8843,10 @@
       childLabel.title = 'Show only items with at least N child posts';
       childLabel.innerHTML = '<input type="checkbox" id="grok-filter-children" /> With child';
       const withVideoLabel = document.getElementById('grok-filter-with-video-label');
-      (withVideoLabel || dateEnd || filters).insertAdjacentElement('afterend', childLabel);
+      (withVideoLabel || filters).insertAdjacentElement('afterend', childLabel);
     }
     ensureHideChildsCheckbox();
+    ensureLikedFilterCheckbox();
     ensureUploadedCheckbox();
 
     ensureMediaMinSelect('grok-filter-children-min', document.getElementById('grok-filter-children-label'));
@@ -8811,7 +8880,6 @@
   function ensureHideChildsCheckbox() {
     document.getElementById('grok-filter-show-childs-label')?.remove();
     const filters = getFiltersRow();
-    const dateEnd = document.getElementById('grok-date-end');
     if (!filters || document.getElementById('grok-filter-hide-childs')) return;
 
     const hideChildsLabel = document.createElement('label');
@@ -8820,12 +8888,11 @@
     hideChildsLabel.title = 'Hide child posts from results (parents only)';
     hideChildsLabel.innerHTML = '<input type="checkbox" id="grok-filter-hide-childs" /> Hide childs';
     const childFilterLabel = document.getElementById('grok-filter-children-label');
-    (childFilterLabel || dateEnd || filters).insertAdjacentElement('afterend', hideChildsLabel);
+    (childFilterLabel || filters).insertAdjacentElement('afterend', hideChildsLabel);
   }
 
   function ensureUploadedCheckbox() {
     const filters = getFiltersRow();
-    const dateEnd = document.getElementById('grok-date-end');
     if (!filters || document.getElementById('grok-filter-uploaded-only')) return;
 
     const uploadedLabel = document.createElement('label');
@@ -8833,9 +8900,10 @@
     uploadedLabel.className = 'grok-filter-check-label';
     uploadedLabel.title = 'Show only uploaded images (hide generated media)';
     uploadedLabel.innerHTML = '<input type="checkbox" id="grok-filter-uploaded-only" /> Uploaded only';
+    const likedLabel = document.getElementById('grok-filter-liked-label');
     const hideChildsLabel = document.getElementById('grok-filter-hide-childs-label');
     const childFilterLabel = document.getElementById('grok-filter-children-label');
-    (hideChildsLabel || childFilterLabel || dateEnd || filters).insertAdjacentElement('afterend', uploadedLabel);
+    (likedLabel || hideChildsLabel || childFilterLabel || filters).insertAdjacentElement('afterend', uploadedLabel);
   }
 
   function bindMediaFilterListeners() {
@@ -8913,7 +8981,7 @@
     const wrap = document.getElementById('grok-search-count-wrap');
     if (!wrap) return;
     wrap.querySelectorAll(
-      '.grok-download-results-btn, .grok-check-all-btn, .grok-clear-selection-btn'
+      '.grok-download-results-btn, .grok-check-all-btn, .grok-clear-selection-btn, .grok-download-selected-btn, .grok-cancel-download-btn, .grok-retry-download-btn'
     ).forEach(el => el.remove());
   }
 
@@ -8970,12 +9038,16 @@
     btn.className = `${className} grok-toolbar-btn`;
     btn.title = title;
     btn.textContent = text;
-    wrap.appendChild(btn);
+    if (className === 'grok-download-selected-btn' && wrap.firstChild) {
+      wrap.insertBefore(btn, wrap.firstChild);
+    } else {
+      wrap.appendChild(btn);
+    }
   }
 
   function ensureDownloadSelectedButtons() {
     stripSearchBarActionButtons();
-    const toolbarWrap = document.getElementById('grok-search-count-wrap');
+    const toolbarWrap = getActionsRow();
     appendSelectionToolbarButton(
       toolbarWrap,
       'grok-download-selected-btn',
@@ -9440,69 +9512,78 @@
         <button type="button" id="grok-display-default" class="grok-display-default-btn" title="Reset to 44 per page and 100% size">Default</button>
       </div>
       <div id="grok-search-bar">
-        <div class="grok-bar-top">
+        <div class="grok-bar-line grok-bar-line-1 grok-bar-top">
           <svg id="grok-search-icon" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
             <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
           </svg>
           <input id="grok-search-input" type="text" aria-label="Search saved images by prompt" placeholder="Search saved images by prompt…" autocomplete="off" spellcheck="false" />
-          <span id="grok-stamp-status"></span>
-          <span id="grok-search-count-wrap" class="grok-results-count-wrap">
-            <span id="grok-search-count"></span>
-            <button type="button" class="grok-download-selected-btn grok-toolbar-btn" title="Download selected images to a folder">Download selected</button>
-          </span>
+          <select id="grok-filter-model" class="grok-filter-model-select" title="Filter by generation model" aria-label="Filter by model"></select>
           <select id="grok-sort-select" title="Sort order">
             <option value="newest">Newest</option>
             <option value="oldest">Oldest</option>
           </select>
+          <span id="grok-search-count-wrap" class="grok-results-count-wrap">
+            <span id="grok-search-count"></span>
+            <span id="grok-stamp-status"></span>
+          </span>
         </div>
-        <div class="grok-bar-bottom">
-          <div id="grok-bar-filters" class="grok-bar-filters">
-            <button type="button" id="grok-date-prev" class="grok-date-nav-btn icon-only" title="Previous day" aria-label="Previous day" disabled>${DATE_NAV_PREV_SVG}</button>
-            <input id="grok-date-start" class="grok-date-input" type="date" title="From date" aria-label="From date" />
-            <span class="grok-date-sep">–</span>
-            <input id="grok-date-end" class="grok-date-input" type="date" title="To date" aria-label="To date" />
-            <button type="button" id="grok-date-next" class="grok-date-nav-btn icon-only" title="Next day" aria-label="Next day" disabled>${DATE_NAV_NEXT_SVG}</button>
-            <div id="grok-date-presets" class="grok-date-presets">
-              <button type="button" class="grok-date-preset-btn" data-preset="today" title="Filter to today">Today</button>
-              <button type="button" class="grok-date-preset-btn" data-preset="yesterday" title="Filter to yesterday">Yesterday</button>
-              <button type="button" class="grok-date-preset-btn" data-preset="last7" title="Filter to last 7 days">Last 7 Days</button>
-              <button type="button" class="grok-date-preset-btn" data-preset="thisMonth" title="Filter to this month">This Month</button>
-            </div>
-            <label id="grok-filter-video-only-label" class="grok-filter-check-label" title="Show only video posts (hide images)">
-              <input type="checkbox" id="grok-filter-video-only" />
-              Video only
-            </label>
-            <label id="grok-filter-with-video-label" class="grok-filter-check-label" title="Show image posts that have video in child results">
-              <input type="checkbox" id="grok-filter-with-video" />
-              With video
-            </label>
-            <label id="grok-filter-children-label" class="grok-filter-check-label" title="Show only items with at least N child posts">
-              <input type="checkbox" id="grok-filter-children" />
-              With child
-              <select id="grok-filter-children-min" class="grok-filter-min-select" title="Minimum child posts (at least)" aria-label="Minimum child posts">
-                <option value="1">1</option><option value="3">3</option><option value="5">5</option><option value="7">7</option><option value="10">10</option>
-              </select>
-            </label>
-            <label id="grok-filter-hide-childs-label" class="grok-filter-check-label" title="Hide child posts from results (parents only)">
-              <input type="checkbox" id="grok-filter-hide-childs" />
-              Hide childs
-            </label>
-            <label id="grok-filter-uploaded-only-label" class="grok-filter-check-label" title="Show only uploaded images (hide generated media)">
-              <input type="checkbox" id="grok-filter-uploaded-only" />
-              Uploaded only
-            </label>
-            <button id="grok-search-clear" class="grok-toolbar-btn grok-clear-filters-btn" type="button" title="Clear all filters">
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="1" y1="1" x2="11" y2="11"/><line x1="11" y1="1" x2="1" y2="11"/>
-              </svg>
-            </button>
+        <div class="grok-bar-line grok-bar-line-2" id="grok-bar-date-row">
+          <button type="button" id="grok-date-prev" class="grok-date-nav-btn icon-only" title="Previous day" aria-label="Previous day" disabled>${DATE_NAV_PREV_SVG}</button>
+          <input id="grok-date-start" class="grok-date-input" type="date" title="From date" aria-label="From date" />
+          <span class="grok-date-sep">–</span>
+          <input id="grok-date-end" class="grok-date-input" type="date" title="To date" aria-label="To date" />
+          <button type="button" id="grok-date-next" class="grok-date-nav-btn icon-only" title="Next day" aria-label="Next day" disabled>${DATE_NAV_NEXT_SVG}</button>
+          <div id="grok-date-presets" class="grok-date-presets">
+            <button type="button" class="grok-date-preset-btn" data-preset="today" title="Filter to today">Today</button>
+            <button type="button" class="grok-date-preset-btn" data-preset="yesterday" title="Filter to yesterday">Yesterday</button>
+            <button type="button" class="grok-date-preset-btn" data-preset="last7" title="Filter to last 7 days">Last 7 Days</button>
+            <button type="button" class="grok-date-preset-btn" data-preset="thisMonth" title="Filter to this month">This Month</button>
           </div>
-          <div id="grok-bar-actions" class="grok-bar-actions">
-            <button id="grok-export-json-btn" class="grok-toolbar-btn" type="button" title="Download full indexed database as JSON">Export JSON</button>
-            <button id="grok-export-results-btn" class="grok-toolbar-btn" type="button" title="Export filtered results or selected subset as JSON or CSV">Export results</button>
-            <button id="grok-reindex-btn" class="grok-toolbar-btn" type="button" title="Clear cache and reindex from Grok (refreshes child image/video counts)">Reindex</button>
-            <button id="grok-prune-missing-btn" class="grok-toolbar-btn" type="button" title="Scan database for deleted / 404 images and remove them from local index">Prune missing</button>
-          </div>
+          <button id="grok-search-clear" class="grok-toolbar-btn grok-clear-filters-btn" type="button" title="Clear all filters">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <line x1="1" y1="1" x2="11" y2="11"/><line x1="11" y1="1" x2="1" y2="11"/>
+            </svg>
+            <span>Clear filter</span>
+          </button>
+        </div>
+        <div class="grok-bar-line grok-bar-line-3 grok-bar-filters" id="grok-bar-filters">
+          <label id="grok-filter-video-only-label" class="grok-filter-check-label" title="Show only video posts (hide images)">
+            <input type="checkbox" id="grok-filter-video-only" />
+            Video only
+          </label>
+          <label id="grok-filter-with-video-label" class="grok-filter-check-label" title="Show image posts that have video in child results">
+            <input type="checkbox" id="grok-filter-with-video" />
+            With video
+          </label>
+          <label id="grok-filter-children-label" class="grok-filter-check-label" title="Show only items with at least N child posts">
+            <input type="checkbox" id="grok-filter-children" />
+            With child
+            <select id="grok-filter-children-min" class="grok-filter-min-select" title="Minimum child posts (at least)" aria-label="Minimum child posts">
+              <option value="1">1</option><option value="3">3</option><option value="5">5</option><option value="7">7</option><option value="10">10</option>
+            </select>
+          </label>
+          <label id="grok-filter-hide-childs-label" class="grok-filter-check-label" title="Hide child posts from results (parents only)">
+            <input type="checkbox" id="grok-filter-hide-childs" />
+            Hide childs
+          </label>
+          <label id="grok-filter-liked-label" class="grok-filter-check-label" title="Show only posts you have liked">
+            <input type="checkbox" id="grok-filter-liked" />
+            Liked only
+          </label>
+          <label id="grok-filter-uploaded-only-label" class="grok-filter-check-label" title="Show only uploaded images (hide generated media)">
+            <input type="checkbox" id="grok-filter-uploaded-only" />
+            Uploaded only
+          </label>
+        </div>
+        <div class="grok-bar-line grok-bar-line-4 grok-bar-actions" id="grok-bar-actions">
+          <button type="button" class="grok-download-selected-btn grok-toolbar-btn" title="Download selected images to a folder">Download selected</button>
+          <input id="grok-import-json-input" type="file" accept="application/json,.json" hidden aria-label="Choose an exported index file to import" />
+          <button id="grok-import-json-btn" class="grok-toolbar-btn" type="button" title="Merge a previously exported index file into the local database">Import JSON</button>
+          <button id="grok-export-json-btn" class="grok-toolbar-btn" type="button" title="Download full indexed database as JSON">Export JSON</button>
+          <button id="grok-export-results-btn" class="grok-toolbar-btn" type="button" title="Export filtered results or selected subset as JSON or CSV">Export results</button>
+          <button id="grok-reindex-btn" class="grok-toolbar-btn" type="button" title="Clear cache and reindex from Grok (refreshes child image/video counts)">Reindex</button>
+          <button id="grok-verify-btn" class="grok-toolbar-btn" type="button" title="Walk the whole liked feed and reconcile the index: removes posts you have unliked and adds posts liked after they were created">Verify</button>
+          <button id="grok-prune-missing-btn" class="grok-toolbar-btn" type="button" title="Scan database for deleted / 404 images and remove them from local index">Prune missing</button>
         </div>
       </div>
       <div id="grok-pager">
