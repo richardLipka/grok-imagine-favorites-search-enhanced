@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.76.0
+// @version      1.76.1
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -131,10 +131,16 @@
   const HTTP_RETRY_STATUSES = [429, 500, 502, 503, 504];
   const HTTP_MAX_RETRIES = 3;
   const HTTP_RETRY_BASE_MS = 800;
+  /**
+   * 429 gets its own, far more patient schedule. See retryDelayMs() for the measurements: the
+   * asset feed is bucket-limited, not overloaded, and one pause of about five seconds clears it.
+   */
+  const RATE_LIMIT_RETRY_BASE_MS = 5000;
+  const RATE_LIMIT_MAX_RETRIES = 8;
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.76.0';
+  const SCRIPT_VERSION = '1.76.1';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -357,11 +363,42 @@
     return HTTP_RETRY_STATUSES.includes(status) || status === 0;
   }
 
-  /** Exponential backoff, honouring Retry-After when the server sends one. */
-  function retryDelayMs(attempt, headers) {
+  /**
+   * How long to wait before retrying.
+   *
+   * 429 is treated as a token bucket rather than an overloaded server, because that is what it
+   * measurably is. Walking /rest/assets on a real library, the bucket trips roughly every 31
+   * pages -- at pages 32, 63, 96, 126 and 164 in one run -- and a single pause of about five
+   * seconds clears it, after which the walk continues at full speed to the end of the feed.
+   *
+   * The general 800ms exponential backoff is far too impatient for that. Three attempts of 0.8s,
+   * 1.6s and 3.2s were all spent inside one window, so the walk gave up at the *first* limit and
+   * every reindex stopped at about 1,980 images -- 33 pages of 60 -- with Verify failing the same
+   * way, which is why it could not repair the gap either.
+   *
+   * Grok sends no Retry-After and no X-RateLimit-* headers on these endpoints (checked), so there
+   * is nothing to read off the response: the delay has to come from measurement. Retry-After is
+   * still honoured first in case that ever changes.
+   */
+  function retryDelayMs(attempt, headers, status) {
     const after = /retry-after:\s*(\d+)/i.exec(String(headers || ''))?.[1];
-    if (after) return Math.min(Number(after) * 1000, 30000);
+    if (after) return Math.min(Number(after) * 1000, 60000);
+    if (status === 429) return Math.min(RATE_LIMIT_RETRY_BASE_MS * (attempt + 1), 30000);
     return HTTP_RETRY_BASE_MS * 2 ** attempt;
+  }
+
+  /** A rate limit deserves more patience than a flaky response; see retryDelayMs(). */
+  function retryBudget(status) {
+    return status === 429 ? RATE_LIMIT_MAX_RETRIES : HTTP_MAX_RETRIES;
+  }
+
+  /** Shared wording so a long pause never looks like the walk has hung. */
+  function reportRetryWait(label, status, wait, attempt, allowed) {
+    const secs = Math.max(1, Math.round(wait / 1000));
+    console.warn(`[GrokSearch] ${label} HTTP ${status} — retrying in ${wait}ms (attempt ${attempt}/${allowed})`);
+    setLoadStatus(status === 429
+      ? `rate limited — waiting ${secs}s (attempt ${attempt}/${allowed})…`
+      : `retrying in ${secs}s…`);
   }
 
   function gmRequestOnce(url, body, headers, method = 'POST') {
@@ -394,13 +431,12 @@
           return { ok: false, status: res.status };
         }
       }
-      if (!isRetryableStatus(res.status) || attempt >= HTTP_MAX_RETRIES) {
+      if (!isRetryableStatus(res.status) || attempt >= retryBudget(res.status)) {
         console.warn(`[GrokSearch] ${label} HTTP ${res.status}`);
         return { ok: false, status: res.status };
       }
-      const wait = retryDelayMs(attempt, res.headers);
-      console.warn(`[GrokSearch] ${label} HTTP ${res.status} — retrying in ${wait}ms`);
-      setLoadStatus(`rate limited — retrying…`);
+      const wait = retryDelayMs(attempt, res.headers, res.status);
+      reportRetryWait(label, res.status, wait, attempt + 1, retryBudget(res.status));
       await sleep(wait);
     }
   }
@@ -419,13 +455,12 @@
           return { ok: false, status: res.status };
         }
       }
-      if (!isRetryableStatus(res.status) || attempt >= HTTP_MAX_RETRIES) {
+      if (!isRetryableStatus(res.status) || attempt >= retryBudget(res.status)) {
         if (res.status !== 404) console.warn(`[GrokSearch] ${label} HTTP ${res.status}`);
         return { ok: false, status: res.status };
       }
-      const wait = retryDelayMs(attempt, res.headers);
-      console.warn(`[GrokSearch] ${label} HTTP ${res.status} — retrying in ${wait}ms`);
-      setLoadStatus(`rate limited — retrying…`);
+      const wait = retryDelayMs(attempt, res.headers, res.status);
+      reportRetryWait(label, res.status, wait, attempt + 1, retryBudget(res.status));
       await sleep(wait);
     }
   }
@@ -2061,16 +2096,21 @@
       const retryable = (typeof isRetryableStatus === 'function')
         ? isRetryableStatus(res.status)
         : [429, 500, 502, 503, 504, 0].includes(res.status);
-      const retriesAllowed = (typeof HTTP_MAX_RETRIES !== 'undefined') ? HTTP_MAX_RETRIES : maxRetries;
+      const retriesAllowed = (typeof retryBudget === 'function')
+        ? retryBudget(res.status)
+        : ((typeof HTTP_MAX_RETRIES !== 'undefined') ? HTTP_MAX_RETRIES : maxRetries);
       if (!retryable || attempt >= retriesAllowed) {
         if (res.status !== 404) console.warn(`[GrokSearch] ${label} HTTP ${res.status}`);
         return { ok: false, status: res.status };
       }
       const wait = (typeof retryDelayMs === 'function')
-        ? retryDelayMs(attempt, res.headers)
-        : Math.min(800 * 2 ** attempt, 30000);
-      console.warn(`[GrokSearch] ${label} HTTP ${res.status} — retrying in ${wait}ms (attempt ${attempt + 1}/${retriesAllowed})`);
-      setLoadStatus(`rate limited — retrying in ${Math.max(1, Math.round(wait / 1000))}s…`);
+        ? retryDelayMs(attempt, res.headers, res.status)
+        : Math.min(5000 * (attempt + 1), 30000);
+      if (typeof reportRetryWait === 'function') {
+        reportRetryWait(label, res.status, wait, attempt + 1, retriesAllowed);
+      } else {
+        setLoadStatus(`rate limited — waiting ${Math.max(1, Math.round(wait / 1000))}s…`);
+      }
       await sleep(wait);
     }
   }

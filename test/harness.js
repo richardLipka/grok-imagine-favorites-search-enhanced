@@ -37,7 +37,12 @@ function sliceBetween(src, startMarker, endMarker) {
  * Ends before formatSyncStatusMessage, which is where the UI-coupled code begins.
  */
 function createIndexSandbox() {
-  const region = sliceBetween(readSource(), '  function isVideoMediaType', '  function formatSyncStatusMessage');
+  const src = readSource();
+  // The retry helpers live above the sliced region but govern how the asset walk survives a rate
+  // limit, so they are sliced in rather than stubbed -- a stub would have hidden the very bug
+  // these tests exist to catch.
+  const retryRegion = sliceBetween(src, '  function isRetryableStatus(status) {', '  function gmRequestOnce(');
+  const region = retryRegion + sliceBetween(src, '  function isVideoMediaType', '  function formatSyncStatusMessage');
 
   const prelude = `
     const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
@@ -73,6 +78,12 @@ function createIndexSandbox() {
     let feedPages = [];
 
     const sleep = () => Promise.resolve();
+    // Real values, so the sliced retry helpers behave exactly as they do in the browser.
+    const HTTP_RETRY_STATUSES = [429, 500, 502, 503, 504];
+    const HTTP_MAX_RETRIES = 3;
+    const HTTP_RETRY_BASE_MS = 800;
+    const RATE_LIMIT_RETRY_BASE_MS = 5000;
+    const RATE_LIMIT_MAX_RETRIES = 8;
     function setLoadStatus() {}
     function writeStoredString(key, value) { storage[key] = value; }
     function readStoredString(key, fallback = '') {
@@ -137,6 +148,7 @@ function createIndexSandbox() {
       buildAssetsUrl, fetchAssetPage, assetMediaUrl, assetGenInput, assetMediaType,
       getAssetParentId, propagateBatchPrompts,
       parseAsset, syncAssetsFeed, isIndexableAsset, isUploadedPost,
+      retryDelayMs, retryBudget, isRetryableStatus,
     };
   `;
 

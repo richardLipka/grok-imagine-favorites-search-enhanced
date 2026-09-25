@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.76.0, ~9.8k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokSearch.user.js` (v1.76.1, ~9.8k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.user.js` (v1.5.0, ~710 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
@@ -127,7 +127,19 @@ session cookies authenticate the request:
 is comparing identical requests. Verify a parameter is real before building on it — send a
 deliberate nonsense value and check it is rejected.
 
-Both go through `postJsonWithRetry()`, which retries `429`/`5xx` with exponential backoff and honours
+**A 429 from Grok is a token bucket, not an overloaded server, and needs a different kind of
+patience.** Measured on a real library, walking `/rest/assets` trips the bucket roughly every 31
+pages and a single pause of about five seconds clears it; pacing hardly matters (120ms between
+pages tripped at page 28, 400ms at page 32). So `retryDelayMs()` branches on the status: 429 waits
+`RATE_LIMIT_RETRY_BASE_MS` (5s) and grows, with `RATE_LIMIT_MAX_RETRIES` (8) attempts, while every
+other retryable status keeps the 800ms exponential backoff. Getting this wrong is not a slow sync
+but a **silently truncated index** — three tries of 0.8s, 1.6s and 3.2s all fell inside one window,
+so the walk gave up at the first limit and every reindex stopped at about 1,980 images (33 pages of
+60). Verify walks the same feed and failed identically, so it could not repair the gap either.
+Grok sends no `Retry-After` and no `X-RateLimit-*` headers here, so the delay has to come from
+measurement rather than from the response.
+
+Both go through `postJsonWithRetry()`, which retries `429`/`5xx` with backoff and honours
 `Retry-After`. It always resolves: `ok: false` means the request failed, and callers must never treat
 that as an empty result — conflating the two is what made a mid-walk `401` report "up to date".
 

@@ -3,6 +3,38 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.76.1] — 2026-09-25
+
+### Fixed
+
+- **Reindex stopped at about 1,980 images, and Verify could not repair it.** v1.75.2 identified
+  the rate limit but treated it as server overload; it is a **token bucket**, and the remedy was
+  an order of magnitude too impatient.
+
+  Measured by walking `/rest/assets` directly against a real library: the bucket trips roughly
+  **every 31 pages** — at pages 32, 63, 96, 126, 164, 194, 226, 271 and 302 of one run — and a
+  single pause of about **five seconds** clears it, after which the walk continues at full speed.
+  Pacing barely matters: 120ms between pages tripped it at page 28, 400ms at page 32.
+
+  The old schedule was three attempts at 0.8s, 1.6s and 3.2s. All three were spent inside one
+  window, so the walk gave up at the **first** limit — 33 pages of 60 items, which is exactly the
+  1,980 images people saw. **Verify** walks the same feed, so it died at the same page; because it
+  correctly refuses to delete on an incomplete walk, it could neither finish nor repair anything.
+
+  429 now has its own schedule — five seconds, growing, with a budget of eight attempts — while
+  ordinary flaky responses keep the impatient exponential backoff. Grok sends no `Retry-After`
+  and no `X-RateLimit-*` headers on these endpoints (checked), so the delay comes from
+  measurement; `Retry-After` is still honoured first should that ever change. With this, the same
+  walk passed 19,500 images and kept going.
+
+  Progress now names the wait (`rate limited — waiting 5s (attempt 1/8)…`) so a long pause does
+  not look like a hang.
+- **`Retry-After` was never actually read.** The header regex had a doubled escape, so it matched
+  a literal backslash and never a real header. It had no effect in practice — Grok does not send
+  the header — but it meant the one piece of server guidance the code claimed to honour was dead.
+
+---
+
 ## [1.76.0] — 2026-09-25
 
 ### Changed

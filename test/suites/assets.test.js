@@ -238,6 +238,42 @@ module.exports = {
     t.ok('retried page row exists', s.postById.has('a2'));
     t.ok('subsequent page row exists', s.postById.has('a3'));
 
+    t.group('a rate limit is waited out, not given up on');
+    // Measured against a real library: /rest/assets is bucket-limited, tripping roughly every 31
+    // pages, and one pause of about five seconds clears it. The old schedule was three tries of
+    // 0.8s, 1.6s and 3.2s -- all spent inside a single window -- so the walk died at the *first*
+    // limit and every reindex stopped at about 1,980 images (33 pages of 60). Verify walks the
+    // same feed and failed the same way, which is why it could not repair the gap either.
+    s = createIndexSandbox();
+    t.equal('429 waits start at five seconds, not 800ms', s.retryDelayMs(0, '', 429), 5000);
+    t.ok('and grow from there', s.retryDelayMs(1, '', 429) > s.retryDelayMs(0, '', 429));
+    t.equal('a plain 5xx keeps the impatient schedule', s.retryDelayMs(0, '', 500), 800);
+    t.ok('429 gets a bigger budget than a flaky response',
+      s.retryBudget(429) > s.retryBudget(500), [s.retryBudget(429), s.retryBudget(500)]);
+    // Grok sends no Retry-After on these endpoints, but honour it first if that ever changes.
+    t.equal('Retry-After still wins when present', s.retryDelayMs(0, 'retry-after: 12', 429), 12000);
+    t.equal('and is capped', s.retryDelayMs(0, 'retry-after: 9000', 429), 60000);
+
+    // The decisive one: more consecutive 429s than the general budget allows. Under the old
+    // three-retry limit this page was abandoned and the walk stopped short.
+    s = createIndexSandbox();
+    s.setAssetPages([
+      { assets: [asset('a1')] },
+      { failAttempts: 5, status: 429, assets: [asset('a2')] },
+      { assets: [asset('a3')] },
+    ]);
+    res = await s.syncAssetsFeed(null, { stopWhenKnown: false });
+    t.equal('a page that 429s five times is still walked', res.pages, 3);
+    t.equal('and nothing is lost', res.added, 3);
+    t.equal('with no failure reported', res.failed, false);
+
+    // A limit that never lifts must still end the walk, and say so rather than claim success.
+    s = createIndexSandbox();
+    s.setAssetPages([{ assets: [asset('a1')] }, { fail: true, status: 429 }, { assets: [asset('a2')] }]);
+    res = await s.syncAssetsFeed(null, { stopWhenKnown: false });
+    t.equal('an unrelenting rate limit is surfaced', res.failed, true);
+    t.equal('and what was read is kept', res.added, 1);
+
     t.group('merging onto a row the old feed created');
     s = createIndexSandbox();
     s.addPostRow(s.normalizePost({
