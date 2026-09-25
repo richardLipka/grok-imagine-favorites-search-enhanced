@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.76.1, ~9.8k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokSearch.user.js` (v1.77.0, ~9.8k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.user.js` (v1.5.0, ~710 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
@@ -137,7 +137,9 @@ but a **silently truncated index** — three tries of 0.8s, 1.6s and 3.2s all fe
 so the walk gave up at the first limit and every reindex stopped at about 1,980 images (33 pages of
 60). Verify walks the same feed and failed identically, so it could not repair the gap either.
 Grok sends no `Retry-After` and no `X-RateLimit-*` headers here, so the delay has to come from
-measurement rather than from the response.
+measurement rather than from the response. The wait is user-settable (*Rate wait*, stored under
+`RATE_LIMIT_WAIT_KEY`, clamped to 1–60s) because the bucket is Grok's and may change size, but the
+default is the measured one and lowering it re-creates the original bug.
 
 Both go through `postJsonWithRetry()`, which retries `429`/`5xx` with backoff and honours
 `Retry-After`. It always resolves: `ok: false` means the request failed, and callers must never treat
@@ -265,6 +267,24 @@ It is the only destructive path in the codebase, so three rules hold it together
 
 `removeRowsById()` is the only function that deletes parent rows; it also clears `knownIds` and
 `selectedPostIds` and rebuilds the id map.
+
+### Deleting
+
+**"The delete endpoint returned 200" and "the image is gone from the library" are different
+claims.** The library view paginates `/rest/assets`; `/rest/media/post/delete` removes a *media
+post*. They are separate records, so `deleteAndVerify()` follows every accepted delete with
+`GET /rest/assets/{id}` — 200 means it is still in the library, 404 that it is gone.
+
+A row leaves the index **only** when the library confirms it. A survivor is reported as "still in
+library" and a check that could not reach the server as "unverified", and both keep their row:
+hiding a row on an unverified claim is how the index comes to quietly disagree with Grok.
+
+Whether the post delete alone is enough is **unsettled**. Probing found `/rest/media/post/delete`
+correctly shaped (404 for an impossible id, 400 for the wrong field), but also a separate
+`DELETE /rest/assets/{id}` answering 200 and an `/rest/assets/delete` answering 501. Deciding it
+needs one real delete. If the verification starts reporting survivors, **capture what Grok's own UI
+sends when it deletes** — the same rule as the like button. Never wire a guessed destructive
+endpoint: a wrong guess fires deletes at the user's library.
 
 ### Render pipeline
 

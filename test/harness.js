@@ -84,6 +84,15 @@ function createIndexSandbox() {
     const HTTP_RETRY_BASE_MS = 800;
     const RATE_LIMIT_RETRY_BASE_MS = 5000;
     const RATE_LIMIT_MAX_RETRIES = 8;
+    const RATE_LIMIT_WAIT_MIN_MS = 1000;
+    const RATE_LIMIT_WAIT_MAX_MS = 60000;
+    const RATE_LIMIT_WAIT_KEY = 'grokSearchRateLimitWaitMs';
+    // The user-set wait reads localStorage, which the sandbox does not have; the retry helpers
+    // are sliced in with their own typeof guard so the default applies here.
+    const localStorage = {
+      getItem: k => (Object.prototype.hasOwnProperty.call(storage, k) ? storage[k] : null),
+      setItem: (k, v) => { storage[k] = String(v); },
+    };
     function setLoadStatus() {}
     function writeStoredString(key, value) { storage[key] = value; }
     function readStoredString(key, fallback = '') {
@@ -148,7 +157,8 @@ function createIndexSandbox() {
       buildAssetsUrl, fetchAssetPage, assetMediaUrl, assetGenInput, assetMediaType,
       getAssetParentId, propagateBatchPrompts,
       parseAsset, syncAssetsFeed, isIndexableAsset, isUploadedPost,
-      retryDelayMs, retryBudget, isRetryableStatus,
+      retryDelayMs, retryBudget, isRetryableStatus, getRateLimitWaitMs, clampRateLimitWait,
+      setStored(k, v) { storage[k] = v; },
     };
   `;
 
@@ -459,7 +469,21 @@ function createDeleteSandbox(control = {}) {
 
   const prelude = `
     const POST_DELETE = 'https://grok.com/rest/media/post/delete';
-    const log = { requests: [], statuses: [], removed: [], confirms: [], flushes: 0, filters: 0 };
+    const ASSET_GET = 'https://grok.com/rest/assets/';
+    const log = { requests: [], statuses: [], removed: [], confirms: [], flushes: 0, filters: 0, checks: [] };
+
+    /**
+     * The library check that runs after each delete. control.stillThere lists ids the asset
+     * feed keeps serving -- the case where the media post is deleted but the image is not
+     * gone -- and control.checkFails the ids whose check cannot be completed at all.
+     */
+    async function gmGetJson(url, label) {
+      const id = decodeURIComponent(String(url).slice(ASSET_GET.length));
+      log.checks.push(id);
+      if ((control.checkFails || []).includes(id)) return { ok: false, status: 500 };
+      if ((control.stillThere || []).includes(id)) return { ok: true, data: { assetId: id } };
+      return { ok: false, status: 404 };
+    }
 
     async function postJsonWithRetry(url, body, label) {
       log.requests.push({ url, id: body && body.id, label });
@@ -482,6 +506,7 @@ function createDeleteSandbox(control = {}) {
 
   const epilogue = `
     return { log, deleteRemotePost, deletePosts, deleteSelectedPosts, deleteSinglePost,
+             assetStillExists, deleteAndVerify,
              get busy() { return deleteInProgress; } };
   `;
 

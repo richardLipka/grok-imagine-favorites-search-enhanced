@@ -3,6 +3,41 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.77.0] — 2026-09-25
+
+### Added
+
+- **Deleting now checks the library instead of trusting the delete call.** The library view
+  paginates `/rest/assets`; `/rest/media/post/delete` removes a *media post*. Those are separate
+  records, so "the endpoint returned 200" and "the image is gone from the library" are different
+  claims, and only the second is the one that matters. After each delete the item is looked up
+  with `GET /rest/assets/{id}` — 200 means it is still there, 404 that it is gone.
+
+  A row only leaves the local index once the library confirms it is gone. An item that survives
+  is reported as **"N still in library"** and stays visible; a check that cannot reach the server
+  is reported as **"N unverified"** and also stays. Hiding a row locally on an unverified claim is
+  how the index would come to disagree with Grok.
+- **Reindex warns before it starts**, with an estimate based on the current index size and the
+  reason it cannot be hurried: the feed rate-limits about every 31 pages and each one has to be
+  waited out. On a ~23,000 image library that is roughly eight minutes.
+- **The rate-limit wait is configurable** — *Rate wait* in the display row, from 2s to 30s,
+  defaulting to the measured **5s**. Lower values retry inside a window that has not refilled yet;
+  the setting exists because the bucket is Grok's and may not stay the size it is today.
+  **Default** clears it back to 5s.
+
+### Note on deletion
+
+Whether `/rest/media/post/delete` alone removes the image from the library is **not yet settled**.
+Probing showed the endpoint is correctly shaped (404 for an id that cannot exist, 400 for the wrong
+field name), but also that a separate `DELETE /rest/assets/{id}` exists and answers 200, while
+`/rest/assets/delete` answers 501. Settling it needs one real delete, which is destructive and was
+not performed. The verification added here answers the question on the next real delete and reports
+it in the toolbar rather than guessing. If items come back as *still in library*, the fix is to
+capture what Grok's own UI sends when it deletes — the rule in `CLAUDE.md` is to capture a
+destructive request, never to invent one.
+
+---
+
 ## [1.76.1] — 2026-09-25
 
 ### Fixed

@@ -254,6 +254,23 @@ module.exports = {
     t.equal('Retry-After still wins when present', s.retryDelayMs(0, 'retry-after: 12', 429), 12000);
     t.equal('and is capped', s.retryDelayMs(0, 'retry-after: 9000', 429), 60000);
 
+    t.group('the wait is configurable, defaulting to the measured value');
+    // Configurable because the bucket is Grok's and may not stay this size; the default is the
+    // one that cleared every limit across a 390-page walk.
+    s = createIndexSandbox();
+    t.equal('nothing stored means the measured default', s.getRateLimitWaitMs(), 5000);
+    s.setStored('grokSearchRateLimitWaitMs', '8000');
+    t.equal('a stored value is honoured', s.getRateLimitWaitMs(), 8000);
+    t.equal('and drives the first wait', s.retryDelayMs(0, '', 429), 8000);
+    s.setStored('grokSearchRateLimitWaitMs', '50');
+    t.equal('absurdly short is clamped up', s.getRateLimitWaitMs(), 1000);
+    s.setStored('grokSearchRateLimitWaitMs', '999999');
+    t.equal('absurdly long is clamped down', s.getRateLimitWaitMs(), 60000);
+    s.setStored('grokSearchRateLimitWaitMs', 'nonsense');
+    t.equal('garbage falls back to the default', s.getRateLimitWaitMs(), 5000);
+    s.setStored('grokSearchRateLimitWaitMs', '');
+    t.equal('an empty string does too', s.getRateLimitWaitMs(), 5000);
+
     // The decisive one: more consecutive 429s than the general budget allows. Under the old
     // three-retry limit this page was abandoned and the walk stopped short.
     s = createIndexSandbox();

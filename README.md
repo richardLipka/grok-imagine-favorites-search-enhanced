@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 A standalone project by **Richard Lipka**, grown from [IronSniper1's](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) base script and extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, deletion, and much else — see [Credits and origins](#credits-and-origins).
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.user.js` **v1.76.1** · `grokPostSidebar.user.js` **v1.5.0**  
+**Current versions:** `grokSearch.user.js` **v1.77.0** · `grokPostSidebar.user.js` **v1.5.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Credits and origins
@@ -17,7 +17,7 @@ credit.
 |--------|---------|--------------|
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | 2026-03-07 | **The base this repository was forked from.** |
 | [Strapples — Grok Imagine Favorites Search (Greasy Fork)](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) · [GrokImagineSearchandOrganize](https://github.com/Strapples/GrokImagineSearchandOrganize) | 2026-03-20 | A parallel userscript, also forked from IronSniper1. Its author asks that people link back to their GitHub, so it is linked here. |
-| **This repo** | — | Everything since: `grokSearch.user.js` v1.76.1 + `grokPostSidebar.user.js` v1.5.0 |
+| **This repo** | — | Everything since: `grokSearch.user.js` v1.77.0 + `grokPostSidebar.user.js` v1.5.0 |
 
 Earlier versions of this README described the Greasy Fork script as the original and IronSniper1 as
 downstream of it. That was the wrong way round: IronSniper1 came first, and the Greasy Fork script
@@ -150,7 +150,8 @@ Indexing time depends on library size. Leave the tab open until the status finis
 | **Export JSON** | Download full index (schema v5, parents + children) |
 | **Export results** | Export filtered results or selected subset as **JSON** (schema v5) or **CSV** (RFC-4180 table with prompt, model, media URLs, parent/child IDs) |
 | **Verify** | Reconcile the index against the feed — removes posts that are gone and repairs anything a truncated sync missed |
-| **Reindex** | Clear DB and rebuild from API (use after upgrades or bad cache) |
+| **Reindex** | Clear DB and rebuild from API (use after upgrades or bad cache). Warns first with a time estimate — on a ~23,000 image library it takes roughly eight minutes, because Grok rate-limits the feed about every 31 pages and each pause has to be waited out |
+| **Rate wait** | How long to pause when Grok rate-limits the feed during Reindex or Verify. Default **5s**, which is the measured value; lower settings retry inside a window that has not refilled and can truncate the index |
 | **Prune missing** | Probes indexed media for HTTP 404/deleted images and bulk-removes them from local index after user confirmation |
 
 ### Results panel header
@@ -329,6 +330,26 @@ early left behind.
 
 Use **Reindex** only when you want everything rebuilt from scratch; **Verify** is the cheap
 routine option.
+
+### Deleting, and how it is checked
+
+Deleting is permanent, happens on Grok's side, and always asks first. What it does **not** do is
+take the delete endpoint's word for it.
+
+Grok stores these as two different records: the library view you see at `/imagine/saved` is the
+*asset* feed, while the delete call removes a *media post*. So the script looks the item up again
+afterwards and reports what it finds:
+
+| Result | Meaning |
+|--------|---------|
+| `deleted N` | Confirmed gone from the library. Only these rows leave the local index. |
+| `N still in library` | Grok accepted the delete but the image is **still there**. The row is kept so the index does not quietly disagree with Grok. |
+| `N unverified` | The check could not reach the server. Treated as unknown, not as success — the row is kept. |
+| `failed N` | Grok rejected the delete outright. Nothing was removed. |
+
+If you see **still in library**, that is worth reporting: it means the post delete alone is not
+enough and the script needs the request Grok's own UI sends when *it* deletes, which has to be
+captured rather than guessed.
 
 ### Liking from the script
 

@@ -181,5 +181,25 @@ module.exports = {
       && barTemplate.includes('grok-reindex-btn')
       && barTemplate.includes('grok-verify-btn')
       && barTemplate.includes('grok-prune-missing-btn'));
+
+    t.group('reindex warns before it starts');
+    // It clears the cache and walks the whole library, pacing around a rate limit it cannot
+    // outrun. A long quiet stretch with no warning reads as a hang.
+    const srcAll = readSource();
+    const clicks = srcAll.match(/reindexBtn\.addEventListener|addEventListener\('click', async \(\) => \{ if \(await confirmReindex/g) || [];
+    t.ok('every reindex entry point goes through the warning',
+      !/addEventListener\('click', \(\) => reindexDatabase\(\)\)/.test(srcAll),
+      'a reindex button still starts without confirming');
+    t.equal('and both of them do', (srcAll.match(/await confirmReindex\(\)/g) || []).length, 2);
+    const confirmFn = stripComments(sliceBetween(srcAll, '  async function confirmReindex() {', '\n  }\n'));
+    t.ok('the warning names a duration', /minute/.test(confirmFn), confirmFn);
+    t.ok('and explains why it cannot be hurried', /rate-limit/.test(confirmFn), confirmFn);
+
+    t.group('the rate-limit wait is exposed in the UI');
+    t.ok('a control exists', srcAll.includes('grok-rate-wait-select'), 'no wait control');
+    t.ok('it is written to the documented key',
+      /localStorage\.setItem\(RATE_LIMIT_WAIT_KEY/.test(srcAll), 'wait not persisted');
+    t.ok('and Default clears it',
+      /localStorage\.removeItem\(RATE_LIMIT_WAIT_KEY\)/.test(srcAll), 'Default does not reset the wait');
   },
 };

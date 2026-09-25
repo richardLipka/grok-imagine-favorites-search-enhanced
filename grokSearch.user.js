@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.76.1
+// @version      1.77.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -83,6 +83,15 @@
    * answers 404 -- so the shape is known rather than guessed, and nothing real was touched.
    */
   const POST_DELETE = 'https://grok.com/rest/media/post/delete';
+  /**
+   * Single-asset read, used to check a delete actually took.
+   *
+   * The library view is the *asset* feed, not the media-post store, and those are separate
+   * records: `GET /rest/assets/{id}` answers 200 with the asset for a real id and 404 for one
+   * that cannot exist (probed). So "the post is gone" and "the image is gone from the library"
+   * are different questions, and only this one answers the second.
+   */
+  const ASSET_GET = 'https://grok.com/rest/assets/';
 
   /**
    * Liking is **collection membership**, not a post flag.
@@ -137,10 +146,13 @@
    */
   const RATE_LIMIT_RETRY_BASE_MS = 5000;
   const RATE_LIMIT_MAX_RETRIES = 8;
+  /** Bounds for the user-set wait. Below ~2s the bucket has not refilled; above 60s is a hang. */
+  const RATE_LIMIT_WAIT_MIN_MS = 1000;
+  const RATE_LIMIT_WAIT_MAX_MS = 60000;
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.76.1';
+  const SCRIPT_VERSION = '1.77.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -211,6 +223,7 @@
   const BATCH_GROUPS_KEY = 'grokSearchBatchGroups';
   const DEFAULT_BATCH_GROUPS = false;
   const TOGGLE_POS_KEY = 'grokSearchTogglePos';
+  const RATE_LIMIT_WAIT_KEY = 'grokSearchRateLimitWaitMs';
   const SEARCH_BAR_COLLAPSED_KEY = 'grokSearchBarCollapsed';
   const MEDIA_MIN_OPTIONS = [1, 3, 5, 7, 10];
   /** Wait after last keystroke before filtering (ms); capped at 1s. */
@@ -380,10 +393,37 @@
    * is nothing to read off the response: the delay has to come from measurement. Retry-After is
    * still honoured first in case that ever changes.
    */
+  function clampRateLimitWait(ms) {
+    const n = Math.round(Number(ms));
+    if (!Number.isFinite(n) || n <= 0) return RATE_LIMIT_RETRY_BASE_MS;
+    return Math.min(RATE_LIMIT_WAIT_MAX_MS, Math.max(RATE_LIMIT_WAIT_MIN_MS, n));
+  }
+
+  /**
+   * The first-attempt 429 wait, in milliseconds.
+   *
+   * Configurable because the bucket is Grok's and may not stay the size it is today, but the
+   * default is the measured one: five seconds cleared every limit across a 390-page walk. Lower
+   * it and the walk burns attempts inside a window that has not refilled.
+   */
+  function getRateLimitWaitMs() {
+    let stored = null;
+    try {
+      stored = localStorage.getItem(RATE_LIMIT_WAIT_KEY);
+    } catch { /* ignore */ }
+    if (stored === null || stored === '') return RATE_LIMIT_RETRY_BASE_MS;
+    return clampRateLimitWait(stored);
+  }
+
   function retryDelayMs(attempt, headers, status) {
     const after = /retry-after:\s*(\d+)/i.exec(String(headers || ''))?.[1];
     if (after) return Math.min(Number(after) * 1000, 60000);
-    if (status === 429) return Math.min(RATE_LIMIT_RETRY_BASE_MS * (attempt + 1), 30000);
+    if (status === 429) {
+      const base = (typeof getRateLimitWaitMs === 'function')
+        ? getRateLimitWaitMs()
+        : RATE_LIMIT_RETRY_BASE_MS;
+      return Math.min(base * (attempt + 1), RATE_LIMIT_WAIT_MAX_MS);
+    }
     return HTTP_RETRY_BASE_MS * 2 ** attempt;
   }
 
@@ -2485,6 +2525,28 @@
     clearTimeout(syncDebounceTimer);
     const delay = reason === 'navigation' ? 400 : 600;
     syncDebounceTimer = setTimeout(() => runIncrementalSync(reason, options), delay);
+  }
+
+  /**
+   * Reindex throws away the cache and walks the whole library, which is minutes rather than
+   * seconds -- and the walk is deliberately paced around Grok's rate limit, so it cannot be made
+   * much faster. Saying so up front stops a long quiet stretch reading as a hang.
+   */
+  async function confirmReindex() {
+    const known = allPosts.length;
+    const estPages = Math.max(1, Math.ceil((known || 2000) / ASSETS_PAGE_SIZE));
+    const estMinutes = Math.max(1, Math.round((estPages * 0.45 + (estPages / 31) * 5) / 60));
+    const scale = known
+      ? `Your index currently holds ${known.toLocaleString()} images, and the library may be larger.`
+      : 'The whole library is walked from scratch.';
+    return confirmDangerousAction({
+      title: 'Reindex the whole library',
+      message: `${scale} This clears the local cache and re-reads every page from Grok, which `
+        + `takes roughly ${estMinutes} minute${estMinutes === 1 ? '' : 's'} and cannot be hurried: `
+        + 'Grok rate-limits the feed about every 31 pages and the walk has to wait each one out. '
+        + 'Progress is shown in the toolbar, pauses included. Searching still works while it runs.',
+      okLabel: 'Reindex',
+    });
   }
 
   async function reindexDatabase() {
@@ -4895,6 +4957,38 @@
     return res.ok || res.status === 404;
   }
 
+  /**
+   * Is this image still in the library?
+   *
+   * `true` means it is still there, `false` that it is gone, `null` that the check itself did not
+   * get an answer -- which must not be read as either.
+   */
+  async function assetStillExists(id) {
+    if (!id) return null;
+    const res = await gmGetJson(`${ASSET_GET}${encodeURIComponent(id)}`, 'asset check');
+    if (res.ok) return true;
+    if (res.status === 404) return false;
+    return null;
+  }
+
+  /**
+   * Deletes a post and then checks the result against the library.
+   *
+   * Deleting the media post and the image disappearing from `grok.com/imagine/saved` are not the
+   * same event: the library paginates `/rest/assets`, a different store. Accepting the delete
+   * endpoint's own 200 as proof is how the UI could report "deleted" for an image that is still
+   * sitting in the library, so the claim is checked rather than assumed.
+   *
+   * Returns `{ accepted, gone }`. `gone === null` means the verification could not reach the
+   * server, so the row is left alone rather than hidden on an unverified claim.
+   */
+  async function deleteAndVerify(id) {
+    const accepted = await deleteRemotePost(id);
+    if (!accepted) return { accepted: false, gone: false };
+    const still = await assetStillExists(id);
+    return { accepted: true, gone: still === false ? true : (still === null ? null : false) };
+  }
+
   let deleteInProgress = false;
 
   async function deletePosts(posts, { confirmLabel = 'delete' } = {}) {
@@ -4918,20 +5012,34 @@
     const writer = createIndexWriter();
     const goneIds = [];
     let failed = 0;
+    let survived = 0;
+    let unverified = 0;
     try {
       for (let i = 0; i < targets.length; i++) {
         setDownloadStatus(`deleting ${i + 1}/${targets.length}…`, true);
-        if (await deleteRemotePost(targets[i].id)) goneIds.push(targets[i].id);
-        else failed++;
+        const { accepted, gone } = await deleteAndVerify(targets[i].id);
+        if (!accepted) failed++;
+        else if (gone === true) goneIds.push(targets[i].id);
+        else if (gone === false) survived++;
+        else unverified++;
       }
+      // Only rows confirmed gone from the library leave the index. A row that survived the
+      // delete, or whose check never got an answer, stays visible -- hiding it locally would
+      // claim a deletion that did not happen.
       if (goneIds.length) {
         removeRowsById(goneIds, writer);
         await writer.flush();
         applyFilter();
       }
-      setDownloadStatus(failed === 0
-        ? `deleted ${goneIds.length}`
-        : `deleted ${goneIds.length}, failed ${failed}`);
+      const parts = [`deleted ${goneIds.length}`];
+      if (survived) parts.push(`${survived} still in library`);
+      if (unverified) parts.push(`${unverified} unverified`);
+      if (failed) parts.push(`failed ${failed}`);
+      setDownloadStatus(parts.join(', '));
+      if (survived) {
+        console.warn(`[GrokSearch] ${survived} item(s) accepted by ${POST_DELETE} but still present `
+          + 'in the asset feed — the media post is deleted, the library entry is not.');
+      }
     } catch (err) {
       console.error('[GrokSearch] delete failed:', err);
       setDownloadStatus('delete failed');
@@ -4940,7 +5048,7 @@
       syncDownloadSelectedButtons();
     }
     console.log(`[GrokSearch] Deleted ${goneIds.length} of ${targets.length} (${confirmLabel})`);
-    return { deleted: goneIds.length, failed };
+    return { deleted: goneIds.length, failed, survived, unverified };
   }
 
   async function deleteSelectedPosts() {
@@ -6708,6 +6816,11 @@
   }
 
   function applyDisplayDefaults() {
+    try {
+      localStorage.removeItem(RATE_LIMIT_WAIT_KEY);
+    } catch { /* ignore */ }
+    const waitEl = document.getElementById('grok-rate-wait-select');
+    if (waitEl) waitEl.value = String(RATE_LIMIT_RETRY_BASE_MS);
     pageSize = clampPageSize(DEFAULT_PAGE_SIZE);
     gridSizePercent = clampGridSizePercent(DEFAULT_GRID_SIZE_PCT);
     compactGroups = DEFAULT_COMPACT_GROUPS;
@@ -8543,6 +8656,25 @@
       row.appendChild(posCtrl);
     }
 
+    if (!document.getElementById('grok-rate-wait-select')) {
+      const waitCtrl = document.createElement('label');
+      waitCtrl.id = 'grok-rate-wait-label';
+      waitCtrl.className = 'grok-display-control';
+      waitCtrl.title = 'How long to wait when Grok rate-limits the feed during a reindex or verify. '
+        + '5s is the measured default — lower values retry inside a window that has not refilled yet.';
+      waitCtrl.innerHTML = `
+        Rate wait
+        <select id="grok-rate-wait-select" class="grok-display-select">
+          <option value="2000">2s</option>
+          <option value="3000">3s</option>
+          <option value="5000">5s (default)</option>
+          <option value="8000">8s</option>
+          <option value="15000">15s</option>
+          <option value="30000">30s</option>
+        </select>`;
+      row.appendChild(waitCtrl);
+    }
+
     ensureDisplayDefaultButton();
 
     bindDisplayControlListeners();
@@ -8596,6 +8728,20 @@
       batchEl.checked = batchGroups;
       invalidateDisplayEntries();
       batchEl.addEventListener('change', () => applyBatchGroupsSetting(batchEl.checked));
+    }
+
+    const waitEl = document.getElementById('grok-rate-wait-select');
+    if (waitEl && !waitEl.dataset.grokDisplayBound) {
+      waitEl.dataset.grokDisplayBound = '1';
+      waitEl.value = String(getRateLimitWaitMs());
+      // A value outside the offered list (hand-edited storage) would leave the select blank.
+      if (!waitEl.value) waitEl.value = String(RATE_LIMIT_RETRY_BASE_MS);
+      waitEl.addEventListener('change', () => {
+        try {
+          localStorage.setItem(RATE_LIMIT_WAIT_KEY, String(clampRateLimitWait(waitEl.value)));
+        } catch { /* ignore */ }
+        flashStampStatus(`rate-limit wait set to ${Math.round(clampRateLimitWait(waitEl.value) / 1000)}s`);
+      });
     }
 
     const posEl = document.getElementById('grok-toggle-pos-select');
@@ -9341,7 +9487,7 @@
     btn.type = 'button';
     btn.textContent = 'Reindex';
     btn.title = 'Clear cache and reindex from Grok (refreshes child image/video counts)';
-    btn.addEventListener('click', () => reindexDatabase());
+    btn.addEventListener('click', async () => { if (await confirmReindex()) reindexDatabase(); });
     actions.appendChild(btn);
   }
 
@@ -9721,7 +9867,7 @@
     dateStartEl.addEventListener('input', onDateChange);
     dateEndEl.addEventListener('input', onDateChange);
 
-    if (reindexBtn) reindexBtn.addEventListener('click', () => reindexDatabase());
+    if (reindexBtn) reindexBtn.addEventListener('click', async () => { if (await confirmReindex()) reindexDatabase(); });
     if (pruneMissingBtn) pruneMissingBtn.addEventListener('click', () => runPruneMissingMedia({ manual: true }));
     if (exportJsonBtn) exportJsonBtn.addEventListener('click', () => downloadDatabaseJson());
     if (exportResultsBtn) exportResultsBtn.addEventListener('click', () => showExportSubsetDialog());

@@ -126,5 +126,43 @@ module.exports = {
     const like = createLikeSandbox();
     const tpl = { url: 'https://grok.com/custom/like', body: { postId: '' }, idPath: ['postId'] };
     t.equal('templating still works', like.buildLikeRequest(tpl, 'abc', true).body.postId, 'abc');
+
+    t.group('a delete is checked against the library, not just the post store');
+    // The library view paginates /rest/assets, a different store from the media posts that
+    // /rest/media/post/delete removes. Accepting that endpoint's own 200 as proof is how the UI
+    // could report "deleted" for an image still sitting in the library.
+    let d = createDeleteSandbox({ confirm: true });
+    let r = await d.deletePosts([{ id: 'a' }]);
+    t.equal('a post that is gone from the feed counts as deleted', r.deleted, 1);
+    t.equal('and the library was actually asked', d.log.checks, ['a']);
+    t.equal('so the row leaves the index', d.log.removed, ['a']);
+
+    d = createDeleteSandbox({ confirm: true, stillThere: ['a'] });
+    r = await d.deletePosts([{ id: 'a' }]);
+    t.equal('an image the feed still serves is not counted as deleted', r.deleted, 0);
+    t.equal('it is reported as surviving', r.survived, 1);
+    t.equal('and the row stays in the index', d.log.removed, []);
+    t.ok('the status says so', d.log.statuses.some(x => /still in library/.test(x)), d.log.statuses);
+
+    d = createDeleteSandbox({ confirm: true, checkFails: ['a'] });
+    r = await d.deletePosts([{ id: 'a' }]);
+    t.equal('a check that cannot be completed is not called success', r.deleted, 0);
+    t.equal('it is reported as unverified', r.unverified, 1);
+    t.equal('and the row is kept rather than hidden on an unverified claim', d.log.removed, []);
+
+    t.group('a rejected delete is never even checked');
+    d = createDeleteSandbox({ confirm: true, responses: { a: { ok: false, status: 500 } } });
+    r = await d.deletePosts([{ id: 'a' }]);
+    t.equal('it counts as failed', r.failed, 1);
+    t.equal('nothing was removed', d.log.removed, []);
+    t.equal('and no pointless library check was made', d.log.checks, []);
+
+    t.group('a mixed batch is reported honestly');
+    d = createDeleteSandbox({ confirm: true, stillThere: ['b'], checkFails: ['c'] });
+    r = await d.deletePosts([{ id: 'a' }, { id: 'b' }, { id: 'c' }]);
+    t.equal('only the confirmed one is deleted', r.deleted, 1);
+    t.equal('one survived', r.survived, 1);
+    t.equal('one unverified', r.unverified, 1);
+    t.equal('and only the confirmed one left the index', d.log.removed, ['a']);
   },
 };
