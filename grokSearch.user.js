@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.75.1
+// @version      1.75.2
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -134,7 +134,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.75.1';
+  const SCRIPT_VERSION = '1.75.2';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -1752,7 +1752,8 @@
         }
       }
 
-      if (statusEl) setLoadStatus(`verifying… ${remoteIds.size.toLocaleString()}`);
+      pageIndex++;
+      if (statusEl) setLoadStatus(`verifying (legacy feed)… ${remoteIds.size.toLocaleString()} remote found (page ${pageIndex})`);
       cursor = page.nextCursor;
       if (!cursor || posts.length === 0) { complete = true; break; }
       if (seenCursors.has(cursor)) {
@@ -1760,7 +1761,7 @@
         break;
       }
       seenCursors.add(cursor);
-      if (++pageIndex >= FULL_INDEX_MAX_PAGES) {
+      if (pageIndex >= FULL_INDEX_MAX_PAGES) {
         console.warn(`[GrokSearch] Reconcile stopped at ${FULL_INDEX_MAX_PAGES} pages`);
         break;
       }
@@ -1787,7 +1788,7 @@
           if (a?.assetId && isIndexableAsset(a)) remoteIds.add(String(a.assetId));
         }
         assetPages++;
-        if (statusEl) setLoadStatus(`verifying… ${remoteIds.size.toLocaleString()}`);
+        if (statusEl) setLoadStatus(`verifying (asset feed)… ${remoteIds.size.toLocaleString()} remote found (page ${assetPages})`);
         if (!page.nextPageToken || seenAssetTokens.has(page.nextPageToken)) break;
         seenAssetTokens.add(page.nextPageToken);
         assetToken = page.nextPageToken;
@@ -1802,6 +1803,7 @@
     let removed = 0;
     let refusedDelete = 0;
     if (complete) {
+      if (statusEl) setLoadStatus(`verifying… checking ${allPosts.length.toLocaleString()} local images`);
       const stale = allPosts.filter(p => !remoteIds.has(p.id)).map(p => p.id);
       const ratio = allPosts.length ? stale.length / allPosts.length : 0;
       if (stale.length && ratio > RECONCILE_MAX_DELETE_RATIO) {
@@ -1810,7 +1812,8 @@
           `[GrokSearch] Reconcile refused to delete ${stale.length} of ${allPosts.length} rows `
           + `(${Math.round(ratio * 100)}%) — treating as a bad feed response, not mass unliking`
         );
-      } else {
+      } else if (stale.length) {
+        if (statusEl) setLoadStatus(`verifying… removing ${stale.length.toLocaleString()} missing images`);
         removed = removeRowsById(stale, writer);
       }
     }
@@ -1828,7 +1831,7 @@
   function formatReconcileMessage(result) {
     if (!result.ok && result.reason === 'network') return 'verify failed — check connection';
     if (result.reason === 'refused') return 'verify aborted — unexpected feed response';
-    if (!result.ok) return 'verify incomplete';
+    if (!result.ok) return 'verify incomplete — check connection or rate limits';
     const parts = [];
     if (result.added > 0) parts.push(`+${result.added} added`);
     if (result.removed > 0) parts.push(`-${result.removed} removed`);
@@ -1840,7 +1843,10 @@
     reconcileInProgress = true;
     const statusEl = document.getElementById('grok-stamp-status');
     const btn = document.getElementById('grok-verify-btn');
-    if (btn) btn.disabled = true;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Verifying…';
+    }
     try {
       if (!db) db = await openDB();
       if (manual) setLoadStatus('verifying index…');
@@ -1857,7 +1863,10 @@
       return null;
     } finally {
       reconcileInProgress = false;
-      if (btn) btn.disabled = false;
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Verify';
+      }
     }
   }
 
@@ -2028,30 +2037,42 @@
    * `assetId` is the same id space as a media post id, so rows from here merge with rows the old
    * feed produced instead of duplicating them.
    */
-  function gmGetJson(url, label) {
-    return new Promise(resolve => {
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url,
-        headers: { Accept: 'application/json' },
-        withCredentials: true,
-        onload: res => {
-          if (res.status < 200 || res.status >= 300) {
-            console.warn(`[GrokSearch] ${label} HTTP ${res.status}`);
-            resolve({ ok: false, status: res.status });
-            return;
-          }
-          try {
-            resolve({ ok: true, data: JSON.parse(res.responseText) });
-          } catch {
-            console.warn(`[GrokSearch] ${label} response was not JSON`);
-            resolve({ ok: false, status: res.status });
-          }
-        },
-        onerror: () => resolve({ ok: false, status: 0 }),
-        ontimeout: () => resolve({ ok: false, status: 0 }),
+  async function gmGetJson(url, label, { maxRetries = 3 } = {}) {
+    for (let attempt = 0; ; attempt++) {
+      const res = await new Promise(resolve => {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url,
+          headers: { Accept: 'application/json' },
+          withCredentials: true,
+          onload: r => resolve({ status: r.status, text: r.responseText, headers: r.responseHeaders }),
+          onerror: () => resolve({ status: 0, text: '', headers: '' }),
+          ontimeout: () => resolve({ status: 0, text: '', headers: '' }),
+        });
       });
-    });
+      if (res.status >= 200 && res.status < 300) {
+        try {
+          return { ok: true, data: JSON.parse(res.text) };
+        } catch {
+          console.warn(`[GrokSearch] ${label} response was not JSON`);
+          return { ok: false, status: res.status };
+        }
+      }
+      const retryable = (typeof isRetryableStatus === 'function')
+        ? isRetryableStatus(res.status)
+        : [429, 500, 502, 503, 504, 0].includes(res.status);
+      const retriesAllowed = (typeof HTTP_MAX_RETRIES !== 'undefined') ? HTTP_MAX_RETRIES : maxRetries;
+      if (!retryable || attempt >= retriesAllowed) {
+        if (res.status !== 404) console.warn(`[GrokSearch] ${label} HTTP ${res.status}`);
+        return { ok: false, status: res.status };
+      }
+      const wait = (typeof retryDelayMs === 'function')
+        ? retryDelayMs(attempt, res.headers)
+        : Math.min(800 * 2 ** attempt, 30000);
+      console.warn(`[GrokSearch] ${label} HTTP ${res.status} — retrying in ${wait}ms (attempt ${attempt + 1}/${retriesAllowed})`);
+      setLoadStatus(`rate limited — retrying in ${Math.max(1, Math.round(wait / 1000))}s…`);
+      await sleep(wait);
+    }
   }
 
   function buildAssetsUrl(pageToken) {
@@ -2335,7 +2356,13 @@
 
       pages++;
       stalePages = pageNew > 0 ? 0 : stalePages + 1;
-      if (statusEl) setLoadStatus(`${label}… +${added} new, ${updated} updated`);
+      if (statusEl) {
+        if (!stopWhenKnown) {
+          setLoadStatus(`indexing library: ${added.toLocaleString()} images (page ${pages})…`);
+        } else {
+          setLoadStatus(`${label}… +${added} new, ${updated} updated`);
+        }
+      }
       if (stopWhenKnown && stalePages >= ASSETS_SYNC_STALE_PAGES) break;
       if (!page.nextPageToken) break;
       if (seenTokens.has(page.nextPageToken)) {
@@ -2344,7 +2371,8 @@
       }
       seenTokens.add(page.nextPageToken);
       pageToken = page.nextPageToken;
-      await sleep(SYNC_LIST_PAGE_DELAY_MS);
+      const delay = stopWhenKnown ? SYNC_LIST_PAGE_DELAY_MS : Math.max(SYNC_LIST_PAGE_DELAY_MS, 100);
+      await sleep(delay);
     }
 
     if (fresh.length) {
@@ -2432,7 +2460,10 @@
     selectedPostIds.clear();
     matchedPosts = [];
     currentPage = 0;
-    if (reindexBtn) reindexBtn.disabled = true;
+    if (reindexBtn) {
+      reindexBtn.disabled = true;
+      reindexBtn.textContent = 'Reindexing…';
+    }
     showLoadingIndicator('Reindexing saved posts…');
     try {
       if (!db) db = await openDB();
@@ -2440,13 +2471,20 @@
       await resolveMediaSource({ force: true });
       await dbClear();
       setLoadStatus('reindexing…');
-      const count = await fetchFullIndex(statusEl);
+      const result = await fetchFullIndex(statusEl);
+      const count = typeof result === 'object' ? result.count : result;
+      const failed = Boolean(result?.failed);
       loaded = true;
       writeStoredString(INDEX_VERSION_KEY, String(INDEX_SCHEMA_VERSION));
-      console.log(`[GrokSearch] Reindex done: ${count} posts`);
+      console.log(`[GrokSearch] Reindex done: ${count} posts${failed ? ' (incomplete)' : ''}`);
       if (statusEl) {
-        setLoadStatus(`${count.toLocaleString()} reindexed`);
-        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
+        if (failed) {
+          setLoadStatus(`${count.toLocaleString()} reindexed (incomplete — check connection)`);
+          setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 6000);
+        } else {
+          setLoadStatus(`${count.toLocaleString()} reindexed`);
+          setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
+        }
       }
       applyFilter();
     } catch (e) {
@@ -2455,7 +2493,10 @@
     } finally {
       indexing = false;
       hideLoadingIndicator();
-      if (reindexBtn) reindexBtn.disabled = false;
+      if (reindexBtn) {
+        reindexBtn.disabled = false;
+        reindexBtn.textContent = 'Reindex';
+      }
     }
   }
 
@@ -2811,14 +2852,41 @@
       const posts = page.posts;
       for (const post of posts) {
         const parsed = parsePost(post);
-        if (!parsed || knownIds.has(parsed.id)) continue;
-        allFetched.push(addPostRow(stampMetadataRefreshed(normalizePost(parsed))));
-        for (const child of collectChildRecords(post, parsed)) {
+        if (!parsed) continue;
+
+        let parentRow = postById.get(parsed.id);
+        if (!parentRow) {
+          parentRow = addPostRow(stampMetadataRefreshed(normalizePost(parsed)));
+          allFetched.push(parentRow);
+        } else {
+          // Merge legacy child metadata and like state onto row created by asset feed
+          const merged = normalizePost({
+            ...parentRow,
+            ...parsed,
+            isChild: Boolean(parentRow.isChild || parsed.isChild),
+            parentId: parentRow.parentId || parsed.parentId || null,
+            rootId: parentRow.rootId || parsed.rootId || parentRow.parentId || parsed.parentId || null,
+            childPostCount: Math.max(parentRow.childPostCount || 0, parsed.childPostCount || 0),
+            childImageCount: Math.max(parentRow.childImageCount || 0, parsed.childImageCount || 0),
+            childVideoCount: Math.max(parentRow.childVideoCount || 0, parsed.childVideoCount || 0),
+            isLiked: parsed.isLiked ?? parentRow.isLiked ?? null,
+            prompt: parentRow.prompt || parsed.prompt || '',
+          });
+          if (postMetadataChanged(parentRow, merged)) {
+            const updated = updatePostRow(merged);
+            if (updated) allFetched.push(updated);
+          }
+        }
+
+        for (const child of collectChildRecords(post, parentRow || parsed)) {
           if (knownIds.has(child.id)) continue;
           allFetched.push(addPostRow(child));
         }
       }
-      if (statusEl) setLoadStatus(`indexing… ${allFetched.length.toLocaleString()}`);
+      const totalIndexed = assets.added + allFetched.length;
+      if (statusEl) {
+        setLoadStatus(`checking legacy trees: +${allFetched.length.toLocaleString()} items (${totalIndexed.toLocaleString()} total)…`);
+      }
       cursor = page.nextCursor;
       if (!cursor || posts.length === 0) break;
       // A cursor that repeats (or a feed that never terminates) would otherwise loop forever.
@@ -2835,11 +2903,21 @@
     }
     sortAllPostsNewestFirst();
     const chunkSize = 500;
-    for (let i = 0; i < allFetched.length; i += chunkSize) {
-      await dbPutMany(allFetched.slice(i, i + chunkSize));
-      if (statusEl) setLoadStatus(`saving… ${Math.min(i + chunkSize, allFetched.length)}/${allFetched.length}`);
+    if (allFetched.length > 0) {
+      for (let i = 0; i < allFetched.length; i += chunkSize) {
+        await dbPutMany(allFetched.slice(i, i + chunkSize));
+        const savedCount = Math.min(i + chunkSize, allFetched.length);
+        if (statusEl) setLoadStatus(`saving… ${savedCount.toLocaleString()}/${allFetched.length.toLocaleString()}`);
+      }
     }
-    return allFetched.length + assets.added;
+    return {
+      count: allPosts.length,
+      failed: assets.failed,
+      assetCount: assets.added,
+      legacyCount: allFetched.length,
+      valueOf() { return this.count; },
+      toString() { return String(this.count); },
+    };
   }
 
   const DEFAULT_LOADING_MESSAGE = 'Loading saved posts…';
@@ -3000,13 +3078,20 @@
         }
       } else {
         setLoadStatus('first-time indexing…');
-        const count = await fetchFullIndex(statusEl);
+        const result = await fetchFullIndex(statusEl);
+        const count = typeof result === 'object' ? result.count : result;
+        const failed = Boolean(result?.failed);
         loaded = true;
         writeStoredString(INDEX_VERSION_KEY, String(INDEX_SCHEMA_VERSION));
-        console.log(`[GrokSearch] Full index done: ${count} posts`);
+        console.log(`[GrokSearch] Full index done: ${count} posts${failed ? ' (incomplete)' : ''}`);
         if (statusEl) {
-          setLoadStatus(`${count.toLocaleString()} indexed`);
-          setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
+          if (failed) {
+            setLoadStatus(`${count.toLocaleString()} indexed (incomplete)`);
+            setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 6000);
+          } else {
+            setLoadStatus(`${count.toLocaleString()} indexed`);
+            setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
+          }
         }
       }
     } catch (e) {

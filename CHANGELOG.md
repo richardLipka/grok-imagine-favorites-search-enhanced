@@ -3,6 +3,34 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.75.2] — 2026-09-25
+
+### Fixed
+
+- **Reindexing prematurely stopping after ~2,000 images.**
+  - `gmGetJson` lacked exponential backoff retry. Rapid pagination through `/rest/assets` (60 items/page at 40ms intervals) hit Grok's rate limits after ~33 pages (1,980–2,040 images). `gmGetJson` now retries up to 3 times on HTTP 429, 5xx, or network timeouts, respecting the `Retry-After` header when sent.
+  - Paced the delay between pages during full reindexing (`Math.max(SYNC_LIST_PAGE_DELAY_MS, 100)`) to 100ms, preventing burst rate-limiting while maintaining fast library walks.
+  - In `fetchFullIndex()`, the legacy list pass previously skipped any post whose ID was already known (`knownIds.has(parsed.id)`). Because the asset feed ran first, this skipped all parents and dropped all of their child trees (`childPosts`). The legacy pass now enriches existing parent rows with child counts and like status, and always collects child records regardless of parent existence.
+  - Surfaced walk failures: if an asset walk encounters an unrecoverable failure or rate limit exhaustion, `fetchFullIndex()` reports it as incomplete rather than silently declaring success.
+
+### Changed
+
+- **Clear Progress Reporting During Reindexing and Verification:**
+  - **Reindexing progress:** Replaced generic counters with informative stage indicators:
+    - Asset feed: `indexing library: N images (page P)…`
+    - Legacy trees: `checking legacy trees: +N items (M total)…`
+    - Rate limits: `rate limited — retrying in Xs…`
+    - Saving: `saving… N/M`
+    - Button text reflects state (`Reindexing…` while running).
+  - **Verification progress:** Step-by-step progress tracking for both feeds:
+    - Legacy feed: `verifying (legacy feed)… N remote found (page P)`
+    - Asset feed: `verifying (asset feed)… N remote found (page P)`
+    - Comparison: `verifying… checking N local images`
+    - Removal: `verifying… removing N missing images`
+    - Button text reflects state (`Verifying…` while running).
+
+---
+
 ## [1.75.1] — 2026-09-25
 
 ### Fixed

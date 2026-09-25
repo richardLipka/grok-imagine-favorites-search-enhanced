@@ -98,7 +98,10 @@ function createIndexSandbox() {
       const i = token ? Number(token) : 0;
       const page = assetPages[i];
       queueMicrotask(() => {
-        if (page && page.fail) { opts.onload({ status: 500, responseText: '' }); return; }
+        if (page && (page.fail || (page.failAttempts && page.failAttempts-- > 0))) {
+          opts.onload({ status: page.status || 500, responseText: '' });
+          return;
+        }
         opts.onload({ status: 200, responseText: JSON.stringify({
           assets: page ? page.assets : [],
           nextPageToken: page && i + 1 < assetPages.length ? String(i + 1) : null,

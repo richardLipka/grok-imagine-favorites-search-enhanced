@@ -224,6 +224,20 @@ module.exports = {
     t.equal('the failure is surfaced', res.failed, true);
     t.equal('what was read is still kept', res.added, 1);
 
+    t.group('transient rate limits (429) are retried and walk continues');
+    s = createIndexSandbox();
+    s.setAssetPages([
+      { assets: [asset('a1')] },
+      { failAttempts: 2, status: 429, assets: [asset('a2')] },
+      { assets: [asset('a3')] },
+    ]);
+    res = await s.syncAssetsFeed(null, { stopWhenKnown: false });
+    t.equal('all 3 pages walked successfully despite 429', res.pages, 3);
+    t.equal('all 3 assets added', res.added, 3);
+    t.equal('no failure reported', res.failed, false);
+    t.ok('retried page row exists', s.postById.has('a2'));
+    t.ok('subsequent page row exists', s.postById.has('a3'));
+
     t.group('merging onto a row the old feed created');
     s = createIndexSandbox();
     s.addPostRow(s.normalizePost({
