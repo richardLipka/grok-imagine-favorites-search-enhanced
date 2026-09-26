@@ -4,6 +4,41 @@ All notable changes are documented here.
 Versions match the `@version` in each userscript header. Changes that do not alter what users
 install — tests, docs, tooling — sit under **Unreleased** and get no version or tag.
 
+## [1.78.0] — 2026-09-26
+
+### Added
+
+- **Tags, backed by Grok's own collections.** The chips in Grok's UI — *Liked*, and whatever you
+  have made — are collections, the same mechanism the heart uses. The script now reads, applies
+  and manages them, so a tag added here shows up in Grok and vice versa.
+  - **In the lightbox**, under the prompt: a chip per tag the image carries, each removable, plus
+    a picker to add an existing tag or create one on the spot.
+  - **A Tag filter** in the toolbar, shown once the account has at least one tag besides *Liked*.
+  - **A Tags manager** (toolbar button) to create, rename and delete tags, with a count of how
+    many images each holds, and to apply a tag to the whole current selection at once.
+  - *Liked* is deliberately not offered as a tag: it has its own control, and letting it be
+    renamed or deleted from here would break the heart.
+
+  Every field name was probed rather than guessed, the same way the delete endpoint was:
+  `collection/create` takes `{name}`, `update` and `delete` take `{id}` (a `collectionId` gets a
+  400), and `collection/assets/list` takes `{collectionId, limit}`. The whole lifecycle — create,
+  add, read back, rename, remove, delete — was then run end to end against the live API on a
+  throwaway tag, which was cleaned up afterwards.
+
+  As with liking, a 200 is not taken as proof: the collection endpoints report `addedCount` and
+  `removedCount`, so a silent no-op is reported as "already tagged" rather than as a change. A
+  membership read that only partly succeeds is **not** cached as final, or a tag whose members
+  failed to load would look empty for the rest of the session.
+
+### Changed
+
+- **Deleting from the lightbox moves to the next image instead of closing it.** `applyFilter()`
+  has already dropped the deleted row, so the next image has slid into that index — which is what
+  you want when clearing out a run of them. The last image in the set steps back one, and an empty
+  set closes the lightbox.
+
+---
+
 ## Unreleased
 
 ### Documentation

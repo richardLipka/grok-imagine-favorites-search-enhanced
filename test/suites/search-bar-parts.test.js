@@ -129,6 +129,8 @@ module.exports = {
       ['ensureVerifyButton', 'Verify'],
       ['ensureReindexButton', 'Reindex'],
       ['ensurePruneMissingButton', 'Prune missing'],
+      ['ensureTagsButton', 'Tags'],
+      ['ensureTagFilterSelect', 'Tag filter'],
       ['ensureExportJsonButton', 'Export JSON'],
       ['ensureExportResultsButton', 'Export results'],
       ['ensureLikedFilterCheckbox', 'Liked only'],

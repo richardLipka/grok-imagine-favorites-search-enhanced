@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.77.1
+// @version      1.78.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -106,6 +106,25 @@
   const COLLECTION_ADD = 'https://grok.com/rest/media/collection/assets/add';
   const COLLECTION_REMOVE = 'https://grok.com/rest/media/collection/assets/remove';
   const LIKED_COLLECTION_KEY = 'grokSearchLikedCollectionId';
+  /**
+   * Tags are Grok's **collections**, the same mechanism the heart uses.
+   *
+   * Every field name below was probed rather than guessed, the same way the delete endpoint was:
+   * a bogus UUID gets past validation and answers 404 when the field is right, and 400 when it is
+   * not. `create` takes `{name}`, `update` and `delete` take `{id}` (not `collectionId`), while
+   * `assets/list` takes `{collectionId, limit}` and answers `{items: [{assetId, mimeType,
+   * addTime}]}`. `assets/add` and `assets/remove` are already used by liking.
+   *
+   * The default collection is "Liked" and is deliberately excluded from the tag UI: it has its own
+   * control, and letting it be renamed or deleted from here would break the heart.
+   */
+  const COLLECTION_CREATE = 'https://grok.com/rest/media/collection/create';
+  const COLLECTION_UPDATE = 'https://grok.com/rest/media/collection/update';
+  const COLLECTION_DELETE = 'https://grok.com/rest/media/collection/delete';
+  const COLLECTION_ASSETS_LIST = 'https://grok.com/rest/media/collection/assets/list';
+  const COLLECTION_ASSETS_PAGE = 500;
+  const TAG_NAME_MAX = 60;
+  const FILTER_TAG_KEY = 'grokSearchFilterTag';
   /** Liked-list pages to walk for metadata (40 posts/page; includes childPosts). */
   const SYNC_LIST_REFRESH_PAGES = 4;
   const SYNC_LIST_PAGE_DELAY_MS = 40;
@@ -159,7 +178,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.77.1';
+  const SCRIPT_VERSION = '1.78.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -263,6 +282,14 @@
   let filterMinChildren = 1;
   let filterModel = '';
   let filterLikedOnly = false;
+  /** Tag id being filtered to, '' for none. See applyFilter(). */
+  let filterTagId = '';
+  /** Collections that are not the default "Liked" one: [{ id, name }], name-sorted. */
+  let tagList = [];
+  /** assetId -> Set of tag ids. Rebuilt by loadTags(); empty until then. */
+  let tagsByAsset = new Map();
+  let tagsLoaded = false;
+  let tagsLoading = null;
   /** Resolved liked-feed source; null means "send no source filter". */
   let mediaSource = MEDIA_SOURCE_LIKED;
   let mediaSourceResolved = false;
@@ -1291,6 +1318,142 @@
     if (!res.ok) return { ok: false, status: res.status ?? 0 };
     const touched = Number(liked ? res.data?.addedCount : res.data?.removedCount);
     return { ok: true, status: 200, changed: Number.isFinite(touched) ? touched > 0 : true };
+  }
+
+  // ─── Tags (Grok collections) ───────────────────────────────────────────────
+  function normalizeTagName(name) {
+    return String(name || '').replace(/\s+/g, ' ').trim().slice(0, TAG_NAME_MAX);
+  }
+
+  function getTagById(id) {
+    return tagList.find(t => t.id === id) || null;
+  }
+
+  function tagIdsForAsset(id) {
+    return tagsByAsset.get(String(id)) || null;
+  }
+
+  /**
+   * Reads every collection and its membership, so the UI can show what an image is already
+   * tagged with rather than only offering to add.
+   *
+   * Membership is read per collection because that is the only listing Grok exposes; there is no
+   * "which collections is this asset in" call. For the handful of collections an account has that
+   * is a few requests, and the result is cached until something changes it.
+   */
+  async function loadTags({ force = false } = {}) {
+    if (tagsLoaded && !force) return true;
+    if (tagsLoading) return tagsLoading;
+    tagsLoading = (async () => {
+      const res = await postJsonWithRetry(COLLECTION_LIST, { limit: 100 }, 'collections');
+      if (!res.ok) return false;
+      const all = Array.isArray(res.data?.collections) ? res.data.collections : [];
+      const liked = pickLikedCollection(all);
+      tagList = all
+        .filter(c => c?.id && (!liked || c.id !== liked.id))
+        .map(c => ({ id: String(c.id), name: normalizeTagName(c.name) || '(unnamed)' }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      const map = new Map();
+      let complete = true;
+      for (const tag of tagList) {
+        const page = await postJsonWithRetry(
+          COLLECTION_ASSETS_LIST, { collectionId: tag.id, limit: COLLECTION_ASSETS_PAGE }, 'tag members');
+        if (!page.ok) { complete = false; continue; }
+        for (const item of (page.data?.items || [])) {
+          const assetId = String(item?.assetId || '');
+          if (!assetId) continue;
+          if (!map.has(assetId)) map.set(assetId, new Set());
+          map.get(assetId).add(tag.id);
+        }
+      }
+      tagsByAsset = map;
+      // A partial read is still better than none for display, but it must not be cached as final
+      // or a tag that failed to load would look empty for the rest of the session.
+      tagsLoaded = complete;
+      return complete;
+    })();
+    try {
+      return await tagsLoading;
+    } finally {
+      tagsLoading = null;
+    }
+  }
+
+  function rememberTagMembership(assetId, tagId, member) {
+    const key = String(assetId);
+    if (!tagsByAsset.has(key)) tagsByAsset.set(key, new Set());
+    const set = tagsByAsset.get(key);
+    if (member) set.add(tagId);
+    else set.delete(tagId);
+    if (!set.size) tagsByAsset.delete(key);
+  }
+
+  /**
+   * Adds or removes a tag, and reports whether the server said it actually changed anything.
+   *
+   * The collection endpoints report `addedCount` / `removedCount`, which is what makes a silent
+   * no-op detectable -- the same signal the heart relies on after `media/post/like` turned out to
+   * answer 200 and do nothing.
+   */
+  async function setAssetTag(assetId, tagId, member) {
+    if (!assetId || !tagId) return { ok: false, changed: false };
+    const res = await postJsonWithRetry(
+      member ? COLLECTION_ADD : COLLECTION_REMOVE,
+      { collectionId: tagId, assetIds: [String(assetId)] },
+      member ? 'tag add' : 'tag remove');
+    if (!res.ok) return { ok: false, changed: false, status: res.status };
+    const touched = Number(member ? res.data?.addedCount : res.data?.removedCount);
+    if (res.ok) rememberTagMembership(assetId, tagId, member);
+    return { ok: true, changed: Number.isFinite(touched) ? touched > 0 : true };
+  }
+
+  async function createTag(name) {
+    const clean = normalizeTagName(name);
+    if (!clean) return { ok: false, reason: 'empty' };
+    if (tagList.some(t => t.name.toLowerCase() === clean.toLowerCase())) {
+      return { ok: false, reason: 'duplicate' };
+    }
+    const res = await postJsonWithRetry(COLLECTION_CREATE, { name: clean }, 'tag create');
+    if (!res.ok) return { ok: false, reason: 'request', status: res.status };
+    const id = String(res.data?.collection?.id || res.data?.id || '');
+    if (!id) {
+      // The tag may well have been created; re-reading is the only way to find out, and is
+      // cheaper than leaving the list wrong.
+      await loadTags({ force: true });
+      const found = tagList.find(t => t.name.toLowerCase() === clean.toLowerCase());
+      return found ? { ok: true, tag: found } : { ok: false, reason: 'no-id' };
+    }
+    const tag = { id, name: clean };
+    tagList = [...tagList, tag].sort((a, b) => a.name.localeCompare(b.name));
+    return { ok: true, tag };
+  }
+
+  async function renameTag(id, name) {
+    const clean = normalizeTagName(name);
+    if (!clean) return { ok: false, reason: 'empty' };
+    const res = await postJsonWithRetry(COLLECTION_UPDATE, { id, name: clean }, 'tag rename');
+    if (!res.ok) return { ok: false, reason: 'request', status: res.status };
+    const tag = getTagById(id);
+    if (tag) tag.name = clean;
+    tagList = [...tagList].sort((a, b) => a.name.localeCompare(b.name));
+    return { ok: true };
+  }
+
+  /** Deletes the collection itself. The images in it are untouched -- only the grouping goes. */
+  async function deleteTag(id) {
+    const res = await postJsonWithRetry(COLLECTION_DELETE, { id }, 'tag delete');
+    if (!res.ok && res.status !== 404) return { ok: false, status: res.status };
+    tagList = tagList.filter(t => t.id !== id);
+    for (const [assetId, set] of tagsByAsset) {
+      set.delete(id);
+      if (!set.size) tagsByAsset.delete(assetId);
+    }
+    if (filterTagId === id) {
+      filterTagId = '';
+      writeStoredString(FILTER_TAG_KEY, '');
+    }
+    return { ok: true };
   }
 
   /** Optimistic toggle: flips the row, reverts if the request fails. */
@@ -5284,6 +5447,108 @@
     ensureLightboxDeleteButton(lb);
     ensureLightboxChildRow(lb);
     ensureLightboxSidebar(lb);
+    ensureLightboxTagRow(lb);
+  }
+
+  /**
+   * The tag editor under the prompt: one chip per tag the image already has, plus a control to
+   * add another. Built here rather than in the lightbox template for the reason the child row is
+   * -- this function guards on the row existing and binds its listener at the same time, so a
+   * copy in the template would exist with nothing listening on it.
+   */
+  function ensureLightboxTagRow(lb) {
+    const meta = lb?.querySelector('.grok-lightbox-meta');
+    if (!meta || document.getElementById('grok-lightbox-tags')) return;
+    const row = document.createElement('div');
+    row.id = 'grok-lightbox-tags';
+    row.className = 'grok-lightbox-tags';
+    row.innerHTML = `
+      <span class="grok-lightbox-tags-label">Tags</span>
+      <span class="grok-lightbox-tag-chips"></span>
+      <select class="grok-lightbox-tag-add grok-display-select" aria-label="Add a tag to this image"></select>`;
+    meta.appendChild(row);
+
+    row.addEventListener('click', async e => {
+      const chip = e.target.closest('.grok-lightbox-tag-chip-remove');
+      if (!chip) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const post = getCurrentLightboxPost();
+      const tagId = chip.dataset.tagId;
+      if (!post || !tagId) return;
+      chip.disabled = true;
+      const res = await setAssetTag(post.id, tagId, false);
+      if (!res.ok) flashStampStatus('tag removal failed');
+      renderLightboxTagRow(post);
+      if (filterTagId) applyFilter();
+    });
+
+    row.querySelector('.grok-lightbox-tag-add')?.addEventListener('change', async e => {
+      const sel = e.target;
+      const value = sel.value;
+      sel.value = '';
+      const post = getCurrentLightboxPost();
+      if (!post || !value) return;
+      sel.disabled = true;
+      try {
+        let tagId = value;
+        if (value === '__new__') {
+          const name = prompt('New tag name:');
+          if (!name) return;
+          const made = await createTag(name);
+          if (!made.ok) {
+            flashStampStatus(made.reason === 'duplicate' ? 'tag already exists' : 'could not create tag');
+            return;
+          }
+          tagId = made.tag.id;
+        }
+        const res = await setAssetTag(post.id, tagId, true);
+        if (!res.ok) flashStampStatus('tagging failed');
+        else if (res.changed === false) flashStampStatus('already tagged');
+      } finally {
+        sel.disabled = false;
+        renderLightboxTagRow(post);
+        syncTagFilterOptions();
+        if (filterTagId) applyFilter();
+      }
+    });
+  }
+
+  function renderLightboxTagRow(post) {
+    const row = document.getElementById('grok-lightbox-tags');
+    if (!row) return;
+    const chips = row.querySelector('.grok-lightbox-tag-chips');
+    const add = row.querySelector('.grok-lightbox-tag-add');
+    if (!post) { row.hidden = true; return; }
+    row.hidden = false;
+
+    const mine = tagIdsForAsset(post.id);
+    const current = tagList.filter(t => mine && mine.has(t.id));
+    if (chips) {
+      const html = current.length
+        ? current.map(t => `
+            <span class="grok-lightbox-tag-chip">${escapeHtml(t.name)}<button type="button"
+              class="grok-lightbox-tag-chip-remove" data-tag-id="${escapeHtml(t.id)}"
+              aria-label="Remove tag ${escapeHtml(t.name)}" title="Remove this tag">\u00d7</button></span>`).join('')
+        : `<span class="grok-lightbox-tags-empty">${tagsLoaded ? 'none' : 'loading\u2026'}</span>`;
+      if (chips.dataset.sig !== html) { chips.dataset.sig = html; chips.innerHTML = html; }
+    }
+    if (add) {
+      const available = tagList.filter(t => !mine || !mine.has(t.id));
+      const html = '<option value="">+ tag</option>'
+        + available.map(t => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.name)}</option>`).join('')
+        + '<option value="__new__">New tag\u2026</option>';
+      if (add.dataset.sig !== html) { add.dataset.sig = html; add.innerHTML = html; }
+      add.value = '';
+    }
+  }
+
+  function ensureLightboxTagRowLoaded() {
+    if (tagsLoaded || tagsLoading) return;
+    loadTags().then(() => {
+      renderLightboxTagRow(getCurrentLightboxPost());
+      syncTagFilterOptions();
+    });
   }
 
   /**
@@ -5454,10 +5719,31 @@
       btn.disabled = true;
       const res = await deleteSinglePost(post);
       btn.disabled = false;
-      // The row is gone from matchedPosts, so staying open would show the next item under the
-      // old index. Closing is the honest outcome.
-      if (res.deleted > 0) closeResultLightbox();
+      if (res.deleted > 0) advanceLightboxAfterDelete();
     });
+  }
+
+  /**
+   * Where the lightbox goes once the item it was showing has been deleted.
+   *
+   * applyFilter() has already rebuilt `matchedPosts` without that row, so the *next* item has
+   * slid into the index the deleted one occupied -- staying put shows it, which is what someone
+   * clearing out a run of images wants. Only the last item in the set has nowhere to go: there
+   * the index is clamped back one, and an empty set closes the lightbox.
+   */
+  function advanceLightboxAfterDelete() {
+    if (!matchedPosts.length) {
+      closeResultLightbox();
+      return;
+    }
+    if (lightboxIndex >= matchedPosts.length) lightboxIndex = matchedPosts.length - 1;
+    if (lightboxIndex < 0) lightboxIndex = 0;
+    lightboxActivePost = matchedPosts[lightboxIndex] || null;
+    if (!lightboxActivePost) {
+      closeResultLightbox();
+      return;
+    }
+    renderResultLightbox();
   }
 
   function ensureLightboxLikeButton(lb) {
@@ -5665,6 +5951,8 @@
     }
 
     renderLightboxChildRow(post);
+    renderLightboxTagRow(post);
+    ensureLightboxTagRowLoaded();
     renderLightboxRelatedSidebar(post);
     syncLightboxLikeButton();
     if (prevBtn) prevBtn.disabled = lightboxIndex <= 0;
@@ -6090,6 +6378,7 @@
       if (dateBounds && !matchesDateBounds(post, dateBounds)) return false;
       if (!matchesModelFilter(post)) return false;
       if (!matchesLikedFilter(post)) return false;
+      if (!matchesTagFilter(post)) return false;
       if (!matchesVideoFilters(post)) return false;
       if (filterOnlyChildren && (post.childPostCount ?? 0) < filterMinChildren) return false;
       if (terms.length > 0) {
@@ -8433,6 +8722,73 @@
         gap: 8px;
         flex-shrink: 0;
       }
+      /* Tags. The chips sit under the prompt with the child links, so they share its rhythm. */
+      .grok-lightbox-tags {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 9px;
+      }
+      .grok-lightbox-tags-label,
+      .grok-lightbox-tags-empty {
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.62);
+      }
+      .grok-lightbox-tag-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        min-height: 24px;
+        padding: 2px 4px 2px 9px;
+        border-radius: 999px;
+        border: 1px solid rgba(139, 92, 246, 0.5);
+        background: rgba(139, 92, 246, 0.2);
+        color: #ede9fe;
+        font-size: 11px;
+        white-space: nowrap;
+      }
+      .grok-lightbox-tag-chip-remove {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        padding: 0;
+        border: none;
+        border-radius: 50%;
+        background: rgba(0, 0, 0, 0.3);
+        color: inherit;
+        font-size: 13px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .grok-lightbox-tag-chip-remove:hover { background: rgba(239, 68, 68, 0.7); color: #fff; }
+      .grok-tag-manager-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        max-height: 40vh;
+        overflow-y: auto;
+        margin: 10px 0;
+      }
+      .grok-tag-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 6px;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.05);
+      }
+      .grok-tag-row-name { flex: 1; min-width: 0; font-size: 12px; color: rgba(255,255,255,0.9);
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .grok-tag-row-count {
+        font-size: 11px; color: rgba(255,255,255,0.62); font-variant-numeric: tabular-nums;
+        min-width: 3em; text-align: right;
+      }
+      .grok-tag-empty { font-size: 12px; color: rgba(255,255,255,0.62); padding: 8px 2px; }
+      .grok-tag-manager-new { display: flex; gap: 8px; align-items: center; }
+      .grok-tag-new-input { width: auto; flex: 1; text-align: left; }
       .grok-lightbox-kids {
         display: flex;
         align-items: center;
@@ -8890,6 +9246,62 @@
       if (m) models.add(m);
     }
     return [...models].sort((a, b) => a.localeCompare(b));
+  }
+
+  /**
+   * Tag membership is keyed on the asset id, and a child row is its own asset, so this asks about
+   * the row itself rather than its parent. An unloaded tag map matches nothing rather than
+   * everything -- showing the whole library under a tag filter would be the wrong way to fail.
+   */
+  function matchesTagFilter(post) {
+    if (!filterTagId) return true;
+    const mine = tagIdsForAsset(post.id);
+    return Boolean(mine && mine.has(filterTagId));
+  }
+
+  function syncTagFilterOptions() {
+    const sel = document.getElementById('grok-filter-tag');
+    if (!sel) return;
+    const label = document.getElementById('grok-filter-tag-label');
+    // Nothing to filter by until the account has at least one collection besides "Liked".
+    if (label) label.hidden = tagList.length === 0;
+    const html = '<option value="">All tags</option>'
+      + tagList.map(t => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.name)}</option>`).join('');
+    if (sel.dataset.sig !== html) {
+      sel.dataset.sig = html;
+      sel.innerHTML = html;
+    }
+    if (filterTagId && !getTagById(filterTagId)) filterTagId = '';
+    sel.value = filterTagId;
+  }
+
+  function ensureTagFilterSelect() {
+    if (document.getElementById('grok-filter-tag')) {
+      syncTagFilterOptions();
+      return;
+    }
+    const filters = getFiltersRow();
+    if (!filters) return;
+    const label = document.createElement('label');
+    label.id = 'grok-filter-tag-label';
+    label.className = 'grok-filter-check-label';
+    label.title = 'Show only images carrying this Grok tag (collection)';
+    label.hidden = true;
+    label.innerHTML = 'Tag <select id="grok-filter-tag" class="grok-display-select" aria-label="Filter by tag"></select>';
+    filters.appendChild(label);
+
+    filterTagId = readStoredString(FILTER_TAG_KEY, '');
+    syncTagFilterOptions();
+    label.querySelector('#grok-filter-tag').addEventListener('change', e => {
+      filterTagId = e.target.value;
+      writeStoredString(FILTER_TAG_KEY, filterTagId);
+      currentPage = 0;
+      updateClearButton();
+      applyFilter();
+    });
+    // The filter is useless until membership is known, so it loads itself rather than waiting for
+    // someone to open the lightbox.
+    loadTags().then(() => { syncTagFilterOptions(); if (filterTagId) applyFilter(); });
   }
 
   function ensureLikedFilterCheckbox() {
@@ -9523,6 +9935,185 @@
     actions.appendChild(btn);
   }
 
+  /**
+   * Tag manager: rename or delete a tag, and tag everything currently selected.
+   *
+   * Deleting a tag removes the grouping, never the images -- worth saying in the dialog, because
+   * "delete" next to a list of pictures reads the other way.
+   */
+  function ensureTagsButton() {
+    if (document.getElementById('grok-tags-btn')) return;
+    const actions = getActionsRow();
+    if (!actions) return;
+    const btn = document.createElement('button');
+    btn.id = 'grok-tags-btn';
+    btn.className = 'grok-toolbar-btn';
+    btn.type = 'button';
+    btn.textContent = 'Tags';
+    btn.title = 'Create, rename and delete Grok tags, and tag the current selection';
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      await loadTags({ force: true });
+      btn.disabled = false;
+      openTagManager();
+    });
+    actions.appendChild(btn);
+  }
+
+  function ensureTagManagerDialog() {
+    let dlg = document.getElementById('grok-tag-manager');
+    if (dlg) return dlg;
+    dlg = document.createElement('div');
+    dlg.id = 'grok-tag-manager';
+    dlg.className = 'grok-bulk-download-confirm';
+    dlg.hidden = true;
+    dlg.innerHTML = `
+      <div class="grok-bulk-download-confirm-backdrop" data-grok-tag-close></div>
+      <div class="grok-bulk-download-confirm-panel" role="dialog" aria-modal="true" aria-label="Manage tags">
+        <div class="grok-bulk-download-confirm-title">Tags</div>
+        <p class="grok-bulk-download-confirm-message" id="grok-tag-manager-note"></p>
+        <div id="grok-tag-manager-list" class="grok-tag-manager-list"></div>
+        <div class="grok-tag-manager-new">
+          <input type="text" id="grok-tag-new-name" class="grok-page-jump grok-tag-new-input"
+                 placeholder="New tag name" aria-label="New tag name" maxlength="60" />
+          <button type="button" class="grok-toolbar-btn" id="grok-tag-create">Create</button>
+        </div>
+        <div class="grok-bulk-download-confirm-actions">
+          <button type="button" class="grok-toolbar-btn" id="grok-tag-apply-selection"></button>
+          <button type="button" class="grok-toolbar-btn" data-grok-tag-close>Close</button>
+        </div>
+      </div>`;
+    document.body.appendChild(dlg);
+
+    dlg.querySelectorAll('[data-grok-tag-close]').forEach(el => {
+      el.addEventListener('click', e => { e.preventDefault(); closeTagManager(); });
+    });
+    document.addEventListener('keydown', e => {
+      const open = document.getElementById('grok-tag-manager');
+      if (open && !open.hidden && e.key === 'Escape') { e.preventDefault(); closeTagManager(); }
+    });
+
+    dlg.querySelector('#grok-tag-create').addEventListener('click', async () => {
+      const input = document.getElementById('grok-tag-new-name');
+      const res = await createTag(input.value);
+      if (!res.ok) {
+        flashStampStatus(res.reason === 'duplicate' ? 'tag already exists' : 'could not create tag');
+        return;
+      }
+      input.value = '';
+      renderTagManager();
+      syncTagFilterOptions();
+    });
+
+    dlg.querySelector('#grok-tag-manager-list').addEventListener('click', async e => {
+      const row = e.target.closest('[data-tag-id]');
+      if (!row) return;
+      const id = row.dataset.tagId;
+      const tag = getTagById(id);
+      if (!tag) return;
+      if (e.target.closest('.grok-tag-rename')) {
+        const name = prompt('Rename tag:', tag.name);
+        if (!name || normalizeTagName(name) === tag.name) return;
+        const res = await renameTag(id, name);
+        if (!res.ok) flashStampStatus('rename failed');
+        renderTagManager();
+        syncTagFilterOptions();
+      } else if (e.target.closest('.grok-tag-delete')) {
+        const ok = await confirmDangerousAction({
+          title: `Delete the tag "${tag.name}"`,
+          message: 'This removes the tag from your Grok account. The images that carry it are '
+            + 'not deleted and stay in your library — only the grouping goes.',
+          okLabel: 'Delete tag',
+        });
+        if (!ok) return;
+        const res = await deleteTag(id);
+        if (!res.ok) flashStampStatus('could not delete tag');
+        renderTagManager();
+        syncTagFilterOptions();
+        applyFilter();
+      }
+    });
+
+    dlg.querySelector('#grok-tag-apply-selection').addEventListener('click', async () => {
+      const posts = getSelectedPostsInOrder();
+      if (!posts.length) { flashStampStatus('nothing selected'); return; }
+      const sel = document.getElementById('grok-tag-apply-target');
+      const tagId = sel?.value;
+      if (!tagId) { flashStampStatus('pick a tag first'); return; }
+      const tag = getTagById(tagId);
+      const btn = document.getElementById('grok-tag-apply-selection');
+      btn.disabled = true;
+      let done = 0, failed = 0;
+      for (const p of posts) {
+        const res = await setAssetTag(p.id, tagId, true);
+        if (res.ok) done++; else failed++;
+        setDownloadStatus(`tagging ${done + failed}/${posts.length}…`, true);
+      }
+      btn.disabled = false;
+      setDownloadStatus(failed
+        ? `tagged ${done}, failed ${failed}`
+        : `tagged ${done} as "${tag ? tag.name : 'tag'}"`);
+      renderTagManager();
+      if (filterTagId) applyFilter();
+    });
+    return dlg;
+  }
+
+  function renderTagManager() {
+    const list = document.getElementById('grok-tag-manager-list');
+    const note = document.getElementById('grok-tag-manager-note');
+    const apply = document.getElementById('grok-tag-apply-selection');
+    if (!list) return;
+    const counts = new Map();
+    for (const set of tagsByAsset.values()) {
+      for (const id of set) counts.set(id, (counts.get(id) || 0) + 1);
+    }
+    list.innerHTML = tagList.length
+      ? tagList.map(t => `
+          <div class="grok-tag-row" data-tag-id="${escapeHtml(t.id)}">
+            <span class="grok-tag-row-name">${escapeHtml(t.name)}</span>
+            <span class="grok-tag-row-count">${(counts.get(t.id) || 0).toLocaleString()}</span>
+            <button type="button" class="grok-toolbar-btn grok-tag-rename">Rename</button>
+            <button type="button" class="grok-toolbar-btn grok-tag-delete grok-lightbox-delete-btn">Delete</button>
+          </div>`).join('')
+      : '<div class="grok-tag-empty">No tags yet. Create one below, or from any image in the lightbox.</div>';
+    if (note) {
+      note.textContent = tagsLoaded
+        ? 'Tags are Grok collections, shared with Grok\u2019s own UI. Counts are what this script has read.'
+        : 'Tag membership could not be read in full \u2014 counts may be low.';
+    }
+    if (apply) {
+      const selected = getSelectedPostsInOrder().length;
+      apply.textContent = selected ? `Tag ${selected} selected` : 'Tag selection (none)';
+      apply.disabled = !selected || !tagList.length;
+      const existing = document.getElementById('grok-tag-apply-target');
+      const html = tagList.map(t => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.name)}</option>`).join('');
+      if (!existing) {
+        const sel = document.createElement('select');
+        sel.id = 'grok-tag-apply-target';
+        sel.className = 'grok-display-select';
+        sel.setAttribute('aria-label', 'Tag to apply to the selection');
+        sel.innerHTML = html;
+        apply.parentElement.insertBefore(sel, apply);
+      } else if (existing.dataset.sig !== html) {
+        existing.dataset.sig = html;
+        existing.innerHTML = html;
+      }
+    }
+  }
+
+  function openTagManager() {
+    const dlg = ensureTagManagerDialog();
+    renderTagManager();
+    dlg.hidden = false;
+    document.getElementById('grok-tag-new-name')?.focus();
+  }
+
+  function closeTagManager() {
+    const dlg = document.getElementById('grok-tag-manager');
+    if (dlg) dlg.hidden = true;
+  }
+
   function ensurePruneMissingButton() {
     if (document.getElementById('grok-prune-missing-btn')) return;
     const actions = getActionsRow();
@@ -9687,6 +10278,8 @@
     ensureVerifyButton();
     ensureReindexButton();
     ensurePruneMissingButton();
+    ensureTagsButton();
+    ensureTagFilterSelect();
     ensureMediaFilterCheckboxes();
     ensureLikedFilterCheckbox();
     ensureModelFilterSelect();

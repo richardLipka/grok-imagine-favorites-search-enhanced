@@ -472,6 +472,90 @@ ${epilogue}`)(storage);
  * confirmation are stubbed; what is under test is the orchestration -- that nothing is removed
  * from the index unless the server accepted it, and that nothing happens at all without consent.
  */
+/**
+ * Tags, which are Grok collections. The transport is stubbed; what is under test is the
+ * membership map, the add/remove bookkeeping, and that a no-op is distinguishable from a change.
+ */
+function createTagSandbox(control = {}) {
+  const src = readSource();
+  const region = sliceBetween(src, '  function normalizeTagName(name) {', '  /** Optimistic toggle:')
+    + sliceBetween(src, '  function matchesTagFilter(post) {', '\n  function syncTagFilterOptions');
+
+  const prelude = `
+    const COLLECTION_LIST = 'list';
+    const COLLECTION_ADD = 'add';
+    const COLLECTION_REMOVE = 'remove';
+    const COLLECTION_CREATE = 'create';
+    const COLLECTION_UPDATE = 'update';
+    const COLLECTION_DELETE = 'delete';
+    const COLLECTION_ASSETS_LIST = 'members';
+    const COLLECTION_ASSETS_PAGE = 500;
+    const TAG_NAME_MAX = 60;
+    const FILTER_TAG_KEY = 'grokSearchFilterTag';
+    const log = { requests: [], stored: {} };
+
+    let filterTagId = '';
+    let tagList = [];
+    let tagsByAsset = new Map();
+    let tagsLoaded = false;
+    let tagsLoading = null;
+
+    function writeStoredString(k, v) { log.stored[k] = v; }
+    function pickLikedCollection(list) {
+      return (list || []).find(c => c && c.isDefault === true) || null;
+    }
+    async function postJsonWithRetry(url, body, label) {
+      log.requests.push({ url, body, label });
+      const handler = (control.responses || {})[url];
+      if (typeof handler === 'function') return handler(body);
+      return handler || { ok: true, data: {} };
+    }
+  `;
+
+  const epilogue = `
+    return {
+      log, loadTags, setAssetTag, createTag, renameTag, deleteTag, matchesTagFilter,
+      normalizeTagName, tagIdsForAsset, getTagById,
+      get tagList() { return tagList; },
+      get tagsLoaded() { return tagsLoaded; },
+      get filterTagId() { return filterTagId; },
+      setFilterTagId(v) { filterTagId = v; },
+      membershipSize() { return tagsByAsset.size; },
+    };
+  `;
+
+  return new Function('control', `${prelude}
+${region}
+${epilogue}`)(control);
+}
+
+/** Where the lightbox goes once the item it was showing has been deleted. */
+function createLightboxAdvanceSandbox(posts = [], index = 0) {
+  const region = sliceBetween(readSource(),
+    '  function advanceLightboxAfterDelete() {', '\n  function ensureLightboxLikeButton');
+
+  const prelude = `
+    const log = { closed: 0, rendered: 0 };
+    let matchedPosts = posts.slice();
+    let lightboxIndex = index;
+    let lightboxActivePost = matchedPosts[lightboxIndex] || null;
+    function closeResultLightbox() { log.closed++; lightboxIndex = -1; lightboxActivePost = null; }
+    function renderResultLightbox() { log.rendered++; }
+  `;
+
+  const epilogue = `
+    return {
+      log, advanceLightboxAfterDelete,
+      get index() { return lightboxIndex; },
+      get showing() { return lightboxActivePost && lightboxActivePost.id; },
+    };
+  `;
+
+  return new Function('posts', 'index', `${prelude}
+${region}
+${epilogue}`)(posts, index);
+}
+
 function createDeleteSandbox(control = {}) {
   const region = sliceBetween(readSource(),
     '  async function deleteRemotePost', '  async function downloadSelectedPosts');
@@ -705,5 +789,6 @@ module.exports = {
   createCompactSandbox, createCardImageSandbox, createResultsOnlySandbox,
   createDownloadSandbox, createBulkDownloadSandbox,
   createFeedSandbox, createNativeVisibilitySandbox, createSearchBarSandbox,
-  createDeleteSandbox, createThumbnailSandbox,
+  createDeleteSandbox, createThumbnailSandbox, createTagSandbox,
+  createLightboxAdvanceSandbox,
 };
