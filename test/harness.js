@@ -42,7 +42,12 @@ function createIndexSandbox() {
   // limit, so they are sliced in rather than stubbed -- a stub would have hidden the very bug
   // these tests exist to catch.
   const retryRegion = sliceBetween(src, '  function isRetryableStatus(status) {', '  function gmRequestOnce(');
-  const region = retryRegion + sliceBetween(src, '  function isVideoMediaType', '  function formatSyncStatusMessage');
+  // fetchFullIndex() sits past the main region but is the thing that decides whether a reindex
+  // reports success, so it is sliced in rather than left untested.
+  const fullIndexRegion = sliceBetween(src, '  async function fetchFullIndex(statusEl) {', '\n  const DEFAULT_LOADING_MESSAGE');
+  const region = retryRegion
+    + sliceBetween(src, '  function isVideoMediaType', '  function formatSyncStatusMessage')
+    + fullIndexRegion;
 
   const prelude = `
     const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
@@ -52,10 +57,12 @@ function createIndexSandbox() {
     const SYNC_DEEP_CONCURRENCY = 5;
     const SYNC_LIST_REFRESH_PAGES = 4;
     const SYNC_LIST_PAGE_DELAY_MS = 0;
+    const FULL_WALK_PAGE_DELAY_MS = 0;
     const FULL_INDEX_MAX_PAGES = 2000;
     const RECONCILE_MAX_DELETE_RATIO = 0.5;
     const RECONCILE_LAST_RUN_KEY = 'grokSearchLastReconcileAt';
-    const ASSETS_MAX_PAGES = 2000;
+    // Settable so the page-cap path can be exercised without stubbing 2,000 pages.
+    let ASSETS_MAX_PAGES = 2000;
     const ASSETS_ENDPOINT = 'https://grok.com/rest/assets';
     const ASSETS_WORKSPACE = 'WORKSPACE_KIND_IMAGINE_ALL';
     const ASSETS_PAGE_SIZE = 60;
@@ -145,7 +152,9 @@ function createIndexSandbox() {
       get allPosts() { return allPosts; },
       postById, knownIds, selectedPostIds, dbCalls, storage,
       setFeedPages(pages) { feedPages = pages; },
+      fetchFullIndex,
       setAssetPages(pages) { assetPages = pages; },
+      setAssetsMaxPages(n) { ASSETS_MAX_PAGES = n; },
       get indexRevision() { return indexRevision; },
       toStorageRecord, normalizePost, addPostRow, updatePostRow, rebuildPostIndex,
       createIndexWriter, collectChildRecords, syncChildRecordsForParent,

@@ -339,5 +339,63 @@ module.exports = {
     out = await r2.reconcileLikedIndex(null);
     t.equal('nothing removed', out.removed, 0);
     t.ok('the row is still there', r2.postById.has('keep'), [...r2.postById.keys()]);
+
+    t.group('a reindex only claims success if both walks finished');
+    // fetchFullIndex() runs two walks: the asset feed, then the legacy list pass for the child
+    // trees. Only the asset walk's failure used to reach the caller, so a reindex whose legacy
+    // pass died halfway still reported a clean finish -- the same class of bug as a truncated
+    // asset walk, just one layer further in.
+    s = createIndexSandbox();
+    s.setAssetPages([{ assets: [] }]);
+    s.setFeedPages([{ posts: [] }]);
+    let full = await s.fetchFullIndex(null);
+    t.equal('two clean walks report success', full.failed, false);
+
+    s = createIndexSandbox();
+    s.setAssetPages([{ assets: [] }]);
+    s.setFeedPages([{ posts: [{ id: 'p1', createTime: '2026-01-01T00:00:00Z' }] }, { fail: true }]);
+    full = await s.fetchFullIndex(null);
+    t.equal('a legacy walk cut short is reported', full.failed, true);
+    t.equal('and attributed to the legacy pass', full.legacyFailed, true);
+    t.equal('not to the asset pass', full.assetFailed, false);
+    t.ok('what was read is still kept', full.count >= 1, full.count);
+
+    s = createIndexSandbox();
+    // The first page must carry something: syncAssetsFeed() stops on an empty page, so an empty
+    // first page would end the walk before it ever reached the failing one.
+    s.setAssetPages([{ assets: [asset('x1')] }, { fail: true }]);
+    s.setFeedPages([{ posts: [] }]);
+    full = await s.fetchFullIndex(null);
+    t.equal('an asset walk cut short is still reported', full.failed, true);
+    t.equal('and attributed to the asset pass', full.assetFailed, true);
+
+    t.group('stopping at the page cap is truncation, not the end of the feed');
+    // Reconcile already refuses to delete when its walk hits the cap; the walk that feeds a
+    // reindex has to report it for the same reason, or a capped walk reads as a full one.
+    s = createIndexSandbox();
+    s.setAssetsMaxPages(2);
+    s.setAssetPages([{ assets: [asset('c1')] }, { assets: [asset('c2')] }, { assets: [asset('c3')] }]);
+    res = await s.syncAssetsFeed(null, { stopWhenKnown: false });
+    t.equal('the walk stops at the cap', res.pages, 2);
+    t.equal('and says it did not finish', res.failed, true);
+    t.equal('what it did read is kept', res.added, 2);
+
+    // Ending exactly on the cap with nothing left to fetch is a clean finish, not truncation.
+    s = createIndexSandbox();
+    s.setAssetsMaxPages(2);
+    s.setAssetPages([{ assets: [asset('d1')] }, { assets: [asset('d2')] }]);
+    res = await s.syncAssetsFeed(null, { stopWhenKnown: false });
+    t.equal('a feed that ends on the cap is not a failure', res.failed, false);
+
+    t.group('every full-library walk paces the same');
+    // Reindex and Verify both walk to the end of the feed; there is no reason for them to
+    // disagree about the delay between pages.
+    const srcText = require('../harness').readSource();
+    t.ok('a single constant governs it',
+      /const FULL_WALK_PAGE_DELAY_MS/.test(srcText), 'no shared full-walk delay');
+    t.equal('and both full walks use it',
+      (srcText.match(/FULL_WALK_PAGE_DELAY_MS/g) || []).length >= 3, true);
+    t.ok('no full walk still hardcodes its own number',
+      !/Math\.max\(SYNC_LIST_PAGE_DELAY_MS, 100\)/.test(srcText), 'a hardcoded pacing remains');
   },
 };

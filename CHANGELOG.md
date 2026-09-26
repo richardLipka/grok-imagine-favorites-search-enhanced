@@ -3,6 +3,43 @@
 All notable changes to this enhanced fork are documented here.  
 Versions match the `@version` in each userscript header.
 
+## [1.77.1] — 2026-09-26
+
+### Fixed
+
+Swept the rest of the codebase for the pattern behind the last three releases — **an operation
+that stops early but reports success**. Three more instances, all in the paths that decide whether
+an index is complete:
+
+- **A reindex whose legacy pass died halfway still reported a clean finish.** `fetchFullIndex()`
+  runs two walks: the asset feed, then the legacy list pass that brings in the child trees. Only
+  the asset walk's failure reached the caller, so `failed` was blind to half the job. Both are now
+  tracked and attributed (`assetFailed` / `legacyFailed`).
+- **The legacy walk hitting its page cap was silent.** It now counts as not finishing, the same
+  way reconcile already treats its own cap.
+- **The asset walk hitting its page cap was silent too.** Reported now — but only when there was
+  genuinely more to read. A feed that happens to end exactly on the cap is a clean finish, not a
+  truncation, which the first attempt at this got wrong by reading a stale page token.
+
+### Changed
+
+- **Every full-library walk paces the same.** Reindex used 100ms between pages while Verify's
+  asset walk used 40ms, for no reason other than drift. Both now use `FULL_WALK_PAGE_DELAY_MS`.
+  This changes little in practice — a full walk trips the rate limit about every 31 pages
+  whatever the delay, and the waits dominate — but two paths doing the same job should not
+  disagree about how to do it.
+
+### Checked and found sound
+
+- `checkMediaUrlExists()`, which drives **Prune missing**, already fails safe: only an explicit
+  404/410 counts as gone, and anything ambiguous keeps the row.
+- Liking verifies against `addedCount`/`removedCount` rather than the 200, and reverts on failure.
+- `reconcileLikedIndex()` refuses to delete unless *both* feeds were walked to the end, and caps a
+  single sweep at `RECONCILE_MAX_DELETE_RATIO`.
+- The deep-refresh pool drops a failed fetch without stamping it refreshed, so it is retried.
+
+---
+
 ## [1.77.0] — 2026-09-25
 
 ### Added

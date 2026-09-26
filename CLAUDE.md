@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.77.0, ~9.8k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokSearch.user.js` (v1.77.1, ~9.8k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.user.js` (v1.5.0, ~710 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
@@ -140,6 +140,15 @@ Grok sends no `Retry-After` and no `X-RateLimit-*` headers here, so the delay ha
 measurement rather than from the response. The wait is user-settable (*Rate wait*, stored under
 `RATE_LIMIT_WAIT_KEY`, clamped to 1–60s) because the bucket is Grok's and may change size, but the
 default is the measured one and lowering it re-creates the original bug.
+
+**A walk that stops early must say so.** This codebase has produced the same bug four times now,
+in four different places: a truncated walk reported as a complete one. Every loop that pages
+through a feed — `syncLikedFeed()`, both walks in `reconcileLikedIndex()`, `syncAssetsFeed()` and
+the legacy pass in `fetchFullIndex()` — surfaces *every* early exit: a failed request, and hitting
+the page cap with more still to read. Distinguish those from a genuine end of feed; the second
+attempt at the cap check read a stale page token and called a feed that ended exactly on the cap a
+truncation. When a walk feeds something destructive, incomplete must block it outright, as
+reconcile does.
 
 Both go through `postJsonWithRetry()`, which retries `429`/`5xx` with backoff and honours
 `Retry-After`. It always resolves: `ok: false` means the request failed, and callers must never treat

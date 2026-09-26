@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.77.0
+// @version      1.77.1
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -109,6 +109,13 @@
   /** Liked-list pages to walk for metadata (40 posts/page; includes childPosts). */
   const SYNC_LIST_REFRESH_PAGES = 4;
   const SYNC_LIST_PAGE_DELAY_MS = 40;
+  /**
+   * Pacing for a walk that goes to the end of the library, as opposed to the few pages an
+   * incremental sync reads. Reindex and Verify both do that, so they pace the same: a full walk
+   * trips Grok's rate limit roughly every 31 pages whatever the delay, and the waits dominate,
+   * but there is no reason for two paths doing the same job to disagree about it.
+   */
+  const FULL_WALK_PAGE_DELAY_MS = 100;
   /** Parallel post/get for items with children (full child tree from API). */
   const SYNC_DEEP_REFRESH_LIMIT = 24;
   const SYNC_DEEP_CONCURRENCY = 5;
@@ -152,7 +159,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.77.0';
+  const SCRIPT_VERSION = '1.77.1';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -1867,7 +1874,7 @@
         if (!page.nextPageToken || seenAssetTokens.has(page.nextPageToken)) break;
         seenAssetTokens.add(page.nextPageToken);
         assetToken = page.nextPageToken;
-        await sleep(SYNC_LIST_PAGE_DELAY_MS);
+        await sleep(FULL_WALK_PAGE_DELAY_MS);
       }
       if (assetPages >= ASSETS_MAX_PAGES) {
         console.warn('[GrokSearch] Reconcile: asset walk hit the page cap, refusing to delete');
@@ -2392,9 +2399,13 @@
     let updated = 0;
     let stalePages = 0;
     let failed = false;
+    let moreToRead = false;
     const seenTokens = new Set();
 
     while (pages < ASSETS_MAX_PAGES) {
+      // Reset each pass so that after the loop it describes the *last* iteration: true only if
+      // that page handed back another token and the cap is what stopped us following it.
+      moreToRead = false;
       const page = await fetchAssetPage(pageToken);
       if (!page.ok) { failed = true; break; }
       if (!page.assets.length) break;
@@ -2451,7 +2462,8 @@
       }
       seenTokens.add(page.nextPageToken);
       pageToken = page.nextPageToken;
-      const delay = stopWhenKnown ? SYNC_LIST_PAGE_DELAY_MS : Math.max(SYNC_LIST_PAGE_DELAY_MS, 100);
+      moreToRead = true;
+      const delay = stopWhenKnown ? SYNC_LIST_PAGE_DELAY_MS : FULL_WALK_PAGE_DELAY_MS;
       await sleep(delay);
     }
 
@@ -2461,6 +2473,13 @@
       for (const row of fresh) writer.put(row);
     }
     await writer.flush();
+    // Stopping at the page cap while a next token was still pending is truncation, not the end
+    // of the feed -- reconcile already refuses to act on that, and the walk that feeds a reindex
+    // has to report it for the same reason.
+    if (pages >= ASSETS_MAX_PAGES && moreToRead) {
+      console.warn(`[GrokSearch] Asset walk stopped at ${ASSETS_MAX_PAGES} pages with more to read`);
+      failed = true;
+    }
     if (added || updated) {
       console.log(`[GrokSearch] Asset feed: +${added} new, ${updated} updated over ${pages} page(s)`);
     }
@@ -2947,10 +2966,15 @@
     const allFetched = [];
     let cursor = null;
     let pageIndex = 0;
+    // The legacy pass can be cut short the same way the asset walk can, and until v1.77.1 only
+    // the asset walk's failure reached the caller -- so a reindex whose child-tree pass died
+    // halfway still reported a clean finish. Anything that ends this loop short of the feed has
+    // to be visible, for the same reason it is on the other walk.
+    let legacyFailed = false;
     const seenCursors = new Set();
     while (true) {
       const page = await fetchPage(cursor);
-      if (!page.ok) break;
+      if (!page.ok) { legacyFailed = true; break; }
       const posts = page.posts;
       for (const post of posts) {
         const parsed = parsePost(post);
@@ -2999,9 +3023,10 @@
       seenCursors.add(cursor);
       if (++pageIndex >= FULL_INDEX_MAX_PAGES) {
         console.warn(`[GrokSearch] Full index stopped at ${FULL_INDEX_MAX_PAGES} pages`);
+        legacyFailed = true;
         break;
       }
-      await sleep(SYNC_LIST_PAGE_DELAY_MS);
+      await sleep(FULL_WALK_PAGE_DELAY_MS);
     }
     sortAllPostsNewestFirst();
     const chunkSize = 500;
@@ -3012,9 +3037,16 @@
         if (statusEl) setLoadStatus(`saving… ${savedCount.toLocaleString()}/${allFetched.length.toLocaleString()}`);
       }
     }
+    if (assets.failed || legacyFailed) {
+      console.warn('[GrokSearch] Full index incomplete: '
+        + `${assets.failed ? 'asset walk' : ''}${assets.failed && legacyFailed ? ' and ' : ''}`
+        + `${legacyFailed ? 'legacy walk' : ''} did not reach the end of the feed`);
+    }
     return {
       count: allPosts.length,
-      failed: assets.failed,
+      failed: assets.failed || legacyFailed,
+      assetFailed: assets.failed,
+      legacyFailed,
       assetCount: assets.added,
       legacyCount: allFetched.length,
       valueOf() { return this.count; },
