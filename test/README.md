@@ -23,11 +23,11 @@ them with stubbed collaborators (`dbPutMany`, `fetchPage`, `setLoadStatus`, …)
 runs production code. Nothing here reimplements logic — a test that passed against a copy of
 the algorithm would be worthless.
 
-Eight sandboxes:
+The sandboxes:
 
 | Sandbox | Region | Covers |
 |---------|--------|--------|
-| `createIndexSandbox()` | `isVideoMediaType` → `formatSyncStatusMessage` | Record shape, index mutation, child sync, tree edges, deep-refresh selection, the asset feed, reconciliation |
+| `createIndexSandbox()` | `isRetryableStatus` → `gmRequestOnce`, plus `isVideoMediaType` → `formatSyncStatusMessage`, plus `fetchFullIndex` | Record shape, index mutation, child sync, tree edges, deep-refresh selection, the asset feed, reconciliation, the retry/backoff schedule, and whether a reindex may claim success |
 | `createGridSandbox()` | `renderResultCards` | Keyed results-grid reconciliation, against the fake DOM in [`dom.js`](dom.js) |
 | `createLikeSandbox()` | `setAtPath` → `sendLikeRequest` | Like/unlike request templating (pure shaping, no network) |
 | `createMetadataSandbox()` | `PNG_CRC_TABLE` → `isDownloadableImagePost` | EXIF assembly, PNG text chunks, the WebP RIFF rebuild |
@@ -36,6 +36,11 @@ Eight sandboxes:
 | `createFeedSandbox()` | `setAtPath` → `buildLikeRequest`, plus `readListTemplate` → `isVideoMediaType` | Captured-template replay, response-shape tolerance, source-probe ranking |
 | `createNativeVisibilitySandbox()` | `HID_GRID_ATTR` → `updateDisplayMode` | Hiding and restoring Grok's own grid, against the attribute-aware fake DOM |
 | `createThumbnailSandbox()` | `isVideoMediaType` → `matchesWithVideoFilter`, plus `getChildrenByParent` → `guessMediaExtension` | Image thumbnail resolution for video results, parent/root/child/conversation fallback |
+| `createSearchBarSandbox()` | `getStoredResultsOnly` → `syncResultsOnlyCheckbox`, plus `setSearchBarExpanded` → `patchSearchBarCollapseStyles` | That collapsing the bar never overwrites the *Results only* preference |
+| `createResultsOnlySandbox()` | `setResultsOnlyEnabled` → `updateResultsOnlyLayout` | That only a real change of mode sends the reader back to page 1 |
+| `createCompactSandbox()` | `buildDisplayEntries` → `getPageSize` | Folding children into the outermost matched ancestor, and paging over cards rather than posts |
+| `createCardImageSandbox()` | `imageAltText` → the card skeleton | The alt cap, and that a recycled card gets a new `<img>` rather than a re-pointed one |
+| `createDeleteSandbox()` | `deleteRemotePost` → `downloadSelectedPosts` | Consent, and that a row only leaves the index once the **library** confirms the delete |
 
 `createMetadataSandbox()` takes a **stubbed `piexif`** — the real library is a jsDelivr `@require`
 and cannot be installed here. So the JPEG path is only checked for *how* it calls piexif, while the
@@ -69,6 +74,18 @@ The slices are anchored on function declarations. Rename or reorder one and the 
 `harness: start marker not found …`, and the runner points at `test/harness.js`. That is
 deliberate — a loud, specific failure beats tests that quietly stop covering anything.
 
+## The bug this suite keeps finding
+
+Four releases in a row turned out to be the same shape: **an operation that stops early and
+reports success.** A rate-limited walk giving up at the first 429 and calling the index complete;
+a delete trusting the endpoint's 200 rather than the library; `fetchFullIndex()` reporting only
+half its walks. None of them threw, none of them looked wrong in a screenshot, and the suite only
+caught them once it was asserting on *outcomes* rather than on calls being made.
+
+So when adding coverage for anything that walks a feed or writes to Grok, assert the end state,
+not the request. And run the mutation — the existing 429 test passed happily against the broken
+code because it only ever used two retries.
+
 ## What is not covered
 
 Anything that needs a browser: DOM injection into the live Grok SPA, IndexedDB itself, the real
@@ -94,3 +111,12 @@ current suites, each caught:
 | The asset sync stops after one all-known page | 2 in `assets` |
 | Reconcile ignores the asset feed | 3 in `assets` |
 | An asset storage key is not URL-encoded | 1 in `assets` |
+| 429 goes back to the 800ms exponential backoff | 5 in `assets` |
+| A truncated legacy walk is not reported | 2 in `assets` |
+| A delete trusts the endpoint instead of the library | 8 in `delete` |
+| The focus ring loses its box-shadow half | 1 in `accessibility` |
+| The lightbox stops trapping Tab | 1 in `accessibility` |
+| The prune button loses its accessible name | 1 in `accessibility` |
+| `syncResultsView()` resets the page again | 4 in `paging-position` |
+| A recycled card re-points its `<img>` instead of replacing it | 5 in `card-image` |
+| Compact folds into the *nearest* matched ancestor | 3 in `compact-groups` |

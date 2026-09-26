@@ -479,6 +479,10 @@ req.onsuccess = e => {
 | **Liked only** hides posts you did like | Their like state is unknown (`null`) because the feed did not report it; **Reindex** refreshes it |
 | Recent posts missing, even after **Reindex** | Check the **Model** dropdown reads *All models* — it is a saved preference, so **Reindex** does not clear it and posts made with any other model stay hidden. **Clear** resets it. Then run [`tools/diagnose.js`](tools/diagnose.js) in the console if they are still missing |
 | A post you just liked is missing | If it is an older post it is not near the top of the feed; click **Verify** |
+| **Reindex** stops at about 1,980 images | Fixed in v1.76.1 — update the script. Grok rate-limits the feed roughly every 31 pages; older versions retried too impatiently and gave up at the first limit, indexing 33 pages and calling it done. **Verify** failed the same way, so it could not repair it either |
+| **Reindex** seems to hang | It pauses on purpose. A full walk of ~23,000 images takes around eight minutes, most of it waiting out rate limits. The toolbar names each pause (`rate limited — waiting 5s`). Raise **Rate wait** if your account is limited harder; lowering it re-creates the bug above |
+| Reindex or Verify says *incomplete* | The walk did not reach the end of the feed — connection, or rate limits it could not wait out. Nothing was deleted; just run it again |
+| A deleted image is still in Grok | The status will say *N still in library*: Grok accepted the delete but the image is still in the asset feed the library is built from. The row is deliberately kept so your index does not disagree with Grok. Please report it — the fix needs the request Grok's own UI sends when it deletes |
 | **Verify** says *aborted — unexpected feed response* | It refused to delete more than half the index; check the console and retry later |
 | **Import JSON** fails | The file must be an index export (an object with a `posts` array, or a bare array of rows) |
 | **Download selected** does nothing / no folder picker | Use Chrome or Edge; must click the button (user gesture) |

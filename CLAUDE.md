@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.77.1, ~9.8k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokSearch.user.js` (v1.77.1, ~10.1k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.user.js` (v1.5.0, ~710 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
@@ -81,7 +81,7 @@ Commit subjects are imperative with the version in parentheses, e.g.
 One IIFE, no modules; all state lives in module-scope `let`s near the top (`allPosts`, `matchedPosts`,
 `currentPage`, `filter*`, `resultsOnly`, …) and all tunables are `const`s in the same block. Sections
 are ordered: constants → IndexedDB → API/fetch → post parsing → sync → export → loading UI → display
-mode → downloads/EXIF → lightbox/context menu → filter+render → `injectStyles()` (~850 lines of CSS in
+mode → downloads/EXIF → lightbox/context menu → filter+render → `injectStyles()` (~1,400 lines of CSS in
 one template literal) → search-bar builders → `init()`.
 
 ### Data layer
@@ -371,6 +371,27 @@ bumped by `addPostRow`/`rebuildPostIndex` — rather than running on every filte
 Three display modes are toggled as classes on `<html>` by `updateDisplayMode()`:
 `grok-results-only-mode` / `grok-custom-results-mode` (panel over a hidden native grid),
 `grok-filtered-inline-mode` (results injected inline), and neither (native Grok grid untouched).
+
+### Prompts, thumbnails, and uploads
+
+Three things the feed does not hand over cleanly, each with its own recovery path:
+
+- **Grok V2 generations carry no prompt on the asset row.** `mediaGenInput` is a oneof and the V2
+  branch shapes it differently, so the prompt is resolved **by shape, never by branch name**, and
+  falls back through the parent and root prompts before giving up. A row with no prompt is still
+  indexed \u2014 it is searchable by its parent's wording through `_search`.
+- **A video asset has no image to show in the grid.** `resolveThumbnail()` walks
+  video \u2192 its own poster \u2192 parent \u2192 root \u2192 sibling in the same conversation, and only then gives
+  up. `test/suites/video-thumbnails.test.js` pins the order; getting it wrong shows a blank card
+  rather than an error.
+- **Uploaded media is not generated media.** `isUploadedPost()` marks it, *Uploaded only* filters
+  to it, and it has no prompt by definition \u2014 so nothing should treat a missing prompt on an
+  upload as a parsing failure.
+
+**Prune missing** probes indexed media for 404s and removes what is gone. `checkMediaUrlExists()`
+returns `false` **only** on an explicit 404/410; a probe that fails, times out, or is blocked by
+CORS returns `true` and keeps the row. Keep that asymmetry \u2014 the cost of a wrong `false` is
+deleting an image the user still has, and the cost of a wrong `true` is one stale row.
 
 ### Coexisting with the Grok SPA
 

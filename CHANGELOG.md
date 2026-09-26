@@ -1,7 +1,35 @@
 # Changelog
 
-All notable changes to this enhanced fork are documented here.  
-Versions match the `@version` in each userscript header.
+All notable changes are documented here.  
+Versions match the `@version` in each userscript header. Changes that do not alter what users
+install — tests, docs, tooling — sit under **Unreleased** and get no version or tag.
+
+## Unreleased
+
+### Documentation
+
+- **Refreshed every `.md` against the code rather than against memory.** Several claims had drifted:
+  - `CLAUDE.md` said the script was ~9.8k lines (10.1k) and `injectStyles()` ~850 lines of CSS
+    (1,400).
+  - `test/README.md` said "Eight sandboxes" and listed nine; there are **fourteen**. The table now
+    matches `harness.js` exactly, including the sandboxes added for compact groups, card images,
+    paging position, the search bar and deletes.
+  - The `createIndexSandbox()` row did not mention that it now also slices in the retry helpers and
+    `fetchFullIndex()` — which is what makes the rate-limit and walk-completeness tests real rather
+    than stubbed.
+- **Documented what 1.70–1.77 added but never wrote down**: Grok V2 prompt recovery (resolve
+  `mediaGenInput` by shape, not branch name), the video-thumbnail fallback chain, uploads, and why
+  `checkMediaUrlExists()` fails *safe* — only an explicit 404/410 removes a row.
+- **Named the recurring bug.** Four releases running were the same shape: an operation that stops
+  early and reports success. `CLAUDE.md` and `test/README.md` now say so, with the rule that follows
+  — assert the end state, not that a request was made — and the note that the existing 429 test
+  passed against the broken code because it only ever used two retries.
+- **Troubleshooting** gained the reindex rate-limit stop, the long pauses during a reindex, what
+  *incomplete* means, and what to do when a delete reports *still in library*.
+- The changelog header no longer calls this "this enhanced fork" — the repo left the fork network
+  in v1.68.5.
+
+---
 
 ## [1.77.1] — 2026-09-26
 
