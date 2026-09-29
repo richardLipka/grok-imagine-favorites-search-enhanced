@@ -59,6 +59,7 @@ class FakeImage {
 
   setAttribute(k, v) { this.attrs.set(k, String(v)); }
   getAttribute(k) { return this.attrs.has(k) ? this.attrs.get(k) : null; }
+  removeAttribute(k) { this.attrs.delete(k); }
 
   replaceWith(next) {
     if (!this.card) return;
@@ -74,6 +75,14 @@ class FakeCard {
     this.img = new FakeImage();
     this.img.card = this;
     if (src) this.img.setAttribute('src', src);
+    // syncCardImage() decides here whether a card is showing a deleted image or a video with no
+    // poster, so the classes it sets are the observable half of that decision.
+    const classes = new Set();
+    this.classes = classes;
+    this.classList = {
+      toggle(name, on) { if (on) classes.add(name); else classes.delete(name); },
+      contains(name) { return classes.has(name); },
+    };
   }
 
   querySelector(sel) {

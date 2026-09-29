@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 A standalone project by **Richard Lipka**, grown from [IronSniper1's](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) base script and extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, deletion, and much else — see [Credits and origins](#credits-and-origins).
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.user.js` **v1.78.0** · `grokPostSidebar.user.js` **v1.5.0**  
+**Current versions:** `grokSearch.user.js` **v1.79.0** · `grokPostSidebar.user.js` **v1.5.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Credits and origins
@@ -17,7 +17,7 @@ credit.
 |--------|---------|--------------|
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | 2026-03-07 | **The base this repository was forked from.** |
 | [Strapples — Grok Imagine Favorites Search (Greasy Fork)](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) · [GrokImagineSearchandOrganize](https://github.com/Strapples/GrokImagineSearchandOrganize) | 2026-03-20 | A parallel userscript, also forked from IronSniper1. Its author asks that people link back to their GitHub, so it is linked here. |
-| **This repo** | — | Everything since: `grokSearch.user.js` v1.78.0 + `grokPostSidebar.user.js` v1.5.0 |
+| **This repo** | — | Everything since: `grokSearch.user.js` v1.79.0 + `grokPostSidebar.user.js` v1.5.0 |
 
 Earlier versions of this README described the Greasy Fork script as the original and IronSniper1 as
 downstream of it. That was the wrong way round: IronSniper1 came first, and the Greasy Fork script
@@ -152,7 +152,8 @@ Indexing time depends on library size. Leave the tab open until the status finis
 | **Verify** | Reconcile the index against the feed — removes posts that are gone and repairs anything a truncated sync missed |
 | **Reindex** | Clear DB and rebuild from API (use after upgrades or bad cache). Warns first with a time estimate — on a ~23,000 image library it takes roughly eight minutes, because Grok rate-limits the feed about every 31 pages and each pause has to be waited out |
 | **Rate wait** | How long to pause when Grok rate-limits the feed during Reindex or Verify. Default **5s**, which is the measured value; lower settings retry inside a window that has not refilled and can truncate the index |
-| **Prune missing** | Probes indexed media for HTTP 404/deleted images and bulk-removes them from local index after user confirmation |
+| **Prune missing** | Probes each indexed item's **own** media for HTTP 404/deleted and bulk-removes what is gone, after user confirmation. Every candidate is probed — a thumbnail that failed to paint is not taken as proof |
+| **Fix prompts** | Reads the prompt, model and parent image for every row the library feed did not carry them for. See [Why prompts go missing](#why-prompts-go-missing) |
 
 ### Results panel header
 
@@ -349,6 +350,45 @@ Deleting a tag removes **the grouping only**. The images keep existing and stay 
 
 > Tag counts come from what the script has read. If a tag's membership could not be fetched, the
 > manager says so rather than showing a confident zero.
+
+### Why prompts go missing
+
+`/rest/assets` — the feed Grok's own library pages through, and this script's main source — hands
+back the file, its size and its date, but **not** the generation input. The prompt, the model and
+the link to the parent image live on `GET /rest/assets/{id}`, one request per item.
+
+An index built from the feed alone is therefore missing all three. On a real 23,500-image library
+that was 15,776 rows with no prompt text at all, and 2 rows linked to a parent — so search reached
+about a third of the library and silently ignored the rest.
+
+**Fix prompts** closes that gap without rebuilding anything:
+
+| | |
+|---|---|
+| **What it reads** | The prompt, the model name, and the id of the image a video was generated from |
+| **What it costs** | One request per item. Roughly six minutes for a 16,000-row gap — measured at 300 requests in 7.2 s, with no rate limit |
+| **What it changes** | Nothing is deleted and no existing prompt is overwritten. You can keep using the page while it runs |
+| **How often** | Once per row. About a quarter of items genuinely have no prompt — uploads, mostly — and those are remembered rather than asked again |
+
+A **Reindex** runs the same pass at the end automatically, so this button is only needed for an
+index that already exists.
+
+Restoring the parent link does two further things. A video becomes searchable by the prompt of the
+still it came from — usually its only prompt — and it gets that still back as its poster, instead
+of being drawn as a clip with nothing to show.
+
+### Videos, posters, and the "Media deleted" badge
+
+A video file has no still image inside it that a browser will draw in a grid. The script looks for
+one: the video's own poster, then the parent image, then the root, then a sibling from the same
+generation. When it finds none the card is drawn as a **video with no poster** — a plain tinted
+tile, not an error.
+
+Before v1.79.0 it fell back to putting the `.mp4` in an `<img>`, which cannot decode it; the failure
+was read as a 404 and the card was stamped **Media deleted**, with **Prune missing** offering to
+delete the row. The file itself was fine and played on the next click. If you pruned videos on that
+badge, the images are still in your Grok library — only the local rows went, and a **Reindex**
+brings them back.
 
 ### Deleting, and how it is checked
 

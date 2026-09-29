@@ -4,6 +4,51 @@ All notable changes are documented here.
 Versions match the `@version` in each userscript header. Changes that do not alter what users
 install — tests, docs, tooling — sit under **Unreleased** and get no version or tag.
 
+## [1.79.0] — 2026-09-29
+
+### Fixed
+
+- **Search could not see two thirds of the library.** `/rest/assets` — the feed Grok's own library
+  paginates, and this script's primary source since v1.67.0 — does **not** return `mediaGenInput`.
+  `GET /rest/assets/{id}` does. Everything that hangs off it was therefore missing: measured on a
+  real account, **15,776 of 23,529 indexed rows carried no prompt text of any kind**, and exactly
+  **2 rows were linked to a parent**. A prompt search over that index was a search over a third of
+  it, silently.
+
+  A **detail pass** now reads the prompt, the model and the parent link for every row the feed did
+  not carry them for. It runs at the end of a reindex, and on demand from a new **Fix prompts**
+  button, so an index that already exists does not have to be rebuilt to recover them. Measured
+  against the live API: 300 detail requests at concurrency 6 took 7.2 s with no rate limit at all,
+  and 74% carried a prompt — roughly six minutes for a 16,000-row gap. The rest genuinely have
+  none, so a row that has been asked once is stamped and never asked again.
+
+  Documentation claiming the asset feed carries the prompt and model has been corrected; it was
+  written from the shape of `GET /rest/assets/{id}` and never checked against the list response.
+
+- **Videos were labelled "Media deleted" while playing perfectly.** A video has no still of its
+  own, and the parent image it was generated from was exactly what the missing `inputAssets` link
+  would have named — so the card fell back to the `.mp4` itself, an `<img>` could not decode it,
+  and the resulting `error` event was read as a 404. **7,528 of 7,529 videos in a real index were
+  flagged this way**, and **Prune missing** offered every one of them for deletion.
+
+  A URL that was never an image failing to load as one is no longer treated as evidence of
+  anything: such a card is drawn as a video with no poster instead. The detail pass then restores
+  the parent link, so most of them get a real still back — and become searchable by the prompt of
+  the image they came from, which is the only prompt an `imageToVideo` clip usually has.
+
+- **Prune missing trusted that flag, and probed the wrong file.** It pruned any row already marked
+  broken without re-checking it, and probed `getPostThumbnailUrl()` — which falls back to a
+  parent's or a sibling's image, so a deleted video was judged by a picture that still exists and
+  an intact one by a picture that does not. Every candidate now gets a real HTTP probe against its
+  **own** media, and a probe that succeeds clears the flag.
+
+- **A reindex left the previous page of results on screen.** The grid is not cleared when the index
+  is, so stale cards sat behind the progress overlay, still fetching thumbnails for rows the
+  rebuild had already dropped. The results-panel path hid the grid; the inline path did not. During
+  a rebuild the only thing shown now is what the rebuild is doing and how many images it has found.
+
+---
+
 ## [1.78.0] — 2026-09-26
 
 ### Added

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.78.0
+// @version      1.79.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -178,7 +178,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.78.0';
+  const SCRIPT_VERSION = '1.79.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -229,6 +229,12 @@
   const LIST_REQUEST_KEY = 'grokSearchListRequest';
   const FILTER_LIKED_KEY = 'grokSearchFilterLiked';
   const INDEX_VERSION_KEY = 'grokSearchIndexSchemaVersion';
+  /**
+   * Stamped on a row once `GET /rest/assets/{id}` has been asked for its prompt. Stored, unlike
+   * the runtime fields below, because the whole point is not to ask again next session.
+   */
+  const PROMPT_PROBE_KEY = 'promptProbedAt';
+
   const DB_NAME = 'GrokSearchIndex';
   const DB_VERSION = 1;
   const STORE_NAME = 'posts';
@@ -868,6 +874,11 @@
       // which is the grouping the asset feed offers in place of a parent/child tree.
       conversationId: String(post.conversationId || ''),
     };
+    // Stamped once the per-asset detail endpoint has answered for this row, so a row that
+    // genuinely has no prompt is asked once rather than on every backfill pass.
+    if (post[PROMPT_PROBE_KEY]) {
+      row[PROMPT_PROBE_KEY] = post[PROMPT_PROBE_KEY];
+    }
     if (post[METADATA_REFRESH_KEY] != null) {
       row[METADATA_REFRESH_KEY] = post[METADATA_REFRESH_KEY];
     }
@@ -1726,6 +1737,43 @@
     return updated;
   }
 
+  /**
+   * Recomputes child counts from the parent links actually present in the index. Counts are only
+   * ever raised: a legacy row's `childPostCount` came from the API and can legitimately exceed
+   * the number of child rows that were fetched, and lowering it to match would throw that away.
+   */
+  function recomputeChildCounts(writer) {
+    const byParent = new Map();
+    for (const p of allPosts) {
+      if (!isChildPost(p) || !p.parentId) continue;
+      const list = byParent.get(p.parentId);
+      if (list) list.push(p);
+      else byParent.set(p.parentId, [p]);
+    }
+    let changed = 0;
+    for (const p of allPosts) {
+      const kids = byParent.get(p.id);
+      if (!kids || !kids.length) continue;
+      const videos = kids.reduce((n, k) => n + (isVideoMediaType(k.mediaType) ? 1 : 0), 0);
+      const nextPosts = Math.max(p.childPostCount ?? 0, kids.length);
+      const nextVideos = Math.max(p.childVideoCount ?? 0, videos);
+      const nextImages = Math.max(p.childImageCount ?? 0, kids.length - videos);
+      if ((p.childPostCount ?? 0) === nextPosts
+          && (p.childVideoCount ?? 0) === nextVideos
+          && (p.childImageCount ?? 0) === nextImages) continue;
+      const row = normalizePost({
+        ...p,
+        childPostCount: nextPosts,
+        childImageCount: nextImages,
+        childVideoCount: nextVideos,
+      });
+      const live = updatePostRow(row) || row;
+      if (writer) writer.put(live);
+      changed++;
+    }
+    return changed;
+  }
+
   /** True for parents whose child tree is worth re-fetching via post/get. */
   function postHasKnownChildren(post) {
     return (post.childPostCount ?? 0) > 0
@@ -2180,17 +2228,22 @@
         if (checked % 10 === 0 || checked === targets.length) {
           setLoadStatus(`probing media ${checked}/${targets.length}… (${missing.length} missing)`);
         }
-        if (post._mediaUnavailable) {
-          missing.push(post);
-          return;
-        }
-        const url = getPostThumbnailUrl(post) || post.mediaUrl || post.thumbnail;
+        // Deliberately not short-circuited on `post._mediaUnavailable`: that flag is set by an
+        // <img> failing to load, which a live video sets every time it is drawn in the grid.
+        // Every candidate gets a real HTTP probe, and a probe that succeeds clears the flag.
+        //
+        // The probe also targets the post's *own* media rather than getPostThumbnailUrl(), which
+        // falls back to a parent's or a sibling's image -- judging a deleted video by a picture
+        // that still exists, and an intact one by a picture that does not.
+        const url = post.mediaUrl || post.thumbnail;
         if (!url) {
           missing.push(post);
           return;
         }
         const exists = await checkMediaUrlExists(url);
-        if (!exists) {
+        if (exists) {
+          post._mediaUnavailable = false;
+        } else {
           post._mediaUnavailable = true;
           missing.push(post);
         }
@@ -2649,6 +2702,137 @@
     return { added, updated, pages, failed };
   }
 
+  // ─── Prompt / parent backfill ───────────────────────────────────────────────
+  /**
+   * `/rest/assets` -- the feed the library paginates, and this script's primary source -- does
+   * **not** carry `mediaGenInput`. `GET /rest/assets/{id}` does. Everything that hangs off it is
+   * therefore missing from an index built from the feed alone:
+   *
+   * - **the prompt**, so fulltext search cannot see the row at all. Measured on a real index:
+   *   15,776 of 23,529 rows had no prompt text of any kind -- two thirds of a library that
+   *   search silently could not reach, which is what "search stopped working" actually was.
+   * - **`inputAssets[0]`**, the parent. Without it nothing is ever a child (2 rows out of 23,529
+   *   were), no tree is built, and an `imageToVideo` clip never finds the still it came from --
+   *   and that still is the only poster a video has.
+   * - **`modelName`**, so the model filter has little to offer.
+   *
+   * Measured against the live API before writing this: 300 detail requests at concurrency 6 took
+   * 7.2 s with no rate limit at all, and 74% carried a prompt. The rest genuinely have none, so a
+   * row that has been asked once is stamped and not asked again.
+   */
+  const ASSET_DETAIL_CONCURRENCY = 6;
+
+  /** The generation context of one asset, or null when it carries no `mediaGenInput`. */
+  function assetDetailFields(asset) {
+    const gen = assetGenInput(asset);
+    if (!gen) return null;
+    const id = String(asset?.assetId || '');
+    const parentId = getAssetParentId(asset, gen);
+    return {
+      prompt: String(gen.prompt || asset?.summary || '').trim(),
+      model: String(gen.modelName || ''),
+      parentId: parentId && parentId !== id ? String(parentId) : null,
+    };
+  }
+
+  async function fetchAssetDetail(id) {
+    const res = await gmGetJson(`${ASSET_GET}${encodeURIComponent(id)}`, 'asset detail');
+    if (!res.ok) return { ok: false, status: res.status };
+    return { ok: true, fields: assetDetailFields(res.data?.asset || res.data) };
+  }
+
+  let backfillInProgress = false;
+
+  /**
+   * Rows worth a detail request: no prompt of their own, or no parent link. `force` re-asks
+   * every row, for when Grok starts answering differently than it did.
+   */
+  function rowsNeedingDetail(force) {
+    // `force` means every row, not "every row that still looks incomplete" -- a row whose prompt
+    // was inherited from its parent looks complete and would never be re-read otherwise.
+    if (force) return allPosts.slice();
+    return allPosts.filter(row => {
+      if (row[PROMPT_PROBE_KEY]) return false;
+      return !String(row.prompt || '').trim() || !row.parentId;
+    });
+  }
+
+  async function backfillAssetDetails({ force = false, silent = false } = {}) {
+    if (backfillInProgress || !loaded) return null;
+    const targets = rowsNeedingDetail(force);
+    if (!targets.length) {
+      if (!silent) flashStampStatus('prompts already complete');
+      return { checked: 0, prompts: 0, parents: 0, failed: 0 };
+    }
+    backfillInProgress = true;
+    const writer = createIndexWriter();
+    let done = 0;
+    let prompts = 0;
+    let parents = 0;
+    let failed = 0;
+    try {
+      setLoadStatus(`reading prompts 0/${targets.length.toLocaleString()}…`);
+      await runPool(targets, ASSET_DETAIL_CONCURRENCY, async row => {
+        const res = await fetchAssetDetail(row.id);
+        done++;
+        if (done % 25 === 0 || done === targets.length) {
+          setLoadStatus(`reading prompts ${done.toLocaleString()}/${targets.length.toLocaleString()}… (+${prompts.toLocaleString()} found)`);
+        }
+        if (!res.ok) { failed++; return; }
+        const fields = res.fields;
+        // Stamped even when the asset had no mediaGenInput at all: that answer is final, and
+        // not recording it is how a backfill re-reads the same dead rows for ever.
+        const next = { ...row, [PROMPT_PROBE_KEY]: new Date().toISOString() };
+        if (fields) {
+          if (fields.prompt && !String(row.prompt || '').trim()) {
+            next.prompt = fields.prompt;
+            prompts++;
+          }
+          if (fields.model && !String(row.model || '').trim()) next.model = fields.model;
+          // Only link to a parent that is actually in the index -- a dangling parentId would
+          // make the row a child of nothing, unreachable from its own tree.
+          if (fields.parentId && !row.parentId && postById.has(fields.parentId)) {
+            next.parentId = fields.parentId;
+            next.rootId = fields.parentId;
+            next.isChild = true;
+            parents++;
+          }
+        }
+        const merged = normalizePost(next);
+        writer.put(updatePostRow(merged) || merged);
+      });
+
+      // Parent links only just appeared, so the denormalized parent/root prompts on child rows
+      // have to be recomputed -- that is what makes a video searchable by the prompt of the
+      // still it was generated from -- and a parent that gained children needs its counts back,
+      // or the child filter and the compact grouping have nothing to group by.
+      for (const row of backfillChildParentPrompts()) writer.put(row);
+      recomputeChildCounts(writer);
+      await writer.flush();
+      invalidateDisplayEntries();
+      applyFilter();
+
+      const parts = [`+${prompts.toLocaleString()} prompts`];
+      if (parents) parts.push(`${parents.toLocaleString()} parent links`);
+      if (failed) parts.push(`${failed.toLocaleString()} failed`);
+      const summary = parts.join(', ');
+      console.log(`[GrokSearch] Detail backfill over ${targets.length} row(s): ${summary}`);
+      if (!silent) {
+        setLoadStatus(summary);
+        flashStampStatus(summary);
+        const statusEl = document.getElementById('grok-stamp-status');
+        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 6000);
+      }
+      return { checked: targets.length, prompts, parents, failed };
+    } catch (e) {
+      console.error('[GrokSearch] Detail backfill failed:', e);
+      if (!silent) setLoadStatus('prompt backfill failed');
+      return null;
+    } finally {
+      backfillInProgress = false;
+    }
+  }
+
   function formatSyncStatusMessage(newCount, refreshedCount) {
     const parts = [];
     if (newCount > 0) parts.push(`+${newCount} new`);
@@ -2760,13 +2944,18 @@
       const failed = Boolean(result?.failed);
       loaded = true;
       writeStoredString(INDEX_VERSION_KEY, String(INDEX_SCHEMA_VERSION));
+      // The feed walk cannot see prompts or parent links at all, so an index is not finished
+      // until the detail pass has run. Doing it here means a reindex produces something search
+      // can actually reach, rather than 23,000 rows of untitled thumbnails.
+      const detail = await backfillAssetDetails({ silent: true });
       console.log(`[GrokSearch] Reindex done: ${count} posts${failed ? ' (incomplete)' : ''}`);
       if (statusEl) {
         if (failed) {
           setLoadStatus(`${count.toLocaleString()} reindexed (incomplete — check connection)`);
           setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 6000);
         } else {
-          setLoadStatus(`${count.toLocaleString()} reindexed`);
+          const found = detail?.prompts ? `, ${detail.prompts.toLocaleString()} prompts read` : '';
+          setLoadStatus(`${count.toLocaleString()} reindexed${found}`);
           setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
         }
       }
@@ -3310,6 +3499,12 @@
       const msg = document.getElementById('grok-loading-message');
       if (msg) msg.textContent = message;
       el.classList.add('visible');
+      // The grid is not cleared when the index is, so a reindex left the previous page of cards
+      // sitting behind the overlay -- rows no longer in the database, still fetching thumbnails
+      // for images the rebuild had not reached yet. The panel path already hides it; this one
+      // did not. While a rebuild is running the only honest thing on screen is its progress.
+      const grid = document.getElementById('grok-results-grid');
+      if (grid) grid.style.display = 'none';
       if (shouldShowSearchResults()) applyNativeVisibility();
     }
   }
@@ -6601,9 +6796,23 @@
     if (!img) return null;
 
     const alt = imageAltText(prompt);
+
+    /**
+     * A video has no still of its own. `getPostThumbnailUrl()` looks for the parent image, a
+     * sibling, a child -- and when it finds none it hands back the `.mp4`, which an `<img>`
+     * cannot decode. The resulting `error` event used to flag the post as deleted and offer it
+     * for pruning, while the very same file played perfectly in the lightbox: 7,528 of 7,529
+     * videos in a real index were marked "Media deleted" this way. A URL that was never an
+     * image failing to load as one is not evidence of anything.
+     */
+    const posterless = isVideoUrl(thumb);
+    if (posterless) thumb = '';
+    if (card.classList) card.classList.toggle('grok-result-card--noposter', posterless);
+
     const previous = img.getAttribute('src') || '';
 
     const markBroken = isBroken => {
+      if (posterless) isBroken = false;
       if (card.classList) card.classList.toggle('grok-result-card--broken', isBroken);
       if (post) post._mediaUnavailable = isBroken;
       try {
@@ -6620,7 +6829,8 @@
     };
 
     if (!thumb) {
-      markBroken(true);
+      markBroken(!posterless);
+      if (posterless && previous) img.removeAttribute('src');
     }
 
     if (previous === thumb) {
@@ -8056,6 +8266,12 @@
       }
       .grok-result-card--child {
         box-shadow: inset 0 0 0 2px rgba(139, 92, 246, 0.45);
+      }
+      .grok-result-card--noposter > img {
+        background:
+          linear-gradient(135deg, rgba(139, 92, 246, 0.22), rgba(59, 130, 246, 0.14)),
+          radial-gradient(circle at 50% 42%, rgba(255, 255, 255, 0.16), transparent 62%);
+        box-shadow: inset 0 0 0 1px rgba(139, 92, 246, 0.35);
       }
       .grok-result-card--broken {
         box-shadow: inset 0 0 0 2px rgba(239, 68, 68, 0.55);
@@ -9960,6 +10176,40 @@
     actions.appendChild(btn);
   }
 
+  /**
+   * Existing indexes were built before the detail pass existed and are missing every prompt the
+   * feed does not carry. Rebuilding from scratch to recover them would be an hour of walking the
+   * feed for data the feed does not have, so the pass is reachable on its own.
+   */
+  function ensureFixPromptsButton() {
+    if (document.getElementById('grok-fix-prompts-btn')) return;
+    const actions = getActionsRow();
+    if (!actions) return;
+    const btn = document.createElement('button');
+    btn.id = 'grok-fix-prompts-btn';
+    btn.className = 'grok-toolbar-btn';
+    btn.type = 'button';
+    btn.textContent = 'Fix prompts';
+    btn.title = 'Read the prompt, model and parent image of every row the library feed did not carry them for, so search can find them';
+    btn.addEventListener('click', async () => {
+      const pending = rowsNeedingDetail(false).length;
+      if (pending > 200 && !await confirmDangerousAction({
+        title: 'Read missing prompts',
+        message: `${pending.toLocaleString()} images have no prompt or parent recorded. Reading them takes one request each — roughly ${Math.max(1, Math.round(pending / 2400))} minute(s). Nothing is deleted and you can keep using the page.`,
+        okLabel: 'Read them',
+      })) return;
+      btn.disabled = true;
+      btn.textContent = 'Reading…';
+      try {
+        await backfillAssetDetails({});
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Fix prompts';
+      }
+    });
+    actions.appendChild(btn);
+  }
+
   function ensureTagManagerDialog() {
     let dlg = document.getElementById('grok-tag-manager');
     if (dlg) return dlg;
@@ -10278,6 +10528,7 @@
     ensureVerifyButton();
     ensureReindexButton();
     ensurePruneMissingButton();
+    ensureFixPromptsButton();
     ensureTagsButton();
     ensureTagFilterSelect();
     ensureMediaFilterCheckboxes();

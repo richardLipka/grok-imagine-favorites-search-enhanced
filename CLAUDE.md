@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.78.0, ~10.1k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokSearch.user.js` (v1.79.0, ~10.2k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.user.js` (v1.5.0, ~710 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
@@ -115,11 +115,20 @@ session cookies authenticate the request:
 - `GET /rest/assets?pageSize=60&orderBy=ORDER_BY_CREATE_TIME&workspaceKind=WORKSPACE_KIND_IMAGINE_ALL`
   — **the primary feed since v1.67.0**, and what Grok's own library view paginates. Unlike
   `post/list` it is genuinely ordered newest-first and reaches the current day, so the sync's
-  "stop once nothing is new" shortcut is sound here and only here. Every row carries the prompt and
-  model in `mediaGenInput` (a oneof — resolve it by shape, not by branch name), and the media URL
-  is the asset's storage `key` under `assets.grok.com`, so there is **no per-item request**.
-  `assetId` is the same id space as a media post id, which is why asset rows merge with list rows
-  rather than duplicating them. `workspaceKind` is validated, unlike `filter.source`.
+  "stop once nothing is new" shortcut is sound here and only here. The media URL is the asset's
+  storage `key` under `assets.grok.com`, so the picture itself costs no extra request. `assetId` is
+  the same id space as a media post id, which is why asset rows merge with list rows rather than
+  duplicating them. `workspaceKind` is validated, unlike `filter.source`.
+
+  **The list response does not contain `mediaGenInput`.** Only `GET /rest/assets/{id}` does. This
+  file claimed the opposite until v1.79.0, and the claim was written from the shape of the
+  single-asset response without ever being checked against the list — the same mistake as trusting
+  `filter.source`. What that cost: the prompt, `modelName`, and `inputAssets[0]` (the parent) were
+  absent from every feed-built row. Measured on a live 23,529-row index, **15,776 rows carried no
+  prompt text of any kind and 2 were linked to a parent**, so prompt search covered a third of the
+  library and the tree was empty. Unknown query parameters are accepted and ignored here
+  (`view=FULL`, `readMask=*`, `includeMediaGenInput=true` all return 200 and change nothing), so
+  there is no bulk form of the detail call to find. See **Detail backfill** below.
 
 **`filter.source`, `sort` and `collectionId` on `post/list` are ignored, not honoured.**
 `sort: "BANANA"` behaves exactly like `sort: "CREATE_TIME_DESC"`, and every invented
@@ -277,6 +286,32 @@ It is the only destructive path in the codebase, so three rules hold it together
 `removeRowsById()` is the only function that deletes parent rows; it also clears `knownIds` and
 `selectedPostIds` and rebuilds the id map.
 
+### Detail backfill
+
+`backfillAssetDetails()` closes the gap the list endpoint leaves: one `GET /rest/assets/{id}` per
+row, at `ASSET_DETAIL_CONCURRENCY` (6). Measured against the live API: 300 requests in 7.2 s with
+**no** rate limit — unlike the list walk, which trips the bucket every ~31 pages — and 74% of them
+carried a prompt. It runs at the end of `reindexDatabase()` and from the **Fix prompts** button,
+because an index built by an earlier version cannot be repaired by re-walking a feed that does not
+have the data.
+
+Four rules, each of which is a way to get this wrong:
+
+- **Stamp on an answer, not on a success.** `PROMPT_PROBE_KEY` is written even when the asset had
+  no `mediaGenInput` at all — that is a final answer, and about a quarter of rows give it. It is
+  *not* written when the request failed, or a transient 500 would make a row permanently
+  unsearchable. This is the one field of `toStorageRecord()` whose job is to prevent work.
+- **Never link to a parent that is not in the index.** A dangling `parentId` makes a row a child of
+  nothing: hidden by the child filter, absent from every tree, and searchable only by a prompt it
+  does not have.
+- **Never overwrite a prompt that is already there.** The feed occasionally fills `summary`, and
+  an imported or legacy row may carry better text than the detail call returns.
+- **Re-derive what depends on the new edges.** Parent links arriving late means
+  `backfillChildParentPrompts()` (the denormalized `parentPrompt`/`rootPrompt` that make a video
+  findable by its still's wording) and `recomputeChildCounts()` both have to run afterwards. Counts
+  are only ever *raised*: a legacy row's `childPostCount` came from the API and can legitimately
+  exceed the number of child rows ever fetched.
+
 ### Deleting
 
 **"The delete endpoint returned 200" and "the image is gone from the library" are different
@@ -296,6 +331,12 @@ sends when it deletes** — the same rule as the like button. Never wire a guess
 endpoint: a wrong guess fires deletes at the user's library.
 
 ### Render pipeline
+
+**A rebuild shows its progress, not the index it is replacing.** `reindexDatabase()` empties
+`allPosts` but nothing clears the grid, so the previous page of cards stayed on screen behind the
+overlay, still fetching thumbnails for rows that had already been dropped. Both branches of
+`showLoadingIndicator()` hide `#grok-results-grid` — the results-panel branch always did, the
+inline one did not — and the status line reports the phase and the running count instead.
 
 `allPosts` → `applyFilter()` (text AND-terms over `getSearchablePromptText()`, then date, video and
 child filters, then sort) → `matchedPosts` → `syncResultsView()` → `showResults()` renders one page into
@@ -379,19 +420,36 @@ Three things the feed does not hand over cleanly, each with its own recovery pat
 - **Grok V2 generations carry no prompt on the asset row.** `mediaGenInput` is a oneof and the V2
   branch shapes it differently, so the prompt is resolved **by shape, never by branch name**, and
   falls back through the parent and root prompts before giving up. A row with no prompt is still
-  indexed \u2014 it is searchable by its parent's wording through `_search`.
-- **A video asset has no image to show in the grid.** `resolveThumbnail()` walks
-  video \u2192 its own poster \u2192 parent \u2192 root \u2192 sibling in the same conversation, and only then gives
-  up. `test/suites/video-thumbnails.test.js` pins the order; getting it wrong shows a blank card
-  rather than an error.
+  indexed — it is searchable by its parent's wording through `_search`.
+- **A video asset has no image to show in the grid.** `getPostThumbnailUrl()` walks
+  video → its own poster → parent → root → child → sibling in the same conversation, and only
+  then gives up. `test/suites/video-thumbnails.test.js` pins the order.
+
+  **When it gives up it hands back the `.mp4`, and that is not a broken image.** An `<img>` cannot
+  decode a video, so it fires `error` — which `syncCardImage()` read as a 404 until v1.79.0,
+  stamping the card **Media deleted** and offering the row to **Prune missing**. On a real index
+  **7,528 of 7,529 videos** were flagged, every one of them intact and playable one click away in
+  the lightbox. `syncCardImage()` now checks `isVideoUrl()` first and draws a posterless-video tile
+  instead: the failure of a URL that was never an image is not evidence about the file.
+
+  The deeper cause was the missing `inputAssets` link — without it the parent still is unknown, so
+  the walk above has nothing to find. The detail backfill is what makes those posters exist.
 - **Uploaded media is not generated media.** `isUploadedPost()` marks it, *Uploaded only* filters
-  to it, and it has no prompt by definition \u2014 so nothing should treat a missing prompt on an
+  to it, and it has no prompt by definition — so nothing should treat a missing prompt on an
   upload as a parsing failure.
 
 **Prune missing** probes indexed media for 404s and removes what is gone. `checkMediaUrlExists()`
 returns `false` **only** on an explicit 404/410; a probe that fails, times out, or is blocked by
-CORS returns `true` and keeps the row. Keep that asymmetry \u2014 the cost of a wrong `false` is
+CORS returns `true` and keeps the row. Keep that asymmetry — the cost of a wrong `false` is
 deleting an image the user still has, and the cost of a wrong `true` is one stale row.
+
+Two things it must not do, both of which it did until v1.79.0. It must not short-circuit on
+`post._mediaUnavailable`: that flag is set by an `<img>` failing to load, which every posterless
+video used to do on every paint, so the sweep was proposing thousands of live files for deletion
+without asking the network once. And it must probe `post.mediaUrl`, **not** `getPostThumbnailUrl()`
+— the latter falls back to a parent's or sibling's image, which judges a deleted video by a
+picture that still exists and an intact one by a picture that does not. A successful probe clears
+the flag.
 
 ### Coexisting with the Grok SPA
 

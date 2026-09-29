@@ -51,6 +51,7 @@ function createIndexSandbox() {
 
   const prelude = `
     const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
+    const PROMPT_PROBE_KEY = 'promptProbedAt';
     const SYNC_DEEP_REFRESH_TTL_MS = 10 * 60 * 1000;
     const SYNC_DEEP_REFRESH_LIMIT = 24;
     const SYNC_DEEP_CHILDLESS_SLOTS = 8;
@@ -67,6 +68,7 @@ function createIndexSandbox() {
     const ASSETS_WORKSPACE = 'WORKSPACE_KIND_IMAGINE_ALL';
     const ASSETS_PAGE_SIZE = 60;
     const ASSET_CDN_BASE = 'https://assets.grok.com/';
+    const ASSET_GET = 'https://grok.com/rest/assets/';
     const ASSETS_SYNC_STALE_PAGES = 3;
     const LIKED_BOOLEAN_FIELDS = ['likeStatus','isLiked','liked','hasLiked','isFavorite','isFavorited','favorited','likedByUser','isLikedByUser','userLiked','viewerHasLiked'];
     const LIKED_CONTAINER_FIELDS = ['userInteractionStatus','viewerState','viewer','interaction','interactions','userState','state'];
@@ -78,6 +80,15 @@ function createIndexSandbox() {
     // updatePostRow() clears this when a row is re-parented; without it declared here the
     // assignment would silently create a global instead of being caught.
     let childrenByParentSource = null;
+    let loaded = true;
+
+    // The backfill's UI collaborators. Counted rather than ignored, so a pass that forgets to
+    // re-run the filter after rewriting two thirds of the index is visible in a test.
+    const uiCalls = { filter: 0, displayInvalidated: 0, flash: [] };
+    function applyFilter() { uiCalls.filter++; }
+    function invalidateDisplayEntries() { uiCalls.displayInvalidated++; }
+    function flashStampStatus(text) { uiCalls.flash.push(text); }
+    const document = { getElementById: () => null };
 
     // ── stubs for collaborators defined outside the sliced region ──
     const dbCalls = { put: 0, del: 0, putRows: 0, delRows: 0 };
@@ -120,7 +131,24 @@ function createIndexSandbox() {
      * transport, so the real fetchAssetPage() and its URL building are what run.
      */
     let assetPages = [];
+    /**
+     * Canned single-asset detail responses, keyed by id: the endpoint the feed walk cannot see
+     * prompts or parent links without. An id that is absent answers 404, which is what a
+     * deleted asset does.
+     */
+    let assetDetails = new Map();
     function GM_xmlhttpRequest(opts) {
+      const detail = /[/]rest[/]assets[/]([^?/]+)$/.exec(opts.url);
+      if (detail) {
+        const id = decodeURIComponent(detail[1]);
+        queueMicrotask(() => {
+          if (!assetDetails.has(id)) { opts.onload({ status: 404, responseText: '' }); return; }
+          const value = assetDetails.get(id);
+          if (value && value.fail) { opts.onload({ status: value.status || 500, responseText: '' }); return; }
+          opts.onload({ status: 200, responseText: JSON.stringify({ asset: value }) });
+        });
+        return { abort() {} };
+      }
       const token = new URL(opts.url).searchParams.get('pageToken');
       const i = token ? Number(token) : 0;
       const page = assetPages[i];
@@ -154,6 +182,11 @@ function createIndexSandbox() {
       setFeedPages(pages) { feedPages = pages; },
       fetchFullIndex,
       setAssetPages(pages) { assetPages = pages; },
+      setAssetDetails(map) { assetDetails = new Map(Object.entries(map)); },
+      setLoaded(v) { loaded = v; },
+      uiCalls,
+      assetDetailFields, fetchAssetDetail, rowsNeedingDetail, backfillAssetDetails,
+      recomputeChildCounts,
       setAssetsMaxPages(n) { ASSETS_MAX_PAGES = n; },
       get indexRevision() { return indexRevision; },
       toStorageRecord, normalizePost, addPostRow, updatePostRow, rebuildPostIndex,
@@ -704,8 +737,11 @@ ${epilogue}`)(posts, compact, batch, index);
 function createCardImageSandbox({ createElement }) {
   // Sliced from imageAltText() so the alt cap is the real one, not a stub: the two are a
   // single defence against a broken image sizing itself to its prompt.
-  const region = sliceBetween(readSource(),
-    '  function imageAltText(', '  /** Skeleton built once per card');
+  // isVideoUrl() is sliced in rather than stubbed: whether a card treats a failed load as a
+  // deleted image or as a video with no poster is decided entirely by that predicate.
+  const region = sliceBetween(readSource(), '  function isVideoUrl(', '  function isLikelyImageUrl(')
+    + sliceBetween(readSource(),
+      '  function imageAltText(', '  /** Skeleton built once per card');
   const prelude = `
     const IMAGE_ALT_MAX = 140;
     const document = { createElement: name => createElement(name) };
