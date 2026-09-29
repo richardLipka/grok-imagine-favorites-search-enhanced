@@ -6837,9 +6837,10 @@
      * A video has no still of its own. `getPostThumbnailUrl()` looks for the parent image, a
      * sibling, a child -- and when it finds none it hands back the `.mp4`, which an `<img>`
      * cannot decode. The resulting `error` event used to flag the post as deleted and offer it
-     * for pruning, while the very same file played perfectly in the lightbox: 7,528 of 7,529
-     * videos in a real index were marked "Media deleted" this way. A URL that was never an
-     * image failing to load as one is not evidence of anything.
+     * for pruning, while the very same file played perfectly in the lightbox. Counted on a real
+     * index: 927 of 7,529 videos had no image anywhere to fall back to, so every one of them was
+     * stamped "Media deleted". A URL that was never an image failing to load as one is not
+     * evidence of anything.
      */
     const posterless = isVideoUrl(thumb);
     if (posterless) thumb = '';

@@ -195,9 +195,9 @@ module.exports = {
       readSource().includes("btn.id = 'grok-fix-prompts-btn'"), 'no manual entry point');
 
     t.group('a video is not a broken image');
-    // 7,528 of 7,529 videos in a real index had a .mp4 as their thumbnail, because no parent
-    // still was known. An <img> cannot decode that, fires `error`, and the card called it
-    // deleted -- while the same file played fine in the lightbox one click away.
+    // 927 of 7,529 videos in a real index had no image anywhere to fall back to, so the card
+    // was handed the .mp4 itself. An <img> cannot decode that, fires `error`, and the card
+    // called it deleted -- while the same file played fine in the lightbox one click away.
     const created = [];
     const { syncCardImage } = createCardImageSandbox({
       createElement: () => { const i = new FakeImage(); created.push(i); return i; },

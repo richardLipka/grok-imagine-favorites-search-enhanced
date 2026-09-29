@@ -45,8 +45,11 @@ install — tests, docs, tooling — sit under **Unreleased** and get no version
 - **Videos were labelled "Media deleted" while playing perfectly.** A video has no still of its
   own, and the parent image it was generated from was exactly what the missing `inputAssets` link
   would have named — so the card fell back to the `.mp4` itself, an `<img>` could not decode it,
-  and the resulting `error` event was read as a 404. **7,528 of 7,529 videos in a real index were
-  flagged this way**, and **Prune missing** offered every one of them for deletion.
+  and the resulting `error` event was read as a 404. Counted on a real index, **927 of 7,529
+  videos** had no image anywhere to fall back to and were flagged this way; **Prune missing**
+  offered every one of them for deletion. (The other 6,602 are rescued by a sibling image from the
+  same generation, which is why the problem looked smaller from the grid than it was from the
+  data.)
 
   A URL that was never an image failing to load as one is no longer treated as evidence of
   anything: such a card is drawn as a video with no poster instead. The detail pass then restores

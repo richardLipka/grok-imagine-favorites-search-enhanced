@@ -386,7 +386,8 @@ tile, not an error.
 
 Before v1.79.0 it fell back to putting the `.mp4` in an `<img>`, which cannot decode it; the failure
 was read as a 404 and the card was stamped **Media deleted**, with **Prune missing** offering to
-delete the row. The file itself was fine and played on the next click. If you pruned videos on that
+delete the row. The file itself was fine and played on the next click. On a 7,529-video library
+that hit 927 clips — the ones with no sibling image to borrow from. If you pruned videos on that
 badge, the images are still in your Grok library — only the local rows went, and a **Reindex**
 brings them back.
 

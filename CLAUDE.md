@@ -427,10 +427,15 @@ Three things the feed does not hand over cleanly, each with its own recovery pat
 
   **When it gives up it hands back the `.mp4`, and that is not a broken image.** An `<img>` cannot
   decode a video, so it fires `error` — which `syncCardImage()` read as a 404 until v1.79.0,
-  stamping the card **Media deleted** and offering the row to **Prune missing**. On a real index
-  **7,528 of 7,529 videos** were flagged, every one of them intact and playable one click away in
-  the lightbox. `syncCardImage()` now checks `isVideoUrl()` first and draws a posterless-video tile
-  instead: the failure of a URL that was never an image is not evidence about the file.
+  stamping the card **Media deleted** and offering the row to **Prune missing**. Counted on a real
+  index: **927 of 7,529 videos** reach that fallback, every one of them intact and playable one
+  click away in the lightbox. `syncCardImage()` now checks `isVideoUrl()` first and draws a
+  posterless-video tile instead: the failure of a URL that was never an image is not evidence
+  about the file.
+
+  Count the *resolved* thumbnail, not the stored one. 7,528 of those 7,529 rows have a `.mp4` in
+  their `thumbnail` field, and quoting that number as the damage overstates it eightfold — the
+  sibling step rescues 6,425 of them before the fallback is ever reached.
 
   The deeper cause was the missing `inputAssets` link — without it the parent still is unknown, so
   the walk above has nothing to find. The detail backfill is what makes those posters exist.
