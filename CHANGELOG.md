@@ -4,6 +4,23 @@ All notable changes are documented here.
 Versions match the `@version` in each userscript header. Changes that do not alter what users
 install — tests, docs, tooling — sit under **Unreleased** and get no version or tag.
 
+## [1.79.1] — 2026-09-29
+
+### Fixed
+
+- **The prompt backfill was eight times slower than it needed to be, and threw its work away if
+  you left.** Measured against the live library: 4.8 requests a second through
+  `GM_xmlhttpRequest`, which marshals every call across a process boundary, against **40 a second**
+  using the page's own `fetch` — the call is same-origin, so the session cookie rides along either
+  way. That is ten minutes for a 23,500-row library instead of eighty, and the button's own
+  estimate was written for the faster number. GM remains the fallback.
+- And it now writes every 500 rows rather than once at the end, so a reload or a navigation
+  part-way through keeps what has been read instead of discarding all of it.
+- A `404` from the detail endpoint is treated as an answer — the asset is gone — rather than as a
+  failed request, so such a row is stamped once instead of being re-asked on every later pass.
+
+---
+
 ## [1.79.0] — 2026-09-29
 
 ### Fixed

@@ -112,6 +112,9 @@ function createIndexSandbox() {
       setItem: (k, v) => { storage[k] = String(v); },
     };
     function setLoadStatus() {}
+    // No page window in the sandbox: the fast path throws, which is exactly the condition the
+    // GM fallback exists for, so every detail test runs through both halves.
+    function getPageWindow() { return {}; }
     function writeStoredString(key, value) { storage[key] = value; }
     function readStoredString(key, fallback = '') {
       return Object.prototype.hasOwnProperty.call(storage, key) ? storage[key] : fallback;

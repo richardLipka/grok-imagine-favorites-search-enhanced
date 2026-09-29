@@ -91,6 +91,12 @@ module.exports = {
     t.ok('the grid was told to redraw', s.uiCalls.filter >= 1, s.uiCalls.filter);
     t.ok('with its cached page entries dropped', s.uiCalls.displayInvalidated >= 1);
 
+    t.group('answers are written as they arrive, not only at the end');
+    // The pass covers the whole index and runs for minutes. Buffering every row until it
+    // finishes means a reload two thirds of the way through throws all of it away.
+    t.ok('there is an intermediate flush', readSource().includes('done % BACKFILL_FLUSH_EVERY === 0'),
+      'the backfill only writes once, at the end');
+
     t.group('a row is asked once, not once per pass');
     // 74% of detail requests carry a prompt; the rest genuinely have none. Re-asking those every
     // pass would mean thousands of requests that can never return anything.
@@ -122,6 +128,15 @@ module.exports = {
     t.equal('no link is invented', res.parents, 0);
     t.equal('the row stays top-level', s.postById.get('v9').isChild, false);
     t.equal('while its own prompt is still recovered', s.postById.get('v9').prompt, 'a lone clip');
+
+    t.group('an asset that is gone is an answer, not a failure');
+    // 404 means deleted. Counting it as a failure leaves the row unstamped, so every later pass
+    // asks again -- for ever, for a row that can never answer.
+    s = await indexedFrom([IMAGE('g1', 'gone')]);
+    s.setAssetDetails({});
+    res = await s.backfillAssetDetails({});
+    t.equal('it is not counted as a failure', res.failed, 0);
+    t.equal('and it is not asked again', (await s.backfillAssetDetails({})).checked, 0);
 
     t.group('a failed request leaves the row alone');
     s = await indexedFrom([IMAGE('f1', 'something')]);
