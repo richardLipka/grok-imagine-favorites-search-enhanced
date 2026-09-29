@@ -177,6 +177,26 @@ module.exports = {
     t.equal('so nothing is counted as a failure', res.failed, 0);
     t.ok('and the pass slowed itself down', s.getDetailDelayMs() > 0, s.getDetailDelayMs());
 
+    t.group('a rate limit from either transport reaches the pacer');
+    // gmGetJson() retries a 429 eight times inside itself and tells nobody, so six workers each
+    // burned that budget privately while the shared pause never learned there was a reason to
+    // slow down. The fallback is a single shot, and its answer comes back here.
+    s = createIndexSandbox();
+    s.setStored('grokSearchRateLimitWaitMs', '1000');
+    s.setAssetPages([{ assets: [feedRow(IMAGE('t1', 'x'))] }]);
+    await s.syncAssetsFeed(null, { stopWhenKnown: false });
+    // No page fetch installed, so the attempt goes through the manager.
+    s.setAssetDetails({ t1: IMAGE('t1', 'eventually') });
+    res = await s.backfillAssetDetails({});
+    t.equal('the row is read', res.prompts, 1);
+    t.ok('and the manager was used exactly once per attempt',
+      s.gmDetailCalls.length === 1, s.gmDetailCalls.length);
+    t.ok('the fallback is single-shot, not a private retry loop',
+      /gmRequestOnce\(url, null, null, 'GET'\)/.test(readSource()), 'gmGetJson still used here');
+    t.ok('and its 429 feeds the shared pacer',
+      /if \(gm\.status === 429\) \{ noteDetailRateLimit\(\); continue; \}/.test(readSource()),
+      'a manager 429 does not slow the pass down');
+
     t.group('an asset that is gone is an answer, not a failure');
     // 404 means deleted. Counting it as a failure leaves the row unstamped, so every later pass
     // asks again -- for ever, for a row that can never answer.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.79.2
+// @version      1.79.3
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -178,7 +178,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.79.2';
+  const SCRIPT_VERSION = '1.79.3';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -2834,10 +2834,22 @@
         continue;
       }
       // Anything else, including a transport failure that may simply mean the page blocked the
-      // request, goes to the manager, which has its own retry budget.
-      const gm = await gmGetJson(url, 'asset detail');
-      if (gm.ok) return { ok: true, fields: assetDetailFields(gm.data?.asset || gm.data) };
+      // request, is tried once through the manager.
+      //
+      // Deliberately `gmRequestOnce` and not `gmGetJson`: the latter retries a 429 inside itself,
+      // eight times, and tells nobody. Six workers each burning that budget privately is how a
+      // live run spent minutes waiting without the shared pause ever learning there was a reason
+      // to slow down. One attempt, and the answer comes back here where the pacer can see it.
+      const gm = await gmRequestOnce(url, null, null, 'GET');
+      if (gm.status >= 200 && gm.status < 300) {
+        try {
+          const data = JSON.parse(gm.text);
+          noteDetailSuccess();
+          return { ok: true, fields: assetDetailFields(data?.asset || data) };
+        } catch { return { ok: false, status: gm.status }; }
+      }
       if (gm.status === 404) return { ok: true, fields: null };
+      if (gm.status === 429) { noteDetailRateLimit(); continue; }
       return { ok: false, status: gm.status };
     }
     return { ok: false, status: 429 };

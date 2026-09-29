@@ -117,6 +117,18 @@ function createIndexSandbox() {
     // that care about the pacing install one and drive it directly.
     let pageFetch = null;
     const gmDetailCalls = [];
+    // The real one, minus the header assembly the stubbed transport ignores. Sliced code calls
+    // it for the single-shot fallback, so leaving it out would make every detail test pass
+    // through the catch in backfillAssetDetails() instead of the path under test.
+    function gmRequestOnce(url, body, headers, method = 'GET') {
+      return new Promise(resolve => {
+        GM_xmlhttpRequest({
+          method, url,
+          onload: res => resolve({ status: res.status, text: res.responseText, headers: '' }),
+          onerror: () => resolve({ status: 0, text: '', headers: '' }),
+        });
+      });
+    }
     function getPageWindow() { return pageFetch ? { fetch: pageFetch } : {}; }
     function writeStoredString(key, value) { storage[key] = value; }
     function readStoredString(key, fallback = '') {

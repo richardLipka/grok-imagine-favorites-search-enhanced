@@ -4,6 +4,19 @@ All notable changes are documented here.
 Versions match the `@version` in each userscript header. Changes that do not alter what users
 install — tests, docs, tooling — sit under **Unreleased** and get no version or tag.
 
+## [1.79.3] — 2026-09-29
+
+### Fixed
+
+- **Half the backoff was still invisible to the pacer.** v1.79.2 slowed the pass down whenever the
+  page transport reported a rate limit, but the fallback went through `gmGetJson()`, which retries
+  a 429 up to eight times *inside itself* and reports nothing. Six workers each burning that
+  budget privately is minutes of waiting during which the shared pause never learns there is a
+  reason to wait. The fallback is now a single attempt, and whatever it answers comes back where
+  the pacer can see it.
+
+---
+
 ## [1.79.2] — 2026-09-29
 
 ### Fixed

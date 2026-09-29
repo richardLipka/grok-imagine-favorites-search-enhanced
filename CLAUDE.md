@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.79.2, ~10.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokSearch.user.js` (v1.79.3, ~10.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.user.js` (v1.5.0, ~710 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
@@ -304,10 +304,13 @@ live library. So `detailDelayMs` starts at zero, doubles on each 429, decays aft
 `DETAIL_DECAY_AFTER` clean answers, and `detailGateUntil` is **one shared pause** rather than six
 independent ones.
 
-Two corollaries. A 429 is retried on the **same** transport — handing it to `gmGetJson` as well
+Three corollaries. A 429 is retried on the **same** transport — handing it to `gmGetJson` as well
 doubles the load on the bucket that just refused it, which is precisely what made the live run
 grind to a halt. And `resetDetailPacing()` runs at the start of every pass, so a later one does
-not inherit a backoff that the earlier one's conditions earned.
+not inherit a backoff that the earlier one's conditions earned. And the GM fallback is
+`gmRequestOnce()`, **not** `gmGetJson()`: the latter retries a 429 eight times inside itself and
+tells no one, so the backoff it is waiting out never reaches the pacer that could have prevented
+the next one.
 
 Transport: the page's own `fetch` first, because the call is same-origin and the session cookie
 rides along either way, and `GM_xmlhttpRequest` only for what the page refuses. The feed walks
