@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.79.1, ~10.2k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokSearch.user.js` (v1.79.2, ~10.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.user.js` (v1.5.0, ~710 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
@@ -289,11 +289,29 @@ It is the only destructive path in the codebase, so three rules hold it together
 ### Detail backfill
 
 `backfillAssetDetails()` closes the gap the list endpoint leaves: one `GET /rest/assets/{id}` per
-row, at `ASSET_DETAIL_CONCURRENCY` (6). Measured against the live API: 300 requests in 7.2 s with
-**no** rate limit — unlike the list walk, which trips the bucket every ~31 pages — and 74% of them
-carried a prompt. It runs at the end of `reindexDatabase()` and from the **Fix prompts** button,
-because an index built by an earlier version cannot be repaired by re-walking a feed that does not
-have the data.
+row, at `ASSET_DETAIL_CONCURRENCY` (6). It runs at the end of `reindexDatabase()` and from the
+**Fix prompts** button, because an index built by an earlier version cannot be repaired by
+re-walking a feed that does not have the data. 74% of rows answer with a prompt.
+
+**Pace this one by measuring at runtime, not by picking a number.** The bucket behind
+`/rest/assets/{id}` is large and refills slowly, which is the worst shape to hardcode against: the
+first 300 requests went through at **41 a second with no rate limit at all**, and the sustained
+rate once it had drained measured about **5**. Any fixed delay is therefore wrong by roughly eight
+times in one direction or the other — and being wrong in the fast direction is worse than being
+wrong in the slow one, because every rejected request still costs a round trip and the pause that
+follows applies to all six workers. v1.79.1 shipped the fast constant and stalled outright on a
+live library. So `detailDelayMs` starts at zero, doubles on each 429, decays after
+`DETAIL_DECAY_AFTER` clean answers, and `detailGateUntil` is **one shared pause** rather than six
+independent ones.
+
+Two corollaries. A 429 is retried on the **same** transport — handing it to `gmGetJson` as well
+doubles the load on the bucket that just refused it, which is precisely what made the live run
+grind to a halt. And `resetDetailPacing()` runs at the start of every pass, so a later one does
+not inherit a backoff that the earlier one's conditions earned.
+
+Transport: the page's own `fetch` first, because the call is same-origin and the session cookie
+rides along either way, and `GM_xmlhttpRequest` only for what the page refuses. The feed walks
+still use GM throughout — there the manager's cross-origin handling is the point.
 
 Four rules, each of which is a way to get this wrong:
 

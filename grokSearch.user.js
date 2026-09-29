@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.79.1
+// @version      1.79.2
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -178,7 +178,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.79.1';
+  const SCRIPT_VERSION = '1.79.2';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -2765,15 +2765,82 @@
     }
   }
 
+  /**
+   * Pacing for the detail pass, found at runtime rather than guessed.
+   *
+   * The bucket here is large and refills slowly, which is the worst shape to hardcode against:
+   * the first 300 requests went through at 41 a second with no limit at all, and the sustained
+   * rate after it drained measured about 5. A fixed delay is therefore either eight times too
+   * slow for the first minute or eight times too fast for the next hour — and running too fast
+   * is not merely wasteful, it is worse than running slowly, because every rejected request
+   * still costs a round trip and the pause that follows applies to all six workers.
+   *
+   * So the delay starts at zero, doubles on every rate limit, and decays on a clean streak. The
+   * pass settles on whatever Grok is actually allowing, whatever that turns out to be today.
+   */
+  const DETAIL_DELAY_MAX_MS = 2000;
+  const DETAIL_DELAY_STEP_MS = 60;
+  const DETAIL_DECAY_AFTER = 120;
+  let detailDelayMs = 0;
+  let detailCleanRun = 0;
+  let detailGateUntil = 0;
+
+  /** One shared pause. Six independent five-second waits is not six times better than one. */
+  async function awaitDetailGate() {
+    for (;;) {
+      const wait = detailGateUntil - Date.now();
+      if (wait <= 0) return;
+      await sleep(Math.min(wait, 500));
+    }
+  }
+
+  function noteDetailRateLimit() {
+    detailCleanRun = 0;
+    detailDelayMs = Math.min(DETAIL_DELAY_MAX_MS,
+      detailDelayMs ? detailDelayMs * 2 : DETAIL_DELAY_STEP_MS);
+    detailGateUntil = Math.max(detailGateUntil, Date.now() + getRateLimitWaitMs());
+  }
+
+  function noteDetailSuccess() {
+    if (!detailDelayMs) return;
+    if (++detailCleanRun < DETAIL_DECAY_AFTER) return;
+    detailCleanRun = 0;
+    detailDelayMs = Math.max(0, detailDelayMs - DETAIL_DELAY_STEP_MS);
+  }
+
+  function resetDetailPacing() {
+    detailDelayMs = 0;
+    detailCleanRun = 0;
+    detailGateUntil = 0;
+  }
+
   async function fetchAssetDetail(id) {
     const url = `${ASSET_GET}${encodeURIComponent(id)}`;
-    let res = await getAssetJsonViaPage(url);
-    // A 404 is an answer -- the asset is gone -- so it is not retried through the slow transport
-    // and, upstream, it stamps the row rather than leaving it to be asked again for ever.
-    if (!res.ok && res.status !== 404) res = await gmGetJson(url, 'asset detail');
-    if (res.ok) return { ok: true, fields: assetDetailFields(res.data?.asset || res.data) };
-    if (res.status === 404) return { ok: true, fields: null };
-    return { ok: false, status: res.status };
+    for (let attempt = 0; attempt <= RATE_LIMIT_MAX_RETRIES; attempt++) {
+      await awaitDetailGate();
+      if (detailDelayMs) await sleep(detailDelayMs);
+      const res = await getAssetJsonViaPage(url);
+      if (res.ok) {
+        noteDetailSuccess();
+        return { ok: true, fields: assetDetailFields(res.data?.asset || res.data) };
+      }
+      // A 404 is an answer -- the asset is gone -- so it is neither retried nor sent through the
+      // slow transport, and upstream it stamps the row instead of leaving it to be re-asked.
+      if (res.status === 404) return { ok: true, fields: null };
+      if (res.status === 429) {
+        // Deliberately *not* handed to gmGetJson: retrying a rate-limited request on a second
+        // transport doubles the load on the bucket that just rejected it.
+        noteDetailRateLimit();
+        continue;
+      }
+      // Anything else, including a transport failure that may simply mean the page blocked the
+      // request, goes to the manager, which has its own retry budget.
+      const gm = await gmGetJson(url, 'asset detail');
+      if (gm.ok) return { ok: true, fields: assetDetailFields(gm.data?.asset || gm.data) };
+      if (gm.status === 404) return { ok: true, fields: null };
+      return { ok: false, status: gm.status };
+    }
+    return { ok: false, status: 429 };
   }
 
   let backfillInProgress = false;
@@ -2800,6 +2867,8 @@
       return { checked: 0, prompts: 0, parents: 0, failed: 0 };
     }
     backfillInProgress = true;
+    resetDetailPacing();
+    const startedAt = Date.now();
     const writer = createIndexWriter();
     let done = 0;
     let prompts = 0;
@@ -2811,7 +2880,12 @@
         const res = await fetchAssetDetail(row.id);
         done++;
         if (done % 25 === 0 || done === targets.length) {
-          setLoadStatus(`reading prompts ${done.toLocaleString()}/${targets.length.toLocaleString()}… (+${prompts.toLocaleString()} found)`);
+          // The remaining time is the only number worth showing during a pass this long, and it
+          // has to come from the rate being achieved rather than from an assumed one.
+          const perSec = done / Math.max(1, (Date.now() - startedAt) / 1000);
+          const leftMin = Math.ceil((targets.length - done) / Math.max(0.5, perSec) / 60);
+          setLoadStatus(`reading prompts ${done.toLocaleString()}/${targets.length.toLocaleString()}`
+            + ` — +${prompts.toLocaleString()} found, about ${leftMin} min left`);
         }
         if (!res.ok) { failed++; return; }
         const fields = res.fields;
@@ -10232,7 +10306,12 @@
       const pending = rowsNeedingDetail(false).length;
       if (pending > 200 && !await confirmDangerousAction({
         title: 'Read missing prompts',
-        message: `${pending.toLocaleString()} images have no prompt or parent recorded. Reading them takes one request each — roughly ${Math.max(1, Math.round(pending / 2400))} minute(s). Nothing is deleted and you can keep using the page.`,
+        message: `${pending.toLocaleString()} images have no prompt or parent recorded, and reading them`
+          + ` takes one request each. Expect somewhere between ${Math.max(1, Math.round(pending / 2400))}`
+          + ` and ${Math.max(2, Math.round(pending / 300))} minutes: Grok allows a fast burst and then`
+          + ` throttles, and the pass settles to whatever rate it is actually allowing. Nothing is`
+          + ` deleted, progress is saved as it goes, and you can keep using the page or come back`
+          + ` to it later.`,
         okLabel: 'Read them',
       })) return;
       btn.disabled = true;

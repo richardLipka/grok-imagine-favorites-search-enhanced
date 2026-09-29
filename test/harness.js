@@ -112,9 +112,12 @@ function createIndexSandbox() {
       setItem: (k, v) => { storage[k] = String(v); },
     };
     function setLoadStatus() {}
-    // No page window in the sandbox: the fast path throws, which is exactly the condition the
-    // GM fallback exists for, so every detail test runs through both halves.
-    function getPageWindow() { return {}; }
+    // With no page fetch installed the fast path throws, which is exactly the condition the GM
+    // fallback exists for -- so a test that sets nothing still runs through both halves. Tests
+    // that care about the pacing install one and drive it directly.
+    let pageFetch = null;
+    const gmDetailCalls = [];
+    function getPageWindow() { return pageFetch ? { fetch: pageFetch } : {}; }
     function writeStoredString(key, value) { storage[key] = value; }
     function readStoredString(key, fallback = '') {
       return Object.prototype.hasOwnProperty.call(storage, key) ? storage[key] : fallback;
@@ -144,6 +147,7 @@ function createIndexSandbox() {
       const detail = /[/]rest[/]assets[/]([^?/]+)$/.exec(opts.url);
       if (detail) {
         const id = decodeURIComponent(detail[1]);
+        gmDetailCalls.push(id);
         queueMicrotask(() => {
           if (!assetDetails.has(id)) { opts.onload({ status: 404, responseText: '' }); return; }
           const value = assetDetails.get(id);
@@ -186,6 +190,10 @@ function createIndexSandbox() {
       fetchFullIndex,
       setAssetPages(pages) { assetPages = pages; },
       setAssetDetails(map) { assetDetails = new Map(Object.entries(map)); },
+      setPageFetch(fn) { pageFetch = fn; },
+      gmDetailCalls,
+      getDetailDelayMs() { return detailDelayMs; },
+      noteDetailRateLimit, noteDetailSuccess, resetDetailPacing,
       setLoaded(v) { loaded = v; },
       uiCalls,
       assetDetailFields, fetchAssetDetail, rowsNeedingDetail, backfillAssetDetails,

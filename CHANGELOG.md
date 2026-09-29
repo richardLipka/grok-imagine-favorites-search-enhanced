@@ -4,6 +4,30 @@ All notable changes are documented here.
 Versions match the `@version` in each userscript header. Changes that do not alter what users
 install — tests, docs, tooling — sit under **Unreleased** and get no version or tag.
 
+## [1.79.2] — 2026-09-29
+
+### Fixed
+
+- **The prompt backfill paced itself into a stall.** v1.79.1 made it eight times faster by using
+  the page's own `fetch`, which is true for the first few hundred rows and then stops being true:
+  Grok's bucket here is large and refills slowly, so a burst drains it and everything afterwards
+  runs into a rate limit. Worse, each rejected request was then retried through
+  `GM_xmlhttpRequest` — a second request to the bucket that had just said no — and all six workers
+  waited out their own five-second pause in parallel. On a live run it stopped making progress
+  entirely.
+
+  The delay between requests is now **discovered rather than assumed**: it starts at zero, doubles
+  on every rate limit, decays after a long clean run, and all six workers share one pause instead
+  of each taking their own. A rate-limited request is retried on the same transport, never
+  escalated to a second one. The pass settles on whatever Grok is allowing at the time, which is
+  the only number that was ever going to be right — the measurements bracketing it were 41
+  requests a second on a fresh bucket and about 5 sustained.
+
+- The estimate now says so, giving a range rather than the optimistic end of it, and the progress
+  line reports the time remaining computed from the rate actually being achieved.
+
+---
+
 ## [1.79.1] — 2026-09-29
 
 ### Fixed

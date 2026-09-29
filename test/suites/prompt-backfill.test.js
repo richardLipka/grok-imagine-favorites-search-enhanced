@@ -129,6 +129,54 @@ module.exports = {
     t.equal('the row stays top-level', s.postById.get('v9').isChild, false);
     t.equal('while its own prompt is still recovered', s.postById.get('v9').prompt, 'a lone clip');
 
+    t.group('pacing finds the rate instead of assuming one');
+    // The bucket here is large and refills slowly, which is the worst shape to hardcode against:
+    // the first 300 requests went through at 41/s with no limit, and the sustained rate after it
+    // drained measured about 5. Any fixed delay is wrong by roughly eight times in one direction
+    // or the other, so the delay is discovered.
+    s = createIndexSandbox();
+    s.resetDetailPacing();
+    t.equal('it starts out of the way', s.getDetailDelayMs(), 0);
+    s.noteDetailRateLimit();
+    const first = s.getDetailDelayMs();
+    t.ok('a rate limit introduces one', first > 0, first);
+    s.noteDetailRateLimit();
+    t.equal('and the next one doubles it', s.getDetailDelayMs(), first * 2);
+    for (let i = 0; i < 12; i++) s.noteDetailRateLimit();
+    t.ok('but it is capped', s.getDetailDelayMs() <= 2000, s.getDetailDelayMs());
+    const capped = s.getDetailDelayMs();
+    for (let i = 0; i < 119; i++) s.noteDetailSuccess();
+    t.equal('a short clean run does not move it', s.getDetailDelayMs(), capped);
+    s.noteDetailSuccess();
+    t.ok('a long one decays it', s.getDetailDelayMs() < capped, s.getDetailDelayMs());
+    s.resetDetailPacing();
+    t.equal('and a new pass starts clean', s.getDetailDelayMs(), 0);
+    // A pass that inherited the previous pass's backoff would crawl for no reason.
+    t.ok('which backfillAssetDetails does', readSource().includes('resetDetailPacing();'),
+      'the pass does not reset its pacing');
+
+    t.group('a rate-limited request is not retried on a second transport');
+    // Sending it to GM as well doubles the load on the bucket that just rejected it -- and that
+    // is what turned the first live run into six workers each waiting five seconds in parallel.
+    s = createIndexSandbox();
+    s.setStored('grokSearchRateLimitWaitMs', '1000');
+    await s.syncAssetsFeed(null, { stopWhenKnown: false });
+    s.setAssetPages([{ assets: [feedRow(IMAGE('r1', 'x'))] }]);
+    await s.syncAssetsFeed(null, { stopWhenKnown: false });
+    let calls = 0;
+    s.setPageFetch(async () => {
+      calls++;
+      if (calls === 1) return { ok: false, status: 429 };
+      return { ok: true, status: 200, json: async () => ({ asset: IMAGE('r1', 'recovered') }) };
+    });
+    s.setAssetDetails({ r1: IMAGE('r1', 'from gm') });
+    res = await s.backfillAssetDetails({});
+    t.equal('the page transport was asked twice', calls, 2);
+    t.equal('and the manager not at all', s.gmDetailCalls.length, 0);
+    t.equal('the retry is what answered', s.postById.get('r1').prompt, 'recovered');
+    t.equal('so nothing is counted as a failure', res.failed, 0);
+    t.ok('and the pass slowed itself down', s.getDetailDelayMs() > 0, s.getDetailDelayMs());
+
     t.group('an asset that is gone is an answer, not a failure');
     // 404 means deleted. Counting it as a failure leaves the row unstamped, so every later pass
     // asks again -- for ever, for a row that can never answer.
