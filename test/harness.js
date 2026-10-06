@@ -339,22 +339,38 @@ function createBulkDownloadSandbox(control = {}) {
     let lastFailedDownloads = [];
     let lastDownloadDirHandle = null;
 
-    const log = { statuses: [], saved: [], confirms: 0, picks: 0, syncs: 0, permissionChecks: 0 };
+    const log = {
+      statuses: [], saved: [], confirms: 0, picks: 0, syncs: 0, permissionChecks: 0,
+      // Every write as "folder/file", and every getDirectoryHandle call, so a test can tell a
+      // cached folder handle from one asked for again.
+      writes: [], dirCalls: [],
+    };
     const failNames = new Set(control.saveFails || []);
 
     function setDownloadStatus(text) { log.statuses.push(text); }
     function syncDownloadSelectedButtons() { log.syncs++; }
     function getPostDownloadFilename(p) { return p.noFilename ? '' : p.id + '.jpg'; }
     async function confirmBulkDownload() { log.confirms++; return control.confirm !== false; }
+    function makeDirHandle(name) {
+      return {
+        name,
+        async getDirectoryHandle(child, opts) {
+          log.dirCalls.push({ parent: name, child, create: Boolean(opts && opts.create) });
+          if ((control.dirFails || []).includes(child)) throw new Error('mkdir failed');
+          return makeDirHandle(child);
+        },
+      };
+    }
     async function pickDownloadFolder() {
       log.picks++;
       if (control.pickerError) throw control.pickerError;
-      return { handle: 'picked' };
+      return makeDirHandle('picked');
     }
     async function ensureDirWritePermission() { log.permissionChecks++; }
     async function saveBlobToFolder(dir, filename) {
       if (failNames.has(filename)) throw new Error('save failed');
       log.saved.push(filename);
+      log.writes.push((dir && dir.name ? dir.name : '?') + '/' + filename);
     }
     async function prepareDownloadBlobWithRetry(post, signal) {
       if (signal?.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
@@ -370,6 +386,7 @@ function createBulkDownloadSandbox(control = {}) {
     return {
       log,
       cancelBulkDownload, clearFailedDownloads, downloadPostsToFolder, retryFailedDownloads,
+      sanitizeFolderName,
       get failed() { return lastFailedDownloads; },
       get dirHandle() { return lastDownloadDirHandle; },
       get busy() { return bulkDownloadInProgress; },
@@ -494,7 +511,7 @@ function createSearchBarSandbox(storage = {}) {
     const RESULTS_ONLY_KEY = 'grokSearchResultsOnly';
     const SEARCH_BAR_COLLAPSED_KEY = 'grokSearchBarCollapsed';
     const store = Object.assign({}, storage);
-    const log = { forced: [], hides: 0, nativeApplies: 0 };
+    const log = { forced: [], hides: 0, nativeApplies: 0, panelOffsets: 0 };
 
     let resultsOnly = true;
     let searchBarExpanded = true;
@@ -506,6 +523,9 @@ function createSearchBarSandbox(storage = {}) {
     function setResultsOnlyEnabled(v) { resultsOnly = Boolean(v); log.forced.push(resultsOnly); }
     function hideAllSearchResults() { log.hides++; }
     function applyNativeVisibility() { log.nativeApplies++; }
+    // Defined past the end of the sliced region; what matters here is that collapsing asks for
+    // the panel's offset to be recomputed, since a collapsed bar reserves nothing.
+    function updateResultsPanelOffset() { log.panelOffsets++; }
     const document = { getElementById: () => null };
   `;
 
@@ -532,6 +552,73 @@ ${epilogue}`)(storage);
  * Tags, which are Grok collections. The transport is stubbed; what is under test is the
  * membership map, the add/remove bookkeeping, and that a no-op is distinguishable from a change.
  */
+/**
+ * Where the search bar is allowed to end up, and how much of the screen the results panel then
+ * gives it. The DOM is a stand-in with just enough of an element to be positioned: a class list,
+ * an inline style, and a rect the test controls.
+ */
+function createSearchBarMoveSandbox(control = {}) {
+  const region = sliceBetween(readSource(),
+    '  const SEARCH_BAR_EDGE_PAD = 8;', '  function bindSearchBarDrag(');
+
+  const prelude = `
+    const SEARCH_BAR_POS_KEY = 'grokSearchBarPos';
+    const store = Object.assign({}, control.store || {});
+    let rect = Object.assign({ left: 0, top: 16, width: 900, height: 240 }, control.rect || {});
+    rect.bottom = rect.top + rect.height;
+    const rootStyle = {};
+    const classes = new Set();
+
+    function readStoredString(k, fallback = '') {
+      return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : fallback;
+    }
+    function writeStoredString(k, v) { store[k] = String(v); }
+
+    const wrap = {
+      style: {
+        removeProperty(name) { delete wrap.style[name]; },
+      },
+      classList: {
+        add: c => classes.add(c),
+        remove: c => classes.delete(c),
+        contains: c => classes.has(c),
+      },
+      getBoundingClientRect: () => rect,
+    };
+    const document = {
+      documentElement: {
+        style: {
+          setProperty: (k, v) => { rootStyle[k] = v; },
+          removeProperty: k => { delete rootStyle[k]; },
+        },
+      },
+      getElementById: id => (id === 'grok-search-wrap' && !control.noWrap ? wrap : null),
+    };
+    const window = {
+      innerWidth: control.viewW || 1920,
+      innerHeight: control.viewH || 1000,
+    };
+  `;
+
+  const epilogue = `
+    return {
+      store, rootStyle,
+      clampSearchBarPos, computePanelTopOffset, updateResultsPanelOffset,
+      applySearchBarPosition, resetSearchBarPosition, readStoredSearchBarPos,
+      get left() { return wrap.style.left; },
+      get top() { return wrap.style.top; },
+      get moved() { return classes.has('grok-bar-moved'); },
+      get panelTop() { return rootStyle['--grok-panel-top']; },
+      setRect(next) { rect = Object.assign({}, rect, next); rect.bottom = rect.top + rect.height; },
+      setCollapsed(on) { if (on) classes.add('collapsed'); else classes.delete('collapsed'); },
+    };
+  `;
+
+  return new Function('control', `${prelude}
+${region}
+${epilogue}`)(control);
+}
+
 function createTagSandbox(control = {}) {
   const src = readSource();
   const region = sliceBetween(src, '  function normalizeTagName(name) {', '  /** Optimistic toggle:')
@@ -548,6 +635,11 @@ function createTagSandbox(control = {}) {
     const COLLECTION_ASSETS_PAGE = 500;
     const TAG_NAME_MAX = 60;
     const FILTER_TAG_KEY = 'grokSearchFilterTag';
+    const TAG_SCOPE_KEY = 'grokSearchTagScope';
+    const TAG_SCOPE_SINGLE = 'single';
+    const TAG_SCOPE_SET = 'set';
+    const TAG_SET_CONCURRENCY = 4;
+    const UNTAGGED_FOLDER_NAME = '_untagged';
     const log = { requests: [], stored: {} };
 
     let filterTagId = '';
@@ -557,6 +649,31 @@ function createTagSandbox(control = {}) {
     let tagsLoading = null;
 
     function writeStoredString(k, v) { log.stored[k] = v; }
+    function readStoredString(k, fallback = '') {
+      return Object.prototype.hasOwnProperty.call(log.stored, k) ? log.stored[k] : fallback;
+    }
+
+    // The real index, as far as the set walk is concerned: parent/child edges and nothing else.
+    const postById = new Map((control.posts || []).map(p => [p.id, p]));
+    const allPosts = (control.posts || []).slice();
+    function getRootIdOf(post) { return String(post?.rootId || post?.parentId || ''); }
+    function getAllDescendantPosts(rootId) {
+      const out = [];
+      const walk = id => {
+        for (const p of allPosts) {
+          if (String(p.parentId || '') !== String(id) || out.includes(p)) continue;
+          out.push(p);
+          walk(p.id);
+        }
+      };
+      walk(rootId);
+      return out;
+    }
+    async function runPool(items, concurrency, fn) {
+      const results = [];
+      for (const item of items) results.push(await fn(item));
+      return results;
+    }
     function pickLikedCollection(list) {
       return (list || []).find(c => c && c.isDefault === true) || null;
     }
@@ -572,6 +689,13 @@ function createTagSandbox(control = {}) {
     return {
       log, loadTags, setAssetTag, createTag, renameTag, deleteTag, matchesTagFilter,
       normalizeTagName, tagIdsForAsset, getTagById,
+      getTagScope, setTagScope, getGenerationSetIds, tagIdsForSet, tagFolderNamesForPost,
+      applyTagToPost,
+      setTagList(list) { tagList = list.slice(); },
+      setMembership(map) {
+        tagsByAsset = new Map(Object.entries(map).map(([k, v]) => [k, new Set(v)]));
+        tagsLoaded = true;
+      },
       get tagList() { return tagList; },
       get tagsLoaded() { return tagsLoaded; },
       get filterTagId() { return filterTagId; },
@@ -849,5 +973,6 @@ module.exports = {
   createDownloadSandbox, createBulkDownloadSandbox,
   createFeedSandbox, createNativeVisibilitySandbox, createSearchBarSandbox,
   createDeleteSandbox, createThumbnailSandbox, createTagSandbox,
+  createSearchBarMoveSandbox,
   createLightboxAdvanceSandbox,
 };

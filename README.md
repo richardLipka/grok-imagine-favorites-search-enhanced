@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 A standalone project by **Richard Lipka**, grown from [IronSniper1's](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) base script and extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, deletion, and much else — see [Credits and origins](#credits-and-origins).
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.user.js` **v1.80.0** · `grokPostSidebar.user.js` **v1.5.0**  
+**Current versions:** `grokSearch.user.js` **v1.81.0** · `grokPostSidebar.user.js` **v1.5.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Credits and origins
@@ -17,7 +17,7 @@ credit.
 |--------|---------|--------------|
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | 2026-03-07 | **The base this repository was forked from.** |
 | [Strapples — Grok Imagine Favorites Search (Greasy Fork)](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) · [GrokImagineSearchandOrganize](https://github.com/Strapples/GrokImagineSearchandOrganize) | 2026-03-20 | A parallel userscript, also forked from IronSniper1. Its author asks that people link back to their GitHub, so it is linked here. |
-| **This repo** | — | Everything since: `grokSearch.user.js` v1.80.0 + `grokPostSidebar.user.js` v1.5.0 |
+| **This repo** | — | Everything since: `grokSearch.user.js` v1.81.0 + `grokPostSidebar.user.js` v1.5.0 |
 
 Earlier versions of this README described the Greasy Fork script as the original and IronSniper1 as
 downstream of it. That was the wrong way round: IronSniper1 came first, and the Greasy Fork script
@@ -145,7 +145,9 @@ Indexing time depends on library size. Leave the tab open until the status finis
 | **Default** | Reset to 44 per page, 100% size, **Compact** off, **Batch groups** off, button in the top-right corner |
 | **Sort** | Newest or oldest (remembered between sessions) |
 | **Clear** | Clears text, dates, model, liked, and media filters |
+| **Grip** (the handle above the bar) | Drag the whole bar anywhere on screen. Double-click it, or press Escape with it focused, to put it back in the centre. Arrow keys nudge it, Shift+arrows move it further. The position is remembered |
 | **Download selected** | In the match-count area — save checked images to a folder (Chrome/Edge) |
+| **Download by tag** | Save the **whole indexed catalogue** into one folder per tag (see [Tags](#tags)) |
 | **Import JSON** | Merge a previously exported index file back in (adds and updates; never deletes) |
 | **Export JSON** | Download full index (schema v5, parents + children) |
 | **Export results** | Export filtered results or selected subset as **JSON** (schema v5) or **CSV** (RFC-4180 table with prompt, model, media URLs, parent/child IDs) |
@@ -171,6 +173,19 @@ Shown when **Results only** is on (default). These controls are **not** in the s
 > just the items matching the active filter; use **Clear selection** to start over.
 
 > **Inline mode** (`Results only` off): the panel is hidden, so **Download data**, **Check all**, and **Clear selection** are unavailable. Use **Download selected** from the search bar or turn **Results only** back on.
+
+#### Moving the bar
+
+The bar is wider than the gap above the results panel, so by default it covers the middle of the
+panel's first row of cards — their select boxes included. Two things deal with that:
+
+- while the bar is at the top, the panel starts **just below it** rather than at a fixed offset, so
+  nothing is hidden behind it (capped at 45% of the window height);
+- the **grip** above the bar drags it anywhere. Drag it to a corner and the panel takes the full
+  height back.
+
+A bar dropped past an edge is pulled back inside, so resizing the window smaller cannot leave it
+somewhere you cannot reach. Double-click the grip to put it back in the centre.
 
 ### Collapsed search bar
 
@@ -241,10 +256,17 @@ When inspecting a selected result in the lightbox:
 | Context menu → **Download all** | Every descendant of the post to a folder — works from a variation too, not just the original |
 | Lightbox → **Download** | Same single-file download for the current image or video |
 | **Download selected** | Pick a folder once; files saved as `grok-{id}.{ext}` one by one; progress in toolbar and panel |
+| **Download by tag** | The **whole indexed catalogue**, filed into one folder per tag. A set carrying two tags is saved into **both** folders; images with no tag go into `_untagged`. The confirmation states the plan first — how many images, how many folders, and how many of the files are second copies |
 | **> 5 selected** | Custom confirm dialog naming the count, and noting that you can cancel and resume |
 | **Cancel** | Appears while a bulk download runs. Stops it and aborts the file in flight |
 | **Retry N files** | Appears after a run that did not finish. Downloads only what is left, into the **same folder** — no second folder prompt |
 | Videos | Downloaded without metadata changes |
+
+**Download by tag** takes the whole index rather than your selection, and the folder names are your
+tag names with anything a filesystem will not accept replaced by `-`. Each image is fetched **once**
+however many folders it belongs in, and tags are re-read from Grok before the run starts — a stale
+membership list would file thousands of images under the wrong name. Cancel and **Retry** work the
+same as for a selection.
 
 Each file is attempted up to **three times** with a growing delay before it counts as failed, so a
 single flaky response does not cost you the image. Cancelling is not a failure: everything still
@@ -342,9 +364,28 @@ the same ones, so a tag added here appears in Grok's own UI and the other way ro
 | **Lightbox**, under the prompt | See every tag the image carries, remove one with its ×, add an existing tag, or create a new one inline |
 | **Tag** filter in the toolbar | Show only images carrying one tag. Appears once you have at least one tag besides *Liked* |
 | **Tags** button | Create, rename and delete tags, see how many images each holds, and apply a tag to everything currently selected |
+| **Whole set** (lightbox tag row, and the same checkbox in the **Tags** dialog) | Choose whether a tag you assign covers the one image or the whole generation — see below |
 
 *Liked* is not offered as a tag — the heart already manages it, and renaming or deleting it from
 here would break that.
+
+#### Tagging one image, or the whole set
+
+Grok's collections are **per image**. Tag a variation and only that variation is tagged, which is
+why a set you tagged once shows up under the tag by one picture and not by its eleven siblings.
+
+**Whole set** changes that for tags you assign from here: tagging *any* image in a generation tags
+every image in it, from whichever member you clicked, and removing the tag removes it from all of
+them. Its state is shown by the chips too — with it on, the lightbox lists the tags on the **set**,
+because that is what your next click will change.
+
+It is **off by default**: nothing about tagging changes until you turn it on. Images that already
+carry the tag are not re-sent, so tagging a set of twenty where nineteen already have it costs one
+request, and if part of a set fails the status line says how many landed rather than claiming
+success.
+
+**Download by tag** ignores this setting and always files by the set, so a library tagged one image
+at a time still downloads the way it reads on screen.
 
 Deleting a tag removes **the grouping only**. The images keep existing and stay in your library.
 

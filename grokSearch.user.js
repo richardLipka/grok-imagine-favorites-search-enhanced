@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.80.0
+// @version      1.81.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -125,6 +125,21 @@
   const COLLECTION_ASSETS_PAGE = 500;
   const TAG_NAME_MAX = 60;
   const FILTER_TAG_KEY = 'grokSearchFilterTag';
+  /**
+   * Whether a hand-assigned tag covers the one image or its whole generation.
+   *
+   * Grok's own collections are per-asset, so tagging a child tags only that child, and the
+   * iOS app appears to show a set under a tag whichever member carries it. Both readings are
+   * defensible and only the user knows which they meant, so this is a choice, stored, and the
+   * default is the behaviour that existed before it was offered.
+   */
+  const TAG_SCOPE_KEY = 'grokSearchTagScope';
+  const TAG_SCOPE_SINGLE = 'single';
+  const TAG_SCOPE_SET = 'set';
+  /** A set is a handful of rows, not thousands; four at a time keeps a tag click responsive. */
+  const TAG_SET_CONCURRENCY = 4;
+  /** Where images carrying no tag at all go when the catalogue is filed by tag. */
+  const UNTAGGED_FOLDER_NAME = '_untagged';
   /** Liked-list pages to walk for metadata (40 posts/page; includes childPosts). */
   const SYNC_LIST_REFRESH_PAGES = 4;
   const SYNC_LIST_PAGE_DELAY_MS = 40;
@@ -178,7 +193,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.80.0';
+  const SCRIPT_VERSION = '1.81.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -257,6 +272,7 @@
   const TOGGLE_POS_KEY = 'grokSearchTogglePos';
   const RATE_LIMIT_WAIT_KEY = 'grokSearchRateLimitWaitMs';
   const SEARCH_BAR_COLLAPSED_KEY = 'grokSearchBarCollapsed';
+  const SEARCH_BAR_POS_KEY = 'grokSearchBarPos';
   const MEDIA_MIN_OPTIONS = [1, 3, 5, 7, 10];
   /** Wait after last keystroke before filtering (ms); capped at 1s. */
   const SEARCH_DEBOUNCE_MS = 400;
@@ -1465,6 +1481,97 @@
       writeStoredString(FILTER_TAG_KEY, '');
     }
     return { ok: true };
+  }
+
+  // ─── Tag scope: one image, or the whole generation ─────────────────────────
+  function getTagScope() {
+    return readStoredString(TAG_SCOPE_KEY, TAG_SCOPE_SINGLE) === TAG_SCOPE_SET
+      ? TAG_SCOPE_SET
+      : TAG_SCOPE_SINGLE;
+  }
+
+  function setTagScope(scope) {
+    writeStoredString(TAG_SCOPE_KEY, scope === TAG_SCOPE_SET ? TAG_SCOPE_SET : TAG_SCOPE_SINGLE);
+  }
+
+  /**
+   * Every row of one generation: the post the set hangs from, then everything below it.
+   *
+   * Keyed on the root rather than on the clicked row, so tagging the fourth variation of a
+   * set reaches the original and its siblings too -- which is the whole point of the set
+   * scope. A row with no parent is its own root, so this works for a bare image as well.
+   */
+  function getGenerationSetIds(postOrId) {
+    const id = String((typeof postOrId === 'object' ? postOrId?.id : postOrId) || '');
+    if (!id) return [];
+    const post = (typeof postOrId === 'object' && postOrId) || postById.get(id) || null;
+    const rootId = (post && getRootIdOf(post)) || id;
+    const ids = [rootId];
+    const seen = new Set(ids);
+    for (const kid of getAllDescendantPosts(rootId)) {
+      if (seen.has(kid.id)) continue;
+      seen.add(kid.id);
+      ids.push(kid.id);
+    }
+    // The clicked row itself, in case the index does not know its root's children (an orphaned
+    // child row would otherwise be tagged by proxy and never itself).
+    if (!seen.has(id)) ids.push(id);
+    return ids;
+  }
+
+  /**
+   * The union of the tags carried by any member of a set.
+   *
+   * Read-side only: it changes nothing about what Grok stores, so a library tagged under the
+   * single-image scope still files correctly when the catalogue is sorted by tag. This is the
+   * same union the set scope writes out explicitly.
+   */
+  function tagIdsForSet(postOrId) {
+    const out = new Set();
+    for (const id of getGenerationSetIds(postOrId)) {
+      const mine = tagIdsForAsset(id);
+      if (mine) for (const tagId of mine) out.add(tagId);
+    }
+    return out;
+  }
+
+  /** Folder names for one post when the catalogue is filed by tag: every tag on its set. */
+  function tagFolderNamesForPost(post) {
+    const ids = tagIdsForSet(post);
+    const names = tagList.filter(t => ids.has(t.id)).map(t => t.name);
+    return names.length ? names : [UNTAGGED_FOLDER_NAME];
+  }
+
+  /**
+   * Assigns or clears a tag at the chosen scope, and reports what actually happened.
+   *
+   * Members that already agree with the requested state are skipped rather than asked: a set
+   * of twenty where nineteen are already tagged costs one request, not twenty. The result
+   * carries `applied` and `failed` so a partial run can be said out loud instead of being
+   * reported as a flat success.
+   */
+  async function applyTagToPost(post, tagId, member, { scope = getTagScope() } = {}) {
+    const selfId = String(post?.id || '');
+    if (!selfId || !tagId) return { ok: false, applied: 0, failed: 0, changed: false };
+    const ids = scope === TAG_SCOPE_SET ? getGenerationSetIds(post) : [selfId];
+    const targets = ids.filter(id => {
+      const mine = tagIdsForAsset(id);
+      const has = Boolean(mine && mine.has(tagId));
+      return member ? !has : has;
+    });
+    if (!targets.length) {
+      return { ok: true, applied: 0, failed: 0, changed: false, scope, size: ids.length };
+    }
+    let applied = 0;
+    let failed = 0;
+    await runPool(targets, TAG_SET_CONCURRENCY, async id => {
+      const res = await setAssetTag(id, tagId, member);
+      if (res.ok) applied++;
+      else failed++;
+    });
+    return {
+      ok: failed === 0, applied, failed, changed: applied > 0, scope, size: ids.length,
+    };
   }
 
   /** Optimistic toggle: flips the row, reverts if the request fails. */
@@ -5323,7 +5430,7 @@
     });
   }
 
-  function confirmBulkDownload(count) {
+  function confirmBulkDownload(count, body = '') {
     ensureBulkDownloadConfirmDialog();
     return new Promise(resolve => {
       bulkDownloadConfirmResolver = resolve;
@@ -5336,8 +5443,8 @@
       if (okBtn) { okBtn.textContent = 'Continue'; okBtn.classList.remove('grok-confirm-danger'); }
       const noun = count === 1 ? 'image' : 'images';
       if (msg) {
-        msg.textContent = `This will take some time. You selected ${count} ${noun}. `
-          + 'You can cancel while it runs and retry whatever is left.';
+        msg.textContent = body || (`This will take some time. You selected ${count} ${noun}. `
+          + 'You can cancel while it runs and retry whatever is left.');
       }
       if (dlg) {
         dlg.hidden = false;
@@ -5391,12 +5498,54 @@
     });
   }
 
-  async function downloadPostsToFolder(posts, { dirHandle: existingHandle = null } = {}) {
+  /**
+   * A tag name is user text and a folder name is not: Windows rejects \ / : * ? " < > | and
+   * every platform rejects an empty one, so the name is reduced to something creatable rather
+   * than letting one awkward tag abort a catalogue-sized run. A trailing dot or space is also
+   * dropped -- Windows silently strips those, which would make two tags collide.
+   */
+  function sanitizeFolderName(name) {
+    const clean = String(name || '')
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '-')
+      .replace(/\s+/g, ' ')
+      .slice(0, 64)
+      // Leading dots and the dashes the substitution above leaves behind go together: a
+      // tag of "../x" must not become "-.." and a tag of "///" must not become a folder
+      // literally named "---".
+      .replace(/^[-.\s]+/, '')
+      .replace(/[-.\s]+$/, '');
+    return clean || 'untitled';
+  }
+
+  /**
+   * Subfolder handles are cached for the run: `getDirectoryHandle` is a filesystem round trip,
+   * and a catalogue of 20,000 images across a dozen tags would otherwise ask for the same
+   * dozen folders 20,000 times.
+   */
+  async function resolveDownloadFolder(rootHandle, cache, name) {
+    if (!name) return rootHandle;
+    const key = sanitizeFolderName(name);
+    if (cache.has(key)) return cache.get(key);
+    const handle = await rootHandle.getDirectoryHandle(key, { create: true });
+    cache.set(key, handle);
+    return handle;
+  }
+
+  /**
+   * `folderNamesFor` turns one post into the subfolders it belongs in. Returning more than one
+   * writes the same image into each of them, which is what filing by tag has to do for a set
+   * carrying two tags -- there is no one right folder for it, and a copy in both is more useful
+   * than a choice made arbitrarily. Omitting it writes flat into the chosen folder, exactly as
+   * before.
+   */
+  async function downloadPostsToFolder(posts, {
+    dirHandle: existingHandle = null, folderNamesFor = null, confirmed = false,
+  } = {}) {
     if (bulkDownloadInProgress) return;
     if (posts.length === 0) return;
-    if (!existingHandle && posts.length > BULK_DOWNLOAD_CONFIRM_ABOVE) {
-      const confirmed = await confirmBulkDownload(posts.length);
-      if (!confirmed) return;
+    if (!existingHandle && !confirmed && posts.length > BULK_DOWNLOAD_CONFIRM_ABOVE) {
+      const ok = await confirmBulkDownload(posts.length);
+      if (!ok) return;
     }
     let dirHandle = existingHandle;
     try {
@@ -5422,6 +5571,8 @@
     syncDownloadSelectedButtons();
 
     let ok = 0;
+    let files = 0;
+    const folderCache = new Map();
     const failed = [];
     const total = posts.length;
     try {
@@ -5437,7 +5588,14 @@
         setDownloadStatus(`downloading ${i + 1}/${total}…`, true);
         try {
           const blob = await prepareDownloadBlobWithRetry(post, signal);
-          await saveBlobToFolder(dirHandle, filename, blob);
+          // Fetched once, written as many times as it has tags. A second download of the same
+          // bytes to put them in a second folder would double a catalogue-sized run for nothing.
+          const folders = folderNamesFor ? folderNamesFor(post) : [''];
+          for (const folder of (folders.length ? folders : [''])) {
+            const target = await resolveDownloadFolder(dirHandle, folderCache, folder);
+            await saveBlobToFolder(target, filename, blob);
+            files++;
+          }
           ok++;
         } catch (err) {
           if (isAbortError(err) || bulkDownloadCancelled) {
@@ -5455,7 +5613,12 @@
       }
       lastFailedDownloads = failed;
       lastDownloadDirHandle = failed.length ? dirHandle : null;
-      const savedText = `saved ${ok} file${ok === 1 ? '' : 's'}`;
+      // Filed by tag, the file count exceeds the image count whenever a set carries two tags,
+      // and reporting only one of the two numbers makes the other look like a bug.
+      const savedText = folderNamesFor
+        ? `saved ${ok} image${ok === 1 ? '' : 's'} as ${files} file${files === 1 ? '' : 's'}`
+          + ` in ${folderCache.size} folder${folderCache.size === 1 ? '' : 's'}`
+        : `saved ${ok} file${ok === 1 ? '' : 's'}`;
       if (bulkDownloadCancelled) {
         setDownloadStatus(`cancelled — ${savedText}, ${failed.length} left`);
       } else {
@@ -5601,6 +5764,61 @@
       return;
     }
     await downloadPostsToFolder(posts);
+  }
+
+  /**
+   * The whole catalogue, filed into one folder per tag.
+   *
+   * Tags are read fresh rather than trusted from cache: the folder layout is the point of the
+   * run, and a stale membership map would file thousands of images under the wrong name -- or
+   * under `_untagged`, which looks exactly like the tags having been lost.
+   *
+   * The folder for a post is every tag on its *set*, not on the row itself, so a library tagged
+   * one-image-at-a-time still files the way the set reads on screen. A set carrying two tags is
+   * written into both; there is no single correct folder for it.
+   */
+  async function downloadCatalogueByTag() {
+    if (bulkDownloadInProgress) return;
+    setDownloadStatus('reading tags…', true);
+    const complete = await loadTags({ force: true });
+    if (!complete) {
+      setDownloadStatus('could not read every tag — nothing downloaded');
+      return;
+    }
+    const posts = allPosts.filter(p => getPostDownloadFilename(p));
+    if (!posts.length) {
+      setDownloadStatus('nothing indexed');
+      return;
+    }
+
+    // Counted before the picker opens, because "6,000 images into 12 folders, 6,400 files" is
+    // the one thing that decides whether this is the button the user wanted.
+    const folders = new Set();
+    let writes = 0;
+    for (const post of posts) {
+      const names = tagFolderNamesForPost(post);
+      for (const name of names) folders.add(sanitizeFolderName(name));
+      writes += names.length;
+    }
+    const extra = writes - posts.length;
+    const ok = await confirmBulkDownload(posts.length,
+      `${posts.length.toLocaleString()} images will be saved into ${folders.size} folder`
+      + `${folders.size === 1 ? '' : 's'} named after your tags`
+      + (extra > 0
+        ? `, ${writes.toLocaleString()} files in all — ${extra.toLocaleString()} of them second`
+          + ` copies, because a set with two tags is filed under both.`
+        : '.')
+      + ' Images carrying no tag go into `' + UNTAGGED_FOLDER_NAME + '`.'
+      + ' Pick the folder to put all of this in. You can cancel while it runs and retry'
+      + ' whatever is left.');
+    if (!ok) {
+      setDownloadStatus('');
+      return;
+    }
+    await downloadPostsToFolder(posts, {
+      folderNamesFor: tagFolderNamesForPost,
+      confirmed: true,
+    });
   }
 
   async function downloadAllChildPosts(post) {
@@ -5805,8 +6023,18 @@
     row.innerHTML = `
       <span class="grok-lightbox-tags-label">Tags</span>
       <span class="grok-lightbox-tag-chips"></span>
-      <select class="grok-lightbox-tag-add grok-display-select" aria-label="Add a tag to this image"></select>`;
+      <select class="grok-lightbox-tag-add grok-display-select" aria-label="Add a tag to this image"></select>
+      <label class="grok-lightbox-tag-scope grok-filter-check-label"
+        title="Apply tags to the whole generation: tag or untag any image in a set and every image in that set follows">
+        <input type="checkbox" class="grok-lightbox-tag-scope-check" />
+        Whole set
+      </label>`;
     meta.appendChild(row);
+
+    row.querySelector('.grok-lightbox-tag-scope-check')?.addEventListener('change', e => {
+      setTagScope(e.target.checked ? TAG_SCOPE_SET : TAG_SCOPE_SINGLE);
+      renderLightboxTagRow(getCurrentLightboxPost());
+    });
 
     row.addEventListener('click', async e => {
       const chip = e.target.closest('.grok-lightbox-tag-chip-remove');
@@ -5817,9 +6045,11 @@
       const tagId = chip.dataset.tagId;
       if (!post || !tagId) return;
       chip.disabled = true;
-      const res = await setAssetTag(post.id, tagId, false);
-      if (!res.ok) flashStampStatus('tag removal failed');
+      const res = await applyTagToPost(post, tagId, false);
+      flashStampStatus(describeTagResult(res, false));
       renderLightboxTagRow(post);
+      // The filter reads per-row membership, so a set-wide change moves rows in and out of the
+      // current result page even when the row that was clicked is not the one that moved.
       if (filterTagId) applyFilter();
     });
 
@@ -5842,9 +6072,8 @@
           }
           tagId = made.tag.id;
         }
-        const res = await setAssetTag(post.id, tagId, true);
-        if (!res.ok) flashStampStatus('tagging failed');
-        else if (res.changed === false) flashStampStatus('already tagged');
+        const res = await applyTagToPost(post, tagId, true);
+        flashStampStatus(describeTagResult(res, true));
       } finally {
         sel.disabled = false;
         renderLightboxTagRow(post);
@@ -5852,6 +6081,20 @@
         if (filterTagId) applyFilter();
       }
     });
+  }
+
+  /**
+   * A set-wide tag either worked everywhere or it did not, and "tagged" over a run that reached
+   * three rows of eight is the kind of quiet half-success that gets noticed a week later. So the
+   * counts are said out loud whenever they are not the simple case.
+   */
+  function describeTagResult(res, member) {
+    const verb = member ? 'tagged' : 'untagged';
+    if (!res?.ok && !res?.applied) return member ? 'tagging failed' : 'tag removal failed';
+    if (res.failed) return `${verb} ${res.applied} of ${res.applied + res.failed} — ${res.failed} failed`;
+    if (!res.applied) return member ? 'already tagged' : 'was not tagged';
+    if (res.scope === TAG_SCOPE_SET && res.size > 1) return `${verb} ${res.applied} in this set`;
+    return verb;
   }
 
   function renderLightboxTagRow(post) {
@@ -5862,7 +6105,12 @@
     if (!post) { row.hidden = true; return; }
     row.hidden = false;
 
-    const mine = tagIdsForAsset(post.id);
+    const scope = getTagScope();
+    const check = row.querySelector('.grok-lightbox-tag-scope-check');
+    if (check) check.checked = scope === TAG_SCOPE_SET;
+    // Under the set scope the chips show the set's tags, because that is what a click will
+    // change. Under the single scope they show this row's, exactly as before.
+    const mine = scope === TAG_SCOPE_SET ? tagIdsForSet(post) : tagIdsForAsset(post.id);
     const current = tagList.filter(t => mine && mine.has(t.id));
     if (chips) {
       const html = current.length
@@ -7912,6 +8160,45 @@
         visibility: hidden;
         pointer-events: none;
       }
+      /* Once dragged, the bar is positioned outright; the centring transform has to go or it
+         would be offset by half its own width from wherever it was dropped. The collapse
+         animation keeps working because it only needs the vertical half of that transform. */
+      #grok-search-wrap.grok-bar-moved {
+        left: 0;
+        transform: none;
+        transition: opacity 0.22s ease, visibility 0.28s;
+      }
+      #grok-search-wrap.grok-bar-moved.collapsed {
+        transform: translateY(calc(-100% - 24px));
+        transition: transform 0.28s ease, opacity 0.22s ease, visibility 0.28s;
+      }
+      .grok-search-grip {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 14px;
+        margin: 0 auto -2px;
+        width: 72px;
+        border-radius: 7px;
+        background: rgba(15, 15, 20, 0.85);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        cursor: grab;
+        touch-action: none;
+        transition: background 0.15s, border-color 0.15s;
+      }
+      .grok-search-grip:hover,
+      .grok-search-grip:focus-visible {
+        background: rgba(139, 92, 246, 0.3);
+        border-color: rgba(196, 181, 253, 0.5);
+      }
+      .grok-search-grip--active { cursor: grabbing; background: rgba(139, 92, 246, 0.4); }
+      .grok-search-grip-dots {
+        width: 28px;
+        height: 4px;
+        border-radius: 2px;
+        background:
+          radial-gradient(circle, rgba(255,255,255,0.55) 1px, transparent 1.4px) 0 0/7px 4px repeat-x;
+      }
       #grok-search-toggle {
         position: fixed;
         top: 70px;
@@ -8360,11 +8647,14 @@
         overflow: hidden;
         box-sizing: border-box;
       }
+      /* The --grok-panel-top variable is set by updateResultsPanelOffset() to the bar's own bottom edge
+         while the bar is parked at the top, and removed when it is not, so the panel reclaims
+         the space as soon as the bar is dragged aside or collapsed. */
       html.grok-custom-results-mode #grok-results-panel {
-        top: max(120px, 12vh);
-        left: 2.5vw;
-        right: 2.5vw;
-        bottom: 2.5vh;
+        top: var(--grok-panel-top, max(120px, 12vh));
+        left: 2vw;
+        right: 2vw;
+        bottom: 1.5vh;
         width: auto;
         height: auto;
       }
@@ -9160,6 +9450,20 @@
         flex-wrap: wrap;
         gap: 6px;
         margin-top: 9px;
+      }
+      /* Pushed to the far end of the row: it changes what the next click means, so it has to
+         be visible, and it must not sit between the chips and the control that adds one. */
+      .grok-lightbox-tag-scope {
+        margin-left: auto;
+        font-size: 11px;
+        white-space: nowrap;
+      }
+      .grok-tag-scope-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 10px;
+        font-size: 12px;
       }
       .grok-lightbox-tags-label,
       .grok-lightbox-tags-empty {
@@ -10238,6 +10542,12 @@
     document.querySelectorAll('.grok-check-all-btn').forEach(btn => {
       btn.disabled = busy || total === 0 || matchedSelected === total;
     });
+    const byTag = document.getElementById('grok-download-by-tag-btn');
+    if (byTag) {
+      const indexed = allPosts ? allPosts.length : 0;
+      byTag.disabled = busy || indexed === 0;
+      byTag.textContent = indexed > 0 ? `Download by tag (${indexed.toLocaleString()})` : 'Download by tag';
+    }
     document.querySelectorAll('.grok-clear-selection-btn').forEach(btn => {
       btn.disabled = busy || count === 0;
     });
@@ -10448,6 +10758,11 @@
                  placeholder="New tag name" aria-label="New tag name" maxlength="60" />
           <button type="button" class="grok-toolbar-btn" id="grok-tag-create">Create</button>
         </div>
+        <label class="grok-filter-check-label grok-tag-scope-row"
+          title="Grok tags one image at a time. With this on, tagging any image also tags every other image in the same generation.">
+          <input type="checkbox" id="grok-tag-scope-check" />
+          Apply tags to the whole generation (set), not just the one image
+        </label>
         <div class="grok-bulk-download-confirm-actions">
           <button type="button" class="grok-toolbar-btn" id="grok-tag-apply-selection"></button>
           <button type="button" class="grok-toolbar-btn" data-grok-tag-close>Close</button>
@@ -10461,6 +10776,12 @@
     document.addEventListener('keydown', e => {
       const open = document.getElementById('grok-tag-manager');
       if (open && !open.hidden && e.key === 'Escape') { e.preventDefault(); closeTagManager(); }
+    });
+
+    dlg.querySelector('#grok-tag-scope-check')?.addEventListener('change', e => {
+      setTagScope(e.target.checked ? TAG_SCOPE_SET : TAG_SCOPE_SINGLE);
+      renderTagManager();
+      renderLightboxTagRow(getCurrentLightboxPost());
     });
 
     dlg.querySelector('#grok-tag-create').addEventListener('click', async () => {
@@ -10513,16 +10834,22 @@
       const tag = getTagById(tagId);
       const btn = document.getElementById('grok-tag-apply-selection');
       btn.disabled = true;
-      let done = 0, failed = 0;
+      // Tagging a selection is a hand assignment too, so it follows the same scope choice --
+      // a selection of four parents under the set scope tags the four sets, not the four rows.
+      let done = 0, failed = 0, rows = 0;
       for (const p of posts) {
-        const res = await setAssetTag(p.id, tagId, true);
+        const res = await applyTagToPost(p, tagId, true);
         if (res.ok) done++; else failed++;
+        rows += res.applied;
         setDownloadStatus(`tagging ${done + failed}/${posts.length}…`, true);
       }
       btn.disabled = false;
+      const name = tag ? tag.name : 'tag';
       setDownloadStatus(failed
         ? `tagged ${done}, failed ${failed}`
-        : `tagged ${done} as "${tag ? tag.name : 'tag'}"`);
+        : (getTagScope() === TAG_SCOPE_SET
+          ? `tagged ${rows} image${rows === 1 ? '' : 's'} across ${done} set${done === 1 ? '' : 's'} as "${name}"`
+          : `tagged ${done} as "${name}"`));
       renderTagManager();
       if (filterTagId) applyFilter();
     });
@@ -10533,6 +10860,8 @@
     const list = document.getElementById('grok-tag-manager-list');
     const note = document.getElementById('grok-tag-manager-note');
     const apply = document.getElementById('grok-tag-apply-selection');
+    const scopeCheck = document.getElementById('grok-tag-scope-check');
+    if (scopeCheck) scopeCheck.checked = getTagScope() === TAG_SCOPE_SET;
     if (!list) return;
     const counts = new Map();
     for (const set of tagsByAsset.values()) {
@@ -10584,6 +10913,28 @@
     if (dlg) dlg.hidden = true;
   }
 
+  /**
+   * The second download option: everything, filed by tag, rather than the current selection.
+   *
+   * It is a separate button rather than a mode on *Download selected*, because the two differ
+   * in what they take as well as where they put it — one reads the selection, the other
+   * ignores it entirely and reads the whole index.
+   */
+  function ensureDownloadByTagButton() {
+    if (document.getElementById('grok-download-by-tag-btn')) return;
+    const actions = getActionsRow();
+    if (!actions) return;
+    const btn = document.createElement('button');
+    btn.id = 'grok-download-by-tag-btn';
+    btn.className = 'grok-toolbar-btn';
+    btn.type = 'button';
+    btn.textContent = 'Download by tag';
+    btn.title = 'Download the whole indexed catalogue into one folder per tag '
+      + '(a set with two tags is saved under both)';
+    btn.addEventListener('click', () => downloadCatalogueByTag());
+    actions.appendChild(btn);
+  }
+
   function ensurePruneMissingButton() {
     if (document.getElementById('grok-prune-missing-btn')) return;
     const actions = getActionsRow();
@@ -10623,6 +10974,8 @@
     const wrap = document.getElementById('grok-search-wrap');
     const btn = document.getElementById('grok-search-toggle');
     if (wrap) wrap.classList.toggle('collapsed', !expanded);
+    // A collapsed bar occupies nothing, so the panel takes the space back.
+    updateResultsPanelOffset();
     if (btn) {
       btn.title = expanded ? 'Hide search bar' : 'Show search bar';
       btn.setAttribute('aria-expanded', String(expanded));
@@ -10649,6 +11002,14 @@
       #grok-search-wrap.collapsed {
         transform: translateX(-50%) translateY(calc(-100% - 24px));
         opacity: 0; visibility: hidden; pointer-events: none;
+      }
+      #grok-search-wrap.grok-bar-moved {
+        left: 0; transform: none;
+        transition: opacity 0.22s ease, visibility 0.28s;
+      }
+      #grok-search-wrap.grok-bar-moved.collapsed {
+        transform: translateY(calc(-100% - 24px));
+        transition: transform 0.28s ease, opacity 0.22s ease, visibility 0.28s;
       }
       #grok-search-toggle {
         position: fixed; top: 70px; right: 16px; z-index: 100005;
@@ -10689,6 +11050,207 @@
     } catch {
       return true;
     }
+  }
+
+  // ─── Moving the search bar out of the way ────────────────────────
+  /**
+   * The bar is fixed to the top centre at z-index 99990 and the results panel starts 120px
+   * down, so the bar sits on top of the middle of the panel's first row of cards — including
+   * their select boxes, which cannot be clicked at all while it is there. Collapsing the bar
+   * takes the search with it, so there was no way to reach those cards.
+   *
+   * Two changes fix it together, and either alone would be half a fix: the bar can be dragged
+   * anywhere by its grip, and the panel gives up the strip of screen the bar occupies for as
+   * long as the bar is still in the top region.
+   */
+  const SEARCH_BAR_EDGE_PAD = 8;
+  /** A dragged bar must keep this much of itself on screen, or it cannot be grabbed back. */
+  const SEARCH_BAR_MIN_VISIBLE = 48;
+  /** The most of the viewport the bar may push the panel down by. */
+  const PANEL_TOP_MAX_FRACTION = 0.45;
+  /** Below this the bar counts as parked at the top, and the panel makes room for it. */
+  const BAR_TOP_REGION_FRACTION = 0.25;
+  const PANEL_TOP_DEFAULT_PX = 120;
+
+  function readStoredSearchBarPos() {
+    const raw = readStoredString(SEARCH_BAR_POS_KEY, '');
+    if (!raw) return null;
+    const parts = raw.split(',').map(Number);
+    if (parts.length !== 2 || !parts.every(Number.isFinite)) return null;
+    return { left: parts[0], top: parts[1] };
+  }
+
+  /**
+   * Keeps the bar reachable. A window resized smaller after the bar was dragged to the far edge
+   * would otherwise restore it off screen, where nothing can be clicked and no reset is visible.
+   */
+  function clampSearchBarPos(pos, width, height, viewW, viewH) {
+    const w = Number(width) || 0;
+    const h = Number(height) || 0;
+    const vw = Number(viewW) || 0;
+    const vh = Number(viewH) || 0;
+    const maxLeft = Math.max(SEARCH_BAR_EDGE_PAD, vw - w - SEARCH_BAR_EDGE_PAD);
+    const maxTop = Math.max(SEARCH_BAR_EDGE_PAD, vh - Math.min(h, SEARCH_BAR_MIN_VISIBLE));
+    return {
+      left: Math.min(Math.max(Number(pos?.left) || 0, SEARCH_BAR_EDGE_PAD), maxLeft),
+      top: Math.min(Math.max(Number(pos?.top) || 0, SEARCH_BAR_EDGE_PAD), maxTop),
+    };
+  }
+
+  /**
+   * How far down the results panel has to start to clear the bar.
+   *
+   * Only the top of the screen is reserved: a bar dragged to the side or the bottom is the user
+   * putting it somewhere deliberate, and shrinking the panel to avoid it there would be the
+   * opposite of getting out of the way. Returns 0 for "no reservation needed".
+   */
+  function computePanelTopOffset(rect, viewH, collapsed) {
+    if (!rect || collapsed) return 0;
+    if (rect.bottom <= 0) return 0;
+    if (rect.top > viewH * BAR_TOP_REGION_FRACTION) return 0;
+    const want = Math.round(rect.bottom + SEARCH_BAR_EDGE_PAD);
+    const cap = Math.round(viewH * PANEL_TOP_MAX_FRACTION);
+    return Math.min(Math.max(want, PANEL_TOP_DEFAULT_PX), Math.max(PANEL_TOP_DEFAULT_PX, cap));
+  }
+
+  function updateResultsPanelOffset() {
+    const root = document.documentElement;
+    if (!root || !root.style) return;
+    const wrap = document.getElementById('grok-search-wrap');
+    const offset = wrap
+      ? computePanelTopOffset(
+        wrap.getBoundingClientRect(), window.innerHeight, wrap.classList.contains('collapsed'))
+      : 0;
+    if (offset) root.style.setProperty('--grok-panel-top', offset + 'px');
+    else root.style.removeProperty('--grok-panel-top');
+  }
+
+  function applySearchBarPosition(pos, persist = false) {
+    const wrap = document.getElementById('grok-search-wrap');
+    if (!wrap) return;
+    if (!pos) {
+      wrap.classList.remove('grok-bar-moved');
+      wrap.style.removeProperty('left');
+      wrap.style.removeProperty('top');
+      if (persist) writeStoredString(SEARCH_BAR_POS_KEY, '');
+      updateResultsPanelOffset();
+      return;
+    }
+    const rect = wrap.getBoundingClientRect();
+    const next = clampSearchBarPos(pos, rect.width, rect.height, window.innerWidth, window.innerHeight);
+    wrap.classList.add('grok-bar-moved');
+    wrap.style.left = next.left + 'px';
+    wrap.style.top = next.top + 'px';
+    if (persist) {
+      writeStoredString(SEARCH_BAR_POS_KEY, Math.round(next.left) + ',' + Math.round(next.top));
+    }
+    updateResultsPanelOffset();
+  }
+
+  function resetSearchBarPosition() {
+    applySearchBarPosition(null, true);
+  }
+
+  function bindSearchBarDrag(grip, wrap) {
+    let startX = 0;
+    let startY = 0;
+    let baseLeft = 0;
+    let baseTop = 0;
+    let dragging = false;
+
+    const onMove = e => {
+      if (!dragging) return;
+      e.preventDefault();
+      applySearchBarPosition({
+        left: baseLeft + (e.clientX - startX),
+        top: baseTop + (e.clientY - startY),
+      });
+    };
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      grip.classList.remove('grok-search-grip--active');
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+      // Written on release rather than on every move: a drag is hundreds of events and
+      // localStorage is synchronous.
+      const rect = wrap.getBoundingClientRect();
+      applySearchBarPosition({ left: rect.left, top: rect.top }, true);
+    };
+
+    grip.addEventListener('pointerdown', e => {
+      if (e.button !== undefined && e.button !== 0) return;
+      e.preventDefault();
+      const rect = wrap.getBoundingClientRect();
+      startX = e.clientX;
+      startY = e.clientY;
+      baseLeft = rect.left;
+      baseTop = rect.top;
+      dragging = true;
+      grip.classList.add('grok-search-grip--active');
+      // Pinned to where it already is before the first move arrives: until it is moved the bar
+      // is centred with a transform, and switching to explicit coordinates mid-drag would make
+      // it jump by half its width.
+      applySearchBarPosition({ left: rect.left, top: rect.top });
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointercancel', onUp);
+    });
+
+    grip.addEventListener('dblclick', e => { e.preventDefault(); resetSearchBarPosition(); });
+
+    // Dragging is a mouse gesture, so the same move is on the keyboard as well.
+    grip.addEventListener('keydown', e => {
+      if (e.key === 'Escape' || e.key === 'Home') {
+        e.preventDefault();
+        resetSearchBarPosition();
+        return;
+      }
+      const step = e.shiftKey ? 40 : 8;
+      let dx = 0;
+      let dy = 0;
+      if (e.key === 'ArrowLeft') dx = -step;
+      else if (e.key === 'ArrowRight') dx = step;
+      else if (e.key === 'ArrowUp') dy = -step;
+      else if (e.key === 'ArrowDown') dy = step;
+      else return;
+      e.preventDefault();
+      const rect = wrap.getBoundingClientRect();
+      applySearchBarPosition({ left: rect.left + dx, top: rect.top + dy }, true);
+    });
+  }
+
+  function ensureSearchBarGrip() {
+    const wrap = document.getElementById('grok-search-wrap');
+    if (!wrap) return;
+    if (!document.getElementById('grok-search-grip')) {
+      const grip = document.createElement('div');
+      grip.id = 'grok-search-grip';
+      grip.className = 'grok-search-grip';
+      grip.setAttribute('role', 'button');
+      grip.tabIndex = 0;
+      grip.title = 'Drag to move the search bar — double-click to put it back';
+      grip.setAttribute('aria-label',
+        'Move the search bar. Drag it, or use the arrow keys; Escape puts it back.');
+      grip.innerHTML = '<span class="grok-search-grip-dots" aria-hidden="true"></span>';
+      wrap.insertBefore(grip, wrap.firstChild);
+      bindSearchBarDrag(grip, wrap);
+    }
+    if (!wrap.dataset.grokBarPosBound) {
+      wrap.dataset.grokBarPosBound = '1';
+      applySearchBarPosition(readStoredSearchBarPos());
+      // The bar's height changes with its own content -- a wrapped filter row, a status line
+      // appearing -- and the panel's offset is measured from its bottom edge.
+      if (typeof ResizeObserver === 'function') {
+        try { new ResizeObserver(() => updateResultsPanelOffset()).observe(wrap); }
+        catch { /* measured on resize instead */ }
+      }
+      window.addEventListener('resize', () => {
+        applySearchBarPosition(readStoredSearchBarPos());
+      });
+    }
+    updateResultsPanelOffset();
   }
 
   function ensureSearchBarToggle() {
@@ -10748,6 +11310,7 @@
     ensureVerifyButton();
     ensureReindexButton();
     ensurePruneMissingButton();
+    ensureDownloadByTagButton();
     ensureFixPromptsButton();
     ensureTagsButton();
     ensureTagFilterSelect();
@@ -10758,6 +11321,7 @@
     ensureDateNavButtons();
     ensureDatePresetChips();
     ensureSearchBarToggle();
+    ensureSearchBarGrip();
     ensureDownloadResultsButtons();
     ensureDownloadSelectedButtons();
     ensureLoadingIndicator();

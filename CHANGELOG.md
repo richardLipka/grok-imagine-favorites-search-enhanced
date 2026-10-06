@@ -4,6 +4,44 @@ All notable changes are documented here.
 Versions match the `@version` in each userscript header. Changes that do not alter what users
 install — tests, docs, tooling — sit under **Unreleased** and get no version or tag.
 
+## [1.81.0] — 2026-10-06
+
+### Added
+
+- **The search bar can be moved.** It is fixed to the top centre, 900px wide and taller than the
+  120px gap above the results panel, so it sat on top of the middle of the panel's first row of
+  cards — including their select boxes, which could not be clicked at all while it was there, and
+  collapsing the bar took the search with it. There is now a grip above the bar: drag it anywhere,
+  double-click it to put the bar back. Arrow keys move it too (Shift for larger steps, Escape to
+  reset), and the position is remembered. A bar dropped past an edge is pulled back inside, so a
+  window resized smaller cannot leave it somewhere unreachable.
+
+- **The results panel gives up the strip of screen the bar occupies.** While the bar is parked at
+  the top, the panel starts just below it instead of at a fixed 120px, so nothing is hidden behind
+  it; the reservation is capped at 45% of the window and disappears the moment the bar is collapsed
+  or dragged aside. The panel's own margins are a little tighter as well, so the whole of it fits
+  once it has been pushed down.
+
+- **Optional tag propagation across a generation.** Grok's collections are per-asset: tagging a
+  child tags only that child, which is why a set tagged once appears under the tag by one image and
+  not by its siblings. **Whole set** — in the lightbox tag row and in the tag manager — makes a
+  hand-assigned tag cover every image in the generation instead, from whichever member you clicked;
+  removing one removes it from all of them. It is **off by default**, so the existing behaviour is
+  unchanged until you ask for the other one. Members that already carry the tag are not re-sent, so
+  tagging a set of twenty where nineteen already have it costs one request, and a partial failure
+  reports how many landed rather than claiming success.
+
+- **Download by tag.** A second download option beside *Download selected*: the whole indexed
+  catalogue, saved into one folder per tag. A set carrying two tags is written into both folders —
+  there is no single right one for it — and images with no tag at all go into `_untagged`. Tags are
+  read fresh before the run, and the confirmation states the plan first: how many images, how many
+  folders, and how many of the files are second copies. Each image is fetched once however many
+  folders it belongs in. Folder membership comes from the whole **set**, whichever scope the tags
+  were assigned under, so a library tagged one image at a time still files the way it reads on
+  screen.
+
+---
+
 ## [1.80.0] — 2026-10-06
 
 ### Fixed

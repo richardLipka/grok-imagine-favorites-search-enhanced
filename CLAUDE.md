@@ -11,7 +11,7 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.80.0, ~10.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokSearch.user.js` (v1.81.0, ~10.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
 | `grokPostSidebar.user.js` (v1.5.0, ~710 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
@@ -333,6 +333,32 @@ Four rules, each of which is a way to get this wrong:
   are only ever *raised*: a legacy row's `childPostCount` came from the API and can legitimately
   exceed the number of child rows ever fetched.
 
+### Tag scope
+
+**Grok's collections are per asset, and that is a product fact, not a bug to work around.**
+Tagging a child tags that child; the set is not a thing the API can tag. So the propagation the
+iOS app appears to do is reproduced by writing the tag to every member explicitly, and because
+both readings are defensible and only the user knows which they meant, it is a stored choice
+(`TAG_SCOPE_KEY`) that **defaults to the behaviour that existed before the choice did**.
+
+- **`applyTagToPost()` is the only thing a hand assignment may call.** `setAssetTag()` is the
+  single-row primitive underneath it. There are three places a user assigns a tag by hand — the
+  lightbox add, the lightbox chip removal, and the manager's apply-to-selection — and a scope that
+  reaches only some of them is worse than no scope at all. `test/suites/tag-scope.test.js` asserts
+  structurally that all three go through it.
+- **Walk from the root, not from the clicked row.** `getGenerationSetIds()` resolves
+  `getRootIdOf()` first, so tagging the fourth variation reaches the original and its siblings —
+  which is the entire point. A row whose root is not indexed still includes **itself**, or an
+  orphan would be tagged by proxy and never actually carry the tag.
+- **Skip members that already agree.** This runs on a tag click with the user watching, and a set
+  of twenty where nineteen already carry the tag has to cost one request, not twenty.
+- **Report the counts.** `describeTagResult()` says how many landed when it is not the simple
+  case. "tagged" over a run that reached three rows of eight is a quiet half-success that surfaces
+  a week later as a tag filter missing images.
+- **The read side is always the set.** `tagIdsForSet()` and `tagFolderNamesForPost()` ignore the
+  scope entirely, so a library tagged one-image-at-a-time still files and reads the way it looks
+  on screen, and turning the scope on does not reshuffle a download.
+
 ### Deleting
 
 **"The delete endpoint returned 200" and "the image is gone from the library" are different
@@ -522,6 +548,27 @@ This is the fragile part of the codebase and the usual source of bugs:
   `applyTogglePosition()` on every init rather than only when the button is created. Both
   `injectStyles()` and `patchSearchBarCollapseStyles()` define all four, and each rule resets all
   four offsets — leaving one out lets the previous corner linger.
+- **The bar overlaps the panel by construction, and v1.81.0 fixes it from both ends.** It is
+  `position: fixed`, `min(900px, 92vw)`, centred, z-index 99990; the panel starts at 120px and the
+  bar's own content is four rows plus a pager. So it covered the middle of the panel's first row of
+  cards, select boxes included, and collapsing it took the search away with it.
+
+  `ensureSearchBarGrip()` makes it draggable and `computePanelTopOffset()` decides how much room
+  the panel gives it, published as `--grok-panel-top` on `<html>`. Four rules hold it together:
+
+  - **Only a bar in the top region reserves anything** (`BAR_TOP_REGION_FRACTION`). A bar dragged
+    to a corner is the user putting it somewhere deliberate; shrinking the panel for it there
+    would be the opposite of getting out of the way. Collapsed reserves nothing either.
+  - **The reservation is clamped at both ends** — never below the stylesheet's own 120px, never
+    above `PANEL_TOP_MAX_FRACTION` of the viewport, or a bar whose filter rows wrapped twice on a
+    narrow window would take the whole screen.
+  - **A moved bar needs its own transform rule in *both* stylesheets.** The centring
+    `translateX(-50%)` has to go once the bar is positioned outright, and the collapse animation
+    needs a version without it — `injectStyles()` and `patchSearchBarCollapseStyles()` both
+    define `.grok-bar-moved` and `.grok-bar-moved.collapsed`, same hazard as the toggle corners.
+  - **`clampSearchBarPos()` runs on apply, not only on drop.** The stored position outlives the
+    window it was chosen in, so restoring it into a narrower one has to pull it back inside;
+    `SEARCH_BAR_MIN_VISIBLE` is what keeps the grip grabbable.
 ### Accessibility
 
 Audited against WCAG 2.1/2.2 AA in v1.75.0. Four rules came out of it, and each exists because the
@@ -582,6 +629,29 @@ Cancel and retry are threaded through the whole path and have three invariants:
 - **Whatever was still queued when Cancel landed goes into `lastFailedDownloads`**, including the
   interrupted file, and `lastDownloadDirHandle` is kept so **Retry** resumes into the same folder
   without a second picker prompt. The queue is in-memory only; a reload loses it.
+
+`downloadPostsToFolder()` takes an optional `folderNamesFor(post) → string[]`, which is how
+**Download by tag** (`downloadCatalogueByTag()`) files the whole index into one folder per tag.
+Omitting it writes flat, exactly as before — keep that path byte-identical, it is the one every
+other download uses.
+
+- **More than one folder means more than one *write*, never more than one *fetch*.** A set with
+  two tags has no single right folder, so the image goes into both; refetching for the second copy
+  would double a 20,000-image run for nothing.
+- **Subfolder handles are cached per run.** `getDirectoryHandle` is a filesystem round trip, and a
+  dozen tags across a catalogue would otherwise be asked for twenty thousand times.
+- **`sanitizeFolderName()` is a boundary, not a nicety.** A tag is user text; a folder name is
+  not. It replaces the separators and Windows-reserved characters, strips leading dots and the
+  dashes the substitution leaves behind (so `../x` cannot become `-..` and `///` cannot become a
+  folder literally named `---`), drops a trailing dot or space that Windows would silently strip
+  anyway, and always returns something creatable. Two tags differing only in a forbidden
+  character do collapse into one folder; that is documented rather than fixed, because
+  disambiguating would mean folder names that no longer match the tags.
+- **Tags are re-read with `force: true` and an incomplete read aborts the run.** The folder layout
+  *is* the deliverable, and a stale membership map files thousands of images under `_untagged`,
+  which looks exactly like the tags having been lost.
+- **The file count and the image count both get said.** Filed by tag they differ, and reporting
+  only one makes the other look like a bug.
 
 ### Image metadata
 
