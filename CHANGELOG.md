@@ -4,6 +4,29 @@ All notable changes are documented here.
 Versions match the `@version` in each userscript header. Changes that do not alter what users
 install — tests, docs, tooling — sit under **Unreleased** and get no version or tag.
 
+## [1.80.0] — 2026-10-06
+
+### Fixed
+
+- **Videos with no relative to borrow a still from showed nothing at all.** Grok keeps a poster
+  beside every generated video — same CDN directory, `preview_image.jpg` — and its own player
+  uses it: a post page renders `<video poster="…/preview_image.jpg?cache=1">`. The asset feed
+  never mentions it and `previewImageKey` came back empty on every video checked, so it has to be
+  derived from the video's own key. Sampled across the full date range of a real library, 40 of 40
+  loaded. This is the **last** step of `getPostThumbnailUrl()`, deliberately: the 6,425 videos that
+  already resolve to a parent's or sibling's picture are untouched, and only the 927 that were
+  being handed an `.mp4` to render in an `<img>` change.
+
+- **A description visible in the details was missing from the overview.** The lightbox has always
+  resolved a missing prompt when it opens; the grid never did, so it waited for the whole backfill
+  to reach that row with tens of thousands of rows ahead of it. The same resolution now runs for
+  the page actually on screen — one page's worth, once per row per session, debounced so paging
+  quickly past ten screens only reads the one you stop on, skipped entirely while an index, sync,
+  reconcile or backfill is walking the API, and patched into the cards in place so the view never
+  jumps.
+
+---
+
 ## [1.79.3] — 2026-09-29
 
 ### Fixed

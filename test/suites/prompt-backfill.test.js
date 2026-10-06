@@ -1,6 +1,11 @@
 'use strict';
 
 const { createIndexSandbox, createCardImageSandbox, readSource, sliceBetween } = require('../harness');
+
+/** Prose about the code is not the code: a structural assertion must not read the comments. */
+const stripComments = text => text
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/^\s*\/\/.*$/gm, '');
 const { FakeCard, FakeImage } = require('../dom');
 
 /**
@@ -316,6 +321,34 @@ module.exports = {
       !/getPostThumbnailUrl\(post\)/.test(prune), prune);
     t.ok('a successful probe clears a stale flag',
       /post\._mediaUnavailable = false/.test(prune), prune);
+
+    t.group('the page you are looking at fills itself in');
+    // The lightbox has always resolved a missing prompt when it opens. That is precisely why an
+    // image could show a full description in detail and nothing in the grid: the overview was
+    // waiting for the backfill to reach that row, with tens of thousands ahead of it.
+    const render = sliceBetween(readSource(), '  function showResults() {', '\n  /**');
+    t.ok('the render path asks for the current page', /schedulePagePromptResolve\(page\)/.test(render), render.slice(-300));
+    const resolve = stripComments(sliceBetween(readSource(),
+      '  function schedulePagePromptResolve(', '\n  function hideResults('));
+    t.ok('rows that already have text are skipped',
+      /post\.prompt \|\| post\.parentPrompt \|\| post\.rootPrompt/.test(resolve), resolve);
+    t.ok('and so are rows already tried this session',
+      /pagePromptResolveTried\.has\(post\.id\)/.test(resolve), resolve);
+    // Marked before the request, not after: a row that answers with nothing must not be asked
+    // again every time the reader pages back to it.
+    t.ok('a row is marked before it is asked',
+      resolve.indexOf('pagePromptResolveTried.add(id)') < resolve.indexOf('resolveAndApplyPostPrompt'), resolve);
+    t.ok('paging fast reads the page you stop on, not every page passed',
+      /clearTimeout\(pagePromptResolveTimer\)/.test(resolve), resolve);
+    // This runs from a render path, so it must never compete with a walk for the same bucket.
+    t.ok('it stands aside while anything else is walking the API',
+      /if \(indexing \|\| syncInProgress \|\| reconcileInProgress \|\| backfillInProgress \|\| !loaded\) return;/.test(resolve),
+      resolve);
+    t.ok('and it is bounded rather than unlimited',
+      /runPool\(ids, PAGE_PROMPT_RESOLVE_CONCURRENCY/.test(resolve), resolve);
+    // Re-rendering would scroll the panel back to the top; the view jumping because a prompt
+    // arrived is worse than the prompt being missing.
+    t.ok('cards are patched in place, never re-rendered', !/showResults\(\)/.test(resolve), resolve);
 
     t.group('a rebuild shows its progress, not stale thumbnails');
     // The grid is not cleared when the index is, so the previous page sat behind the overlay,

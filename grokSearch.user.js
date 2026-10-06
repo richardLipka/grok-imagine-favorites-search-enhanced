@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.79.3
+// @version      1.80.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -178,7 +178,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.79.3';
+  const SCRIPT_VERSION = '1.80.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -4263,6 +4263,19 @@
    * 4. Sibling image from the same conversation / generation batch (conversationId)
    * 5. Non-video mediaUrl or original thumbnail
    */
+  /**
+   * Grok keeps a still beside every generated video: same directory, `preview_image.jpg`. Its own
+   * player uses it — the post page renders `<video poster="…/preview_image.jpg?cache=1">` — but
+   * the asset feed never mentions it and `previewImageKey` came back empty on every video
+   * checked, so deriving it from the video's own key is the only way to reach it. Not a guess:
+   * sampled across the full date range of a real library, 40 of 40 loaded.
+   */
+  function derivedVideoPosterUrl(post) {
+    const src = String(post?.mediaUrl || post?.thumbnail || '');
+    if (!/\/[^/]+\.(mp4|webm|mov|mkv)(\?|$)/i.test(src)) return '';
+    return src.replace(/\/[^/]+\.(mp4|webm|mov|mkv)(\?.*)?$/i, '/preview_image.jpg');
+  }
+
   function getPostThumbnailUrl(post) {
     if (!post) return '';
 
@@ -4308,7 +4321,17 @@
       if (convThumb) return convThumb;
     }
 
-    // 5. Fallback
+    // 5. The video's own still, derived from its key.
+    //
+    // Deliberately last rather than first. 6,425 of the 7,529 videos in a real library already
+    // resolve to a parent's or sibling's picture through the steps above and those cards work
+    // today; moving this ahead of them would change every one of them. This replaces only the
+    // case that was previously handing an `.mp4` to an `<img>` — 927 cards that could show
+    // nothing at all, and were stamped "Media deleted" for it before v1.79.0.
+    const poster = derivedVideoPosterUrl(post);
+    if (poster) return poster;
+
+    // 6. Fallback
     if (isLikelyImageUrl(post.mediaUrl)) return post.mediaUrl;
     return post.thumbnail || '';
   }
@@ -6656,12 +6679,81 @@
     updatePanelPageRange(page);
     updatePager();
     enforceDisplayMode();
+    schedulePagePromptResolve(page);
 
     rendering = false;
     if (renderResultsPending) {
       renderResultsPending = false;
       showResults();
     }
+  }
+
+  /**
+   * The lightbox has always resolved a missing prompt when it opens, which is exactly why an
+   * image can show a full description in detail and nothing in the grid — the overview was
+   * waiting for the whole backfill to reach that row, and there can be tens of thousands ahead
+   * of it. The same resolution now runs for the page that is actually on screen.
+   *
+   * Bounded on every side, because this is a render path: one page's worth, once per row per
+   * session, debounced so paging quickly past ten screens reads the one you stop on, and skipped
+   * entirely while anything else is walking the API.
+   */
+  const PAGE_PROMPT_RESOLVE_DELAY_MS = 600;
+  const PAGE_PROMPT_RESOLVE_CONCURRENCY = 4;
+  const pagePromptResolveTried = new Set();
+  let pagePromptResolveTimer = null;
+
+  function cardForPostId(id) {
+    try {
+      return document.querySelector(`.grok-result-card[data-id="${CSS.escape(String(id))}"]`);
+    } catch {
+      return null;
+    }
+  }
+
+  function schedulePagePromptResolve(entries) {
+    clearTimeout(pagePromptResolveTimer);
+    const ids = [];
+    for (const entry of entries || []) {
+      const post = entry?.post;
+      if (!post?.id) continue;
+      if (String(post.prompt || post.parentPrompt || post.rootPrompt || '').trim()) continue;
+      if (pagePromptResolveTried.has(post.id)) continue;
+      ids.push(post.id);
+    }
+    if (!ids.length) return;
+    pagePromptResolveTimer = setTimeout(() => {
+      resolvePagePrompts(ids).catch(e => console.warn('[GrokSearch] Page prompt resolve failed:', e));
+    }, PAGE_PROMPT_RESOLVE_DELAY_MS);
+  }
+
+  async function resolvePagePrompts(ids) {
+    if (indexing || syncInProgress || reconcileInProgress || backfillInProgress || !loaded) return;
+    const updated = [];
+    await runPool(ids, PAGE_PROMPT_RESOLVE_CONCURRENCY, async id => {
+      // Marked before the request, not after: a row that answers with nothing must not be asked
+      // again every time the reader pages back to it.
+      pagePromptResolveTried.add(id);
+      const post = postById.get(id);
+      if (!post || !cardForPostId(id)) return;
+      try {
+        if (await resolveAndApplyPostPrompt(post)) updated.push(id);
+      } catch { /* a row that will not resolve keeps whatever it had */ }
+    });
+    if (!updated.length) return;
+    // The cards are patched in place rather than re-rendered: showResults() scrolls the panel
+    // back to the top, and having the view jump because a prompt arrived would be worse than
+    // the missing prompt.
+    for (const id of updated) {
+      const post = postById.get(id);
+      const card = cardForPostId(id);
+      const el = card?.querySelector('.grok-result-prompt');
+      if (!post || !el) continue;
+      const text = post.prompt || post.parentPrompt || post.rootPrompt || '';
+      if (text && el.textContent !== text) el.textContent = text;
+      if (card && text && !card.title) card.title = text;
+    }
+    invalidateDisplayEntries();
   }
 
   function hideResults() {

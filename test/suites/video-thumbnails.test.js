@@ -59,12 +59,44 @@ module.exports = {
     });
     t.equal('video with jpg poster uses its poster', s.getPostThumbnailUrl(s.postById.get('vid_with_poster')), 'https://assets.grok.com/poster.jpg');
 
-    t.group('standalone video with no image anywhere');
+    t.group('standalone video falls back to its own still');
+    // Grok keeps one beside every generated video, same directory, and its own player uses it:
+    // the post page renders <video poster=".../preview_image.jpg?cache=1">. Nothing in the feed
+    // says so -- previewImageKey is empty on every video checked -- so it is derived from the
+    // video's key. Before this, the chain handed the .mp4 itself to an <img>, which cannot
+    // decode it: 927 cards in a real library showed nothing at all.
     s = createThumbnailSandbox({
       posts: [
-        { id: 'solo_vid', mediaType: 'MEDIA_POST_TYPE_VIDEO', thumbnail: 'https://assets.grok.com/solo.mp4', mediaUrl: 'https://assets.grok.com/solo.mp4' },
+        { id: 'solo_vid', mediaType: 'MEDIA_POST_TYPE_VIDEO', thumbnail: 'https://assets.grok.com/u/solo/generated_video.mp4', mediaUrl: 'https://assets.grok.com/u/solo/generated_video.mp4' },
       ],
     });
-    t.equal('standalone video falls back without throwing', s.getPostThumbnailUrl(s.postById.get('solo_vid')), 'https://assets.grok.com/solo.mp4');
+    t.equal('the still sits beside the video', s.getPostThumbnailUrl(s.postById.get('solo_vid')),
+      'https://assets.grok.com/u/solo/preview_image.jpg');
+
+    // The derivation is last in the chain on purpose: 6,425 of 7,529 videos in that same library
+    // already resolve to a parent's or sibling's picture, and those cards work. Putting the
+    // still first would change every one of them.
+    s = createThumbnailSandbox({
+      posts: [
+        { id: 'par', prompt: 'p', thumbnail: 'https://assets.grok.com/u/par/image.jpg' },
+        { id: 'kid', mediaType: 'MEDIA_POST_TYPE_VIDEO', isChild: true, parentId: 'par',
+          thumbnail: 'https://assets.grok.com/u/kid/generated_video.mp4', mediaUrl: 'https://assets.grok.com/u/kid/generated_video.mp4' },
+      ],
+    });
+    t.equal('a video that already had a parent image keeps it',
+      s.getPostThumbnailUrl(s.postById.get('kid')), 'https://assets.grok.com/u/par/image.jpg');
+
+    // And an image is never rewritten: the derivation only fires on a video extension.
+    s = createThumbnailSandbox({
+      posts: [{ id: 'img', prompt: 'p', thumbnail: 'https://assets.grok.com/u/img/image.jpg', mediaUrl: 'https://assets.grok.com/u/img/image.jpg' }],
+    });
+    t.equal('an image is untouched', s.getPostThumbnailUrl(s.postById.get('img')),
+      'https://assets.grok.com/u/img/image.jpg');
+
+    t.group('a video with nothing resolvable at all');
+    s = createThumbnailSandbox({
+      posts: [{ id: 'bare', mediaType: 'MEDIA_POST_TYPE_VIDEO', thumbnail: '', mediaUrl: '' }],
+    });
+    t.equal('returns empty rather than throwing', s.getPostThumbnailUrl(s.postById.get('bare')), '');
   },
 };
