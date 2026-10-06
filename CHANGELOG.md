@@ -14,7 +14,9 @@ install — tests, docs, tooling — sit under **Unreleased** and get no version
   collapsing the bar took the search with it. There is now a grip above the bar: drag it anywhere,
   double-click it to put the bar back. Arrow keys move it too (Shift for larger steps, Escape to
   reset), and the position is remembered. A bar dropped past an edge is pulled back inside, so a
-  window resized smaller cannot leave it somewhere unreachable.
+  window resized smaller cannot leave it somewhere unreachable. Moving it is instant — the
+  stylesheets transition `transform`, which a drag must not wait for, and a reset whose transition
+  never gets a frame was measured leaving the bar half off the right edge.
 
 - **The results panel gives up the strip of screen the bar occupies.** While the bar is parked at
   the top, the panel starts just below it instead of at a fixed 120px, so nothing is hidden behind

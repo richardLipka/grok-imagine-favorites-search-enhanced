@@ -124,6 +124,24 @@ module.exports = {
     s.updateResultsPanelOffset();
     t.equal('and no variable is left set', s.panelTop, undefined);
 
+    t.group('moving is instant, and only collapsing animates');
+    // Both stylesheets transition `transform`, and every position change crosses it: the centred
+    // translateX(-50%) becomes none and back again. Transitioned, a drag lags the pointer -- and a
+    // reset whose transition gets no frame stays at the *start* of it, which measured as the bar
+    // sitting at left:50% with no translate, half of it off the right edge.
+    const apply = sliceBetween(readSource(),
+      '  function applySearchBarPosition(pos, persist = false) {', '\n  function resetSearchBarPosition');
+    t.ok('the move is applied with the transition suppressed',
+      /withoutBarTransition\(wrap, \(\) => \{[\s\S]*?classList\.add\('grok-bar-moved'\)/.test(apply), apply);
+    t.ok('and so is the reset',
+      /withoutBarTransition\(wrap, \(\) => \{[\s\S]*?classList\.remove\('grok-bar-moved'\)/.test(apply), apply);
+    const without = sliceBetween(readSource(),
+      '  function withoutBarTransition(wrap, apply) {', '\n  function applySearchBarPosition');
+    t.ok('the recalc is forced before the override is lifted',
+      without.indexOf('void wrap.offsetHeight') < without.indexOf("removeProperty('transition')"), without);
+    t.ok('and the override is lifted, not left behind',
+      /removeProperty\('transition'\)/.test(without), without);
+
     t.group('the pieces are wired into the page');
     const src = readSource();
     t.ok('the grip is in the chain that survives a bar rebuild',

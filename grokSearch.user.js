@@ -11125,22 +11125,43 @@
     else root.style.removeProperty('--grok-panel-top');
   }
 
+  /**
+   * Moving the bar is instant; only collapsing it animates.
+   *
+   * Both stylesheets transition `transform`, and every position change crosses that property --
+   * the centred `translateX(-50%)` becomes `none` when the bar is positioned outright, and back
+   * again on reset. Left to transition, a drag lags behind the pointer, and a reset whose
+   * transition never receives a frame stays at the *start* of it: measured in a non-compositing
+   * render, the bar sat at `left: 50%` with no translate, which is half of it off the right edge.
+   * Forcing the recalc with the transition suppressed lands the final value immediately.
+   */
+  function withoutBarTransition(wrap, apply) {
+    wrap.style.transition = 'none';
+    apply();
+    void wrap.offsetHeight;
+    wrap.style.removeProperty('transition');
+  }
+
   function applySearchBarPosition(pos, persist = false) {
     const wrap = document.getElementById('grok-search-wrap');
     if (!wrap) return;
     if (!pos) {
-      wrap.classList.remove('grok-bar-moved');
-      wrap.style.removeProperty('left');
-      wrap.style.removeProperty('top');
+      withoutBarTransition(wrap, () => {
+        wrap.classList.remove('grok-bar-moved');
+        wrap.style.removeProperty('left');
+        wrap.style.removeProperty('top');
+      });
       if (persist) writeStoredString(SEARCH_BAR_POS_KEY, '');
       updateResultsPanelOffset();
       return;
     }
     const rect = wrap.getBoundingClientRect();
     const next = clampSearchBarPos(pos, rect.width, rect.height, window.innerWidth, window.innerHeight);
-    wrap.classList.add('grok-bar-moved');
-    wrap.style.left = next.left + 'px';
-    wrap.style.top = next.top + 'px';
+    withoutBarTransition(wrap, () => {
+      wrap.classList.add('grok-bar-moved');
+      wrap.style.left = next.left + 'px';
+      wrap.style.top = next.top + 'px';
+    });
     if (persist) {
       writeStoredString(SEARCH_BAR_POS_KEY, Math.round(next.left) + ',' + Math.round(next.top));
     }
