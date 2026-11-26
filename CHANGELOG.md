@@ -4,6 +4,117 @@ All notable changes are documented here.
 Versions match the `@version` in each userscript header. Changes that do not alter what users
 install — tests, docs, tooling — sit under **Unreleased** and get no version or tag.
 
+## [1.82.0] — 2026-11-26 (`grokSearch.user.js`) / [1.6.0] (`grokPostSidebar.user.js`)
+
+### Added
+
+- **Collapsible toolbar drawers (`Filters` & `⚙ Tools`) and inline search clear button.** The
+  persistent search bar collapses to a single primary row by default, keeping date/media/tag
+  filters behind **Filters** (with an active-count badge) and display/library maintenance controls
+  behind **⚙ Tools**, with persisted open/closed state, `inert` on collapsed drawers, and `Escape`
+  to dismiss.
+- **Active filter chips and collapsed toggle indicator.** Active filters render as one-click
+  removable chips directly beneath the search row; when the search bar is collapsed, the floating
+  toggle button displays an active filter count badge and updated `aria-label`.
+- **Unified contextual Selection Action Bar.** Appears whenever items are selected (or a bulk
+  download is active/has retries) in both Panel mode and Inline mode, bringing `Download`, `Tag…`,
+  `Export…`, `Delete`, `Select all`, and `Clear` into one consistent bar.
+- **Keyboard Shortcuts help modal (`?` button / `?` key)** documenting all navigation, lightbox,
+  and card shortcuts.
+- **Accessible dark text-prompt dialog** with inline `role="alert"` / `aria-invalid` duplicate and
+  empty-name validation, replacing all native `window.prompt()` calls in tag creation and renaming.
+- **Keyboard-accessible result cards & `⋮` actions menu.** Every result card now includes a native
+  preview trigger button, native `<button>` date filter pill, and visible `⋮` actions menu button
+  (also triggered via `Shift+F10` / `ContextMenu`) with arrow-key, `Home`/`End`, `Escape`, and
+  `Tab` menu navigation.
+- **Lightbox `Copy prompt` button, `← Back` history navigation (`Alt+←`), and deduplication.**
+  Added a visible **Copy prompt** action, a history back-stack for jumping through related posts,
+  distinct **Open media** vs. **Open post** actions, and suppressed duplicate footer child
+  thumbnails whenever the Related sidebar is visible.
+- **Post Sidebar UX upgrades (`grokPostSidebar.user.js`).** Added a **Copy prompt** button with
+  live status feedback, made **Parent ID** a clickable link to `/imagine/post/{parentId}`, added
+  `Escape` collapse with focus restoration, and added a mobile backdrop on viewports `< 768px`.
+
+### Changed
+
+- **WCAG 2.1/2.2 AA accessibility and visual clarity across both scripts.** Raised all muted text
+  and placeholder colors above 4.5:1 contrast, strengthened control borders, enforced `≥ 24×24px`
+  target sizes (and `36px` on `@media (pointer: coarse)`), added `:focus-within` and
+  `@media (hover: none)` card control visibility, added `role="status" aria-live="polite"` live
+  regions, added `@media (prefers-reduced-motion: reduce)` and `@media (forced-colors: active)`
+  support, replaced jargon filter/display labels (`Originals only`, `Has variations ≥`,
+  `Videos only`, `Images w/ video`, `Group variations`, `Group batches`, `Full-screen panel`,
+  `API delay`), and bumped control typography from `10px` to `12px`.
+
+### Fixed
+
+- **Import JSON and Verify buttons did nothing on a fresh page load.** Both controls live in the
+  `buildSearchBar()` template, so `ensureImportJsonButton()` and `ensureVerifyButton()` returned
+  early without binding listeners, and `buildSearchBar()` did not bind them either. Every action
+  button builder now separates creation from idempotent listener binding (`dataset.grok*Bound`).
+- **Persisted Tag and Model filters were wiped on every page reload.** `syncTagFilterOptions()`
+  cleared `filterTagId` before `loadTags()` completed, and `syncModelFilterOptions()` cleared
+  `filterModel` before IndexedDB loaded. Both now wait until their data has loaded.
+- **Tag filter was disconnected from inline mode, Clear filter, and pager counts.** Added
+  `filterTagId` to `hasActiveFilter()`, `getActiveResultsFilters()`, `updatePager()`, and the
+  **Clear filter** button handler; `updatePager()` also now shows group counts when **Batch groups**
+  is active.
+- **Asset feed sync wiped backfilled models and video poster thumbnails.** `/rest/assets` list rows
+  carry no `mediaGenInput` (`model: ''`) and use the `.mp4` URL as `thumbnail`, so merging them onto
+  existing rows overwrote `model` and `.jpg` posters. `syncAssetsFeed()`, `fetchFullIndex()`,
+  `syncLikedFeed()`, and `mergePostFromRemote()` now preserve populated metadata and image posters.
+- **Prompt resolution and batch propagation left `_search` and prompt caches stale.**
+  `resolveAndApplyPostPrompt()` and `propagateBatchPrompts()` mutated rows in place without
+  re-normalizing `_search` or invalidating `cachedPromptById`, leaving resolved prompts unsearchable
+  until reload. `updatePostRow()` also now bumps `indexRevision` when a row's `model` changes so the
+  model dropdown updates after **Fix prompts**.
+- **Reconciliation and full-walk truncation safety.** `reconcileLikedIndex()` now refuses deletion
+  if the asset feed returns a repeated `nextPageToken`, and uses `assetMoreToRead` so a feed ending
+  cleanly on `ASSETS_MAX_PAGES` is not misreported as truncated. `syncAssetsFeed()` and
+  `fetchFullIndex()` now also surface repeated tokens/cursors as incomplete walks.
+- **Multi-generation backfill counts and transitive `rootId`.** `backfillAssetDetails()` now resolves
+  transitive `rootId` across 3+ generation chains before propagating prompts, and
+  `recomputeChildCounts()` now walks all descendant generations and updates `videoCount`.
+- **Import JSON now persists backfilled child parent prompts.** `backfillChildParentPrompts()` runs
+  before `writer.flush()` instead of after.
+- **Retrying a failed or cancelled "Download by tag" run dropped folder grouping.**
+  `downloadPostsToFolder()` now remembers `folderNamesFor` alongside `dirHandle` for
+  `retryFailedDownloads()`, and deduplicates colliding sanitized folder names per post.
+- **Modal dialog keyboard/Escape conflicts and lightbox shortcuts.** Pressing `Escape` or `Tab`
+  while a confirm, export, or tag-manager dialog is open over the lightbox now controls only the
+  topmost dialog, traps focus inside it, and restores focus on close. Pressing `Delete`/`Backspace`
+  in the lightbox now advances to the next image (`advanceLightboxAfterDelete()`) to match the
+  Delete button, and pressing `L` no longer overwrites failure messages. Arrow-key paging now stands
+  aside for all form inputs, the search-bar grip, and open modals, and respects page bounds.
+- **SPA navigation away from `/imagine` left search UI on top of post pages.** Navigating to
+  `/imagine/post/*` now hides the search bar, toggle, and overlays cleanly and restores them on
+  return.
+- **Miscellaneous reliability and UI fixes.** Fixed CSV export throwing `RangeError` on malformed
+  dates; deferred `URL.revokeObjectURL` via `triggerBlobDownload()` for single and JSON downloads;
+  prevented duplicate `applyFilter()` passes from redundant `input`+`change` checkbox/date handlers;
+  added `timeout`/`ontimeout`/`onabort` to GM requests and `tx.onabort`/`db.onversionchange` to
+  IndexedDB helpers; prevented duplicate names in `renameTag()`; guarded async button disabled states
+  with `try`/`finally`; added `Enter` submit in Tag Manager; fixed the diagonal SVG line typo and
+  missing `aria-label`s on pager first/last buttons; added `#grok-tag-manager :focus-visible`; and
+  fixed compact/batch group checkbox `indeterminate` state.
+- **`grokPostSidebar.user.js` (v1.5.1):** Prevented read-only `openDB()` from creating an empty v1
+  `GrokSearchIndex` database without a `posts` store when visiting a post page before `/imagine`;
+  rebuilt the sidebar when navigating back to `/imagine/post/*` in the SPA; walked all descendant
+  generations in `extractChildMediaCounts()`; added `timeout`/`ontimeout`/`onabort` and self-parent
+  cycle guard to remote fetches; added `:focus-visible` rings, `inert` when collapsed, and Copy
+  button feedback with disambiguated accessible names.
+
+### Changed
+
+- **Performance improvements:** Replaced the `O(N^2)` `allPosts` scan in `propagateBatchPrompts()`
+  with a single lazy `Map` lookup; cached prompt twins via `getPostsByPrompt()` and reused
+  `getAllDescendantPosts()` in `getRelatedPosts()`; replaced per-item `Set` rebuilds in
+  `buildDisplayEntries()` batch grouping with a cached `convSeen` map; filtered `MutationObserver`
+  callbacks to ignore churn inside our own injected UI; and prevented `ResizeObserver` / `resize`
+  listener leaks across search bar rebuilds.
+
+---
+
 ## [1.81.0] — 2026-10-06
 
 ### Added

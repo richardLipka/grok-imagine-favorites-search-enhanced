@@ -11,8 +11,8 @@ the live SPA.
 
 | File | `@match` | Role |
 |------|----------|------|
-| `grokSearch.user.js` (v1.81.0, ~10.3k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
-| `grokPostSidebar.user.js` (v1.5.0, ~710 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
+| `grokSearch.user.js` (v1.82.0, ~13.4k lines) | `https://grok.com/imagine*` (bails out on `/imagine/post/`) | Search bar, index + sync, results grid/panel, lightbox, context menu, bulk download, image metadata tagging |
+| `grokPostSidebar.user.js` (v1.6.0, ~900 lines) | `https://grok.com/imagine/post/*` | Read-only collapsible sidebar with prompt + metadata on post detail pages |
 
 Both share IndexedDB `GrokSearchIndex` / store `posts`. `grokSearch.user.js` owns the schema (it is the only
 writer and the only script with `onupgradeneeded`); the sidebar is a read-only consumer that falls back
@@ -571,30 +571,34 @@ This is the fragile part of the codebase and the usual source of bugs:
     `SEARCH_BAR_MIN_VISIBLE` is what keeps the grip grabbable.
 ### Accessibility
 
-Audited against WCAG 2.1/2.2 AA in v1.75.0. Four rules came out of it, and each exists because the
-failure is invisible from a screenshot:
+Audited against WCAG 2.1/2.2 AA in v1.75.0 and expanded in v1.82.0 / v1.6.0. Core invariants:
 
 - **State the focus ring; never inherit it.** Grok's stylesheets are served cross-origin from
   `cdn.grok.com`, so what they reset cannot be read from the page (`sheet.cssRules` throws) and
-  cannot be relied on. Our own CSS clears the outline on five controls besides, two of them with
-  nothing in its place. `injectStyles()` therefore declares `:focus-visible` for every injected
-  container, with **both** an `outline` and a `box-shadow` so overriding one still leaves the
-  other. Adding a new container means adding it to that selector list.
-- **A `title` is not an accessible name, and neither is a glyph.** Text content beats `title` in
-  the name calculation, so an icon button whose text is `✕` announces as the glyph.
-  `imageAltText()` handles thumbnails; `ensureAccessibleNames()` handles the controls, and it is
-  **in the `ensureSearchBarParts()` chain** rather than only in the template, so a bar an older
-  version left in the DOM is fixed too. It runs **last** in that chain: naming a control the
-  builders above it have not created yet is a silent no-op, which is what happened to the import
-  file input when it ran first.
-- **`aria-modal` does nothing about the Tab key.** It hides the rest of the page from assistive
-  tech only. The open lightbox measured 184 still-reachable controls behind its backdrop, so
-  `trapLightboxFocus()` wraps Tab at both ends, `openResultLightbox()` records where focus came
-  from and moves it in, and `closeResultLightbox()` puts it back. Focus moves **only on open** —
-  stepping through results with the arrows must not yank focus off the button being used.
-- **The click target is the label, not the box inside it.** The filter checkboxes render at 13px,
-  but the `<label>` wrapping each one is what gets clicked, so that is what carries
-  `min-height: 24px` (WCAG 2.2 2.5.8). Note 2.5.5 (44×44) is AAA, not AA — 24×24 is the AA bar.
+  cannot be relied on. `injectStyles()` declares `:focus-visible` for every injected container
+  (including `#grok-text-prompt-dialog`, `#grok-shortcuts-dialog`, and `#grok-selection-bar`), with
+  **both** an `outline` and a `box-shadow` plus `@media (forced-colors: active)` system-color
+  fallbacks (`CanvasText` / `Highlight`). Adding a new container means adding it to both selector
+  lists.
+- **Native buttons and unique accessible names.** Result cards expose a native
+  `.grok-result-open-trigger` button (keeping `:scope > img` intact for `syncCardImage()`),
+  native `<button>` date pills (`.grok-result-date`), and visible `⋮` action menu triggers
+  (`.grok-result-menu-btn` + `Shift+F10`/`ContextMenu` with arrow-key menu navigation); lightbox
+  related items are native `<button>` elements. `ensureAccessibleNames()` runs **last** in
+  `ensureSearchBarParts()` so migrated bars receive every `aria-label`, `aria-hidden`, and
+  `role="status" aria-live="polite"` live region.
+- **Topmost modal focus trapping & no native `window.prompt()`.** `getTopOpenModalDialog()` stacks
+  `#grok-text-prompt-dialog`, `#grok-bulk-download-confirm`, `#grok-shortcuts-dialog`,
+  `#grok-export-format-dialog`, and `#grok-tag-manager` above the lightbox so `Tab` trapping,
+  `Escape` dismissal, and focus restoration never collide. Text input modals use inline
+  `role="alert"` + `aria-invalid` validation instead of browser `prompt()`.
+- **Compact drawers, target sizes, and user media preferences.** Secondary toolbar rows sit behind
+  **Filters** (`grok-filters-open`) and **⚙ Tools** (`grok-tools-open`) drawers that set `inert`
+  when closed and announce active filters via `#grok-active-filters` chips and the collapsed toggle
+  badge. Interactive targets meet `≥ 24×24px` (`36px` under `@media (pointer: coarse)`), card
+  overlays appear on `:focus-within` and `@media (hover: none)`, all white text meets ≥ 4.5:1
+  contrast (`≥ 0.55` alpha on dark surfaces), and `@media (prefers-reduced-motion: reduce)`
+  disables animations/transitions.
 
 `test/suites/accessibility.test.js` pins all of it structurally.
 

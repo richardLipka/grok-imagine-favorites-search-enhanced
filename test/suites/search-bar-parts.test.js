@@ -140,6 +140,10 @@ module.exports = {
       ['ensureDisplayControls', 'per-page and size sliders'],
       ['ensureDateNavButtons', 'day stepper'],
       ['ensureDatePresetChips', 'date preset chips'],
+      ['ensureSelectionBar', 'contextual selection bar'],
+      ['ensureActiveFilterChips', 'active filter chips'],
+      ['ensureShortcutsButton', 'shortcuts help button'],
+      ['ensureToolbarDrawers', 'collapsible toolbar drawers'],
     ]) {
       t.ok(`${label} is reached from both paths`, chainCalls.has(`${fn}()`), [...chainCalls]);
     }
@@ -203,5 +207,28 @@ module.exports = {
       /localStorage\.setItem\(RATE_LIMIT_WAIT_KEY/.test(srcAll), 'wait not persisted');
     t.ok('and Default clears it',
       /localStorage\.removeItem\(RATE_LIMIT_WAIT_KEY\)/.test(srcAll), 'Default does not reset the wait');
+
+    t.group('template action buttons always get their click/change listeners');
+    const impFn = stripComments(sliceBetween(srcAll, '  function ensureImportJsonButton() {', '\n  function ensureVerifyButton'));
+    t.ok('Import JSON binds outside the element-creation guard',
+      /grokImportBound/.test(impFn) && !/if \(document\.getElementById\('grok-import-json-btn'\)\) return;/.test(impFn), impFn);
+    const verFn = stripComments(sliceBetween(srcAll, '  function ensureVerifyButton() {', '\n  function ensureExportJsonButton'));
+    t.ok('Verify binds outside the element-creation guard',
+      /grokVerifyBound/.test(verFn) && !/if \(document\.getElementById\('grok-verify-btn'\)\) return;/.test(verFn), verFn);
+
+    t.group('tag and model filters survive reload and integrate with Clear filter');
+    const activeFn = stripComments(sliceBetween(srcAll, '  function hasActiveFilter() {', '\n  function getDateFilterBounds'));
+    t.ok('hasActiveFilter includes filterTagId', /filterTagId/.test(activeFn), activeFn);
+    const syncTagFn = stripComments(sliceBetween(srcAll, '  function syncTagFilterOptions() {', '\n  function ensureTagFilterSelect'));
+    t.ok('syncTagFilterOptions waits for tagsLoaded before clearing stored tag',
+      /if \(tagsLoaded && filterTagId/.test(syncTagFn), syncTagFn);
+    const syncModelFn = stripComments(sliceBetween(srcAll, '  function syncModelFilterOptions() {', '\n  function loadModelFilterFromStorage'));
+    t.ok('syncModelFilterOptions waits for loaded before clearing stored model',
+      /if \(loaded && wanted/.test(syncModelFn), syncModelFn);
+    t.ok('Clear filter resets filterTagId and storage key',
+      /filterTagId = '';[\s\S]*?FILTER_TAG_KEY/.test(build));
+    const pagingFn = stripComments(sliceBetween(srcAll, '  function bindPagingShortcuts(input) {', '\n  function '));
+    t.ok('paging shortcuts stand aside when any modal dialog or form control has focus',
+      /getTopOpenModalDialog\(\)/.test(pagingFn) && /grok-search-grip/.test(pagingFn), pagingFn);
   },
 };

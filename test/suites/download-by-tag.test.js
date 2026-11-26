@@ -96,6 +96,27 @@ module.exports = {
     t.equal('the others are saved', s.log.writes, ['garden/p0.jpg', 'garden/p2.jpg']);
     t.equal('and the one that failed is retryable', s.failed.map(p => p.id), ['p1']);
 
+    t.group('retrying a failed tag-filed run preserves folder grouping');
+    const flakyTag = { fetchFails: ['p1'] };
+    s = createBulkDownloadSandbox(flakyTag);
+    const byTag = p => [p.id === 'p1' ? 'rain' : 'garden'];
+    await s.downloadPostsToFolder(POSTS(2), { folderNamesFor: byTag });
+    t.equal('first pass writes p0 into its tag folder', s.log.writes, ['garden/p0.jpg']);
+    t.equal('folderNamesFor is retained for retry', s.folderNamesFor, byTag);
+    flakyTag.fetchFails = [];
+    await s.retryFailedDownloads();
+    t.equal('retry files p1 into its tag folder rather than flat root',
+      s.log.writes, ['garden/p0.jpg', 'rain/p1.jpg']);
+    t.equal('and clears folderNamesFor once everything finishes', s.folderNamesFor, null);
+
+    t.group('colliding sanitized folder names do not double-write the same file');
+    s = createBulkDownloadSandbox({});
+    await s.downloadPostsToFolder([{ id: 'p0' }], { folderNamesFor: () => ['a/b', 'a:b'] });
+    t.equal('written only once to the shared folder', s.log.writes, ['a-b/p0.jpg']);
+    t.ok('status reports 1 file, not 2',
+      /saved 1 image as 1 file in 1 folder/.test(s.log.statuses[s.log.statuses.length - 1]),
+      s.log.statuses[s.log.statuses.length - 1]);
+
     t.group('what the catalogue run reads before it starts');
     const run = sliceBetween(readSource(),
       '  async function downloadCatalogueByTag() {', '\n  async function downloadAllChildPosts');

@@ -178,7 +178,9 @@ function createIndexSandbox() {
         }
         opts.onload({ status: 200, responseText: JSON.stringify({
           assets: page ? page.assets : [],
-          nextPageToken: page && i + 1 < assetPages.length ? String(i + 1) : null,
+          nextPageToken: page && 'nextPageToken' in page
+            ? page.nextPageToken
+            : (page && i + 1 < assetPages.length ? String(i + 1) : null),
         }) });
       });
       return { abort() {} };
@@ -220,7 +222,7 @@ function createIndexSandbox() {
       pickDeepRefreshTargets, removeRowsById, reconcileLikedIndex, verifyIndexIntegrity,
       getRootIdOf, removeDescendantsOfRoot, buildPromptById, computeSearchText,
       buildAssetsUrl, fetchAssetPage, assetMediaUrl, assetGenInput, assetMediaType,
-      getAssetParentId, propagateBatchPrompts,
+      getAssetParentId, propagateBatchPrompts, resolveAndApplyPostPrompt, mergePostFromRemote,
       parseAsset, syncAssetsFeed, isIndexableAsset, isUploadedPost,
       retryDelayMs, retryBudget, isRetryableStatus, getRateLimitWaitMs, clampRateLimitWait,
       setStored(k, v) { storage[k] = v; },
@@ -338,6 +340,7 @@ function createBulkDownloadSandbox(control = {}) {
     let bulkDownloadAbort = null;
     let lastFailedDownloads = [];
     let lastDownloadDirHandle = null;
+    let lastDownloadFolderNamesFor = null;
 
     const log = {
       statuses: [], saved: [], confirms: 0, picks: 0, syncs: 0, permissionChecks: 0,
@@ -389,6 +392,7 @@ function createBulkDownloadSandbox(control = {}) {
       sanitizeFolderName,
       get failed() { return lastFailedDownloads; },
       get dirHandle() { return lastDownloadDirHandle; },
+      get folderNamesFor() { return lastDownloadFolderNamesFor; },
       get busy() { return bulkDownloadInProgress; },
     };
   `;

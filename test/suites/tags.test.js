@@ -106,6 +106,8 @@ module.exports = {
     t.equal('a rename is applied locally', (await s.renameTag('g', 'orchard')).ok, true);
     t.equal('and re-sorted', s.tagList.map(x => x.name), ['orchard', 'rain']);
     t.equal('an empty rename is refused', (await s.renameTag('g', ' ')).reason, 'empty');
+    t.equal('a duplicate rename is refused', (await s.renameTag('g', 'RAIN')).reason, 'duplicate');
+    t.equal('case-only rename of the same tag is allowed', (await s.renameTag('g', 'Orchard')).ok, true);
 
     s = sandbox({ delete: { ok: true, data: {} } });
     await s.loadTags();
@@ -175,5 +177,9 @@ module.exports = {
     const handler = deleteBtn.slice(0, deleteBtn.indexOf('function ensureLightboxLikeButton'));
     t.ok('the delete button advances rather than closing',
       /res\.deleted > 0\) advanceLightboxAfterDelete\(\)/.test(handler), handler.slice(-220));
+    const keyBlock = readSource().slice(readSource().indexOf("e.key === 'Delete' || e.key === 'Backspace'"));
+    const deleteShortcut = keyBlock.slice(0, 320);
+    t.ok('and the Delete/Backspace keyboard shortcut advances too',
+      /advanceLightboxAfterDelete\(\)/.test(deleteShortcut), deleteShortcut);
   },
 };

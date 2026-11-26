@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Post Sidebar (prompt)
 // @namespace    http://tampermonkey.net/
-// @version      1.5.0
+// @version      1.6.0
 // @description  Collapsible sidebar on /imagine/post/{id}: metadata and prompt from IndexedDB and Grok API.
 // @author       Richard Lipka
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -33,7 +33,6 @@
   'use strict';
 
   const DB_NAME = 'GrokSearchIndex';
-  const DB_VERSION = 1;
   const STORE_NAME = 'posts';
   const POST_GET = 'https://grok.com/rest/media/post/get';
   const ASSETS_ENDPOINT = 'https://grok.com/rest/assets';
@@ -77,18 +76,27 @@
     return url.includes('/upload/') || url.includes('/uploaded/') || url.includes('/user_upload/');
   }
 
+  function walkDescendantPosts(node, visitor) {
+    const children = node?.childPosts || [];
+    for (const child of children) {
+      visitor(child);
+      walkDescendantPosts(child, visitor);
+    }
+  }
+
   function extractChildMediaCounts(post) {
-    const children = post?.childPosts || [];
+    let childPostCount = 0;
     let childImageCount = 0;
     let childVideoCount = 0;
-    for (const child of children) {
+    walkDescendantPosts(post, child => {
+      childPostCount++;
       if (isVideoMediaType(child.mediaType)) childVideoCount++;
       else childImageCount++;
-    }
+    });
     const parentIsVideo = isVideoMediaType(post?.mediaType);
     const videoCount = (parentIsVideo ? 1 : 0) + childVideoCount;
     return {
-      childPostCount: children.length,
+      childPostCount,
       childImageCount,
       childVideoCount,
       videoCount,
@@ -103,7 +111,7 @@
     const hasChildFields = childPostCount != null;
 
     const parentId = r.parentId || c.parentId || null;
-    const parentPrompt = r.parentPrompt || c.parentPrompt || null;
+    const parentPrompt = r.parentPrompt || c.parentPrompt || c.rootPrompt || null;
     const ownPrompt = String(r.prompt || r.originalPrompt || c.prompt || '').trim();
     const promptInherited = Boolean(r.promptInherited || (!ownPrompt && parentPrompt));
     const effectivePrompt = ownPrompt || parentPrompt || '';
@@ -171,7 +179,11 @@
 
     push('Post ID', meta.id, { mono: true, copyValue: meta.id });
     if (meta.parentId) {
-      push('Parent ID', meta.parentId, { mono: true, copyValue: meta.parentId });
+      push('Parent ID', meta.parentId, {
+        mono: true,
+        copyValue: meta.parentId,
+        href: `/imagine/post/${encodeURIComponent(meta.parentId)}`,
+      });
     }
     push('Date', formatDate(meta.createTime));
     push('Model', meta.model);
@@ -190,11 +202,28 @@
     return rows;
   }
 
+  // Read-only consumer: open without a version and abort onupgradeneeded so visiting a post
+  // detail page before grokSearch.user.js never creates an empty v1 database without the store.
   function openDB() {
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onsuccess = e => resolve(e.target.result);
-      req.onerror = e => reject(e.target.error);
+      const req = indexedDB.open(DB_NAME);
+      req.onupgradeneeded = e => {
+        try { e.target.transaction.abort(); } catch { /* ignore */ }
+      };
+      req.onsuccess = e => {
+        const database = e.target.result;
+        if (!database.objectStoreNames.contains(STORE_NAME)) {
+          database.close();
+          reject(new Error(`Store "${STORE_NAME}" not found`));
+          return;
+        }
+        database.onversionchange = () => {
+          database.close();
+          if (db === database) db = null;
+        };
+        resolve(database);
+      };
+      req.onerror = e => reject(e.target.error || new Error('IndexedDB unavailable'));
     });
   }
 
@@ -204,6 +233,7 @@
       const req = tx.objectStore(STORE_NAME).get(id);
       req.onsuccess = () => resolve(req.result || null);
       req.onerror = () => reject(req.error);
+      tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -214,6 +244,7 @@
         url: `${ASSETS_ENDPOINT}/${encodeURIComponent(id)}`,
         headers: { Accept: 'application/json' },
         withCredentials: true,
+        timeout: 30000,
         onload: res => {
           if (res.status < 200 || res.status >= 300) {
             resolve(null);
@@ -227,6 +258,8 @@
           }
         },
         onerror: () => resolve(null),
+        ontimeout: () => resolve(null),
+        onabort: () => resolve(null),
       });
     });
   }
@@ -280,6 +313,7 @@
         headers: { 'Content-Type': 'application/json' },
         data: JSON.stringify({ id }),
         withCredentials: true,
+        timeout: 30000,
         onload: res => {
           if (res.status < 200 || res.status >= 300) {
             resolve(null);
@@ -293,6 +327,8 @@
           }
         },
         onerror: () => resolve(null),
+        ontimeout: () => resolve(null),
+        onabort: () => resolve(null),
       });
     });
 
@@ -307,20 +343,20 @@
         if (remote) {
           remote.prompt = ownPrompt || remote.prompt || '';
           if (model && !remote.model) remote.model = model;
-          if (assetParentId && !remote.parentId) remote.parentId = assetParentId;
+          if (assetParentId && assetParentId !== id && !remote.parentId) remote.parentId = assetParentId;
         } else {
           remote = {
             id,
             prompt: ownPrompt,
             model,
-            parentId: assetParentId,
+            parentId: assetParentId && assetParentId !== id ? assetParentId : null,
             mediaType: asset?.mimeType?.startsWith('video/') ? 'MEDIA_POST_TYPE_VIDEO' : 'MEDIA_POST_TYPE_IMAGE',
             createTime: String(asset?.createTime || ''),
           };
         }
 
         // If prompt is still blank and parent exists, resolve from parent
-        if (!remote.prompt && remote.parentId && depth < maxDepth) {
+        if (!remote.prompt && remote.parentId && remote.parentId !== id && depth < maxDepth) {
           let parent = null;
           try {
             if (db) parent = await dbGetPost(remote.parentId);
@@ -348,21 +384,33 @@
     const s = document.createElement('style');
     s.id = 'grok-post-sidebar-styles';
     s.textContent = `
+      #grok-post-sidebar-backdrop {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 99994;
+        background: rgba(0, 0, 0, 0.55);
+      }
+      @media (max-width: 767px) {
+        #grok-post-sidebar-backdrop.visible {
+          display: block;
+        }
+      }
       #grok-post-sidebar {
         position: fixed;
         top: 0;
         right: 0;
-        width: min(320px, 92vw);
+        width: min(320px, 88vw);
         height: 100vh;
         z-index: 99995;
         display: flex;
         flex-direction: column;
         background: rgba(12, 12, 18, 0.97);
-        border-left: 1px solid rgba(255, 255, 255, 0.12);
+        border-left: 1px solid rgba(255, 255, 255, 0.2);
         box-shadow: -8px 0 32px rgba(0, 0, 0, 0.45);
         backdrop-filter: blur(14px);
         font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-        color: rgba(255, 255, 255, 0.88);
+        color: rgba(255, 255, 255, 0.9);
         box-sizing: border-box;
         pointer-events: auto;
         transition: transform 0.28s ease, opacity 0.22s ease, visibility 0.28s;
@@ -423,91 +471,198 @@
       .grok-post-sidebar-section {
         margin-bottom: 16px;
       }
+      .grok-post-section-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .grok-post-section-head h3 {
+        margin: 0;
+      }
       .grok-post-sidebar-section h3 {
         margin: 0 0 8px;
         font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.04em;
-        color: rgba(255, 255, 255, 0.45);
+        color: rgba(255, 255, 255, 0.68);
       }
       .grok-post-meta-list {
         margin: 0;
         display: grid;
-        grid-template-columns: minmax(72px, 38%) 1fr;
+        grid-template-columns: minmax(76px, 38%) 1fr;
         gap: 6px 10px;
-        font-size: 11px;
+        font-size: 12px;
       }
       .grok-post-meta-list dt {
         margin: 0;
-        color: rgba(255, 255, 255, 0.45);
+        color: rgba(255, 255, 255, 0.68);
         font-weight: 500;
       }
       .grok-post-meta-list dd {
         margin: 0;
-        color: rgba(255, 255, 255, 0.88);
+        color: rgba(255, 255, 255, 0.92);
         word-break: break-word;
       }
       .grok-post-meta-list dd.mono {
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 10px;
-        line-height: 1.4;
+        font-size: 11px;
+        line-height: 1.45;
+      }
+      .grok-post-meta-link {
+        color: #c4b5fd;
+        text-decoration: underline;
+        text-underline-offset: 2px;
+      }
+      .grok-post-meta-link:hover {
+        color: #ede9fe;
       }
       .grok-post-meta-copy {
         margin-left: 6px;
-        padding: 1px 6px;
-        font-size: 10px;
-        border-radius: 4px;
-        border: 1px solid rgba(255, 255, 255, 0.15);
-        background: rgba(255, 255, 255, 0.06);
-        color: rgba(255, 255, 255, 0.7);
+        min-block-size: 24px;
+        min-inline-size: 24px;
+        padding: 3px 8px;
+        font-size: 11px;
+        border-radius: 5px;
+        border: 1px solid rgba(255, 255, 255, 0.26);
+        background: rgba(255, 255, 255, 0.08);
+        color: rgba(255, 255, 255, 0.88);
         cursor: pointer;
         vertical-align: baseline;
       }
       .grok-post-meta-copy:hover {
-        border-color: rgba(139, 92, 246, 0.5);
+        border-color: rgba(139, 92, 246, 0.7);
+        background: rgba(139, 92, 246, 0.2);
         color: #fff;
       }
       .grok-post-meta-empty {
-        font-size: 11px;
-        color: rgba(255, 255, 255, 0.35);
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.64);
         font-style: italic;
       }
       #grok-post-sidebar-prompt {
-        font-size: 12px;
+        font-size: 12.5px;
         line-height: 1.55;
-        color: rgba(255, 255, 255, 0.82);
+        color: rgba(255, 255, 255, 0.9);
         white-space: pre-wrap;
         word-break: break-word;
-        background: rgba(255, 255, 255, 0.04);
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.16);
         border-radius: 10px;
         padding: 10px 12px;
       }
       #grok-post-sidebar-prompt.empty {
-        color: rgba(255, 255, 255, 0.35);
+        color: rgba(255, 255, 255, 0.64);
         font-style: italic;
+      }
+      #grok-post-sidebar-status {
+        margin-top: 8px;
+        min-height: 1.3em;
+        font-size: 11px;
+        color: #c4b5fd;
+      }
+      #grok-post-sidebar-status:empty {
+        display: none;
       }
       .grok-post-prompt-inherited-badge {
         display: inline-block;
         margin-bottom: 6px;
         padding: 2px 7px;
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         border-radius: 4px;
         background: rgba(139, 92, 246, 0.25);
-        border: 1px solid rgba(139, 92, 246, 0.45);
-        color: #c4b5fd;
+        border: 1px solid rgba(139, 92, 246, 0.55);
+        color: #ddd6fe;
         letter-spacing: 0.02em;
+      }
+      #grok-post-sidebar :focus-visible,
+      #grok-post-sidebar-toggle:focus-visible {
+        outline: 2px solid #c4b5fd;
+        outline-offset: 2px;
+        box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.45);
+      }
+      @media (pointer: coarse) {
+        .grok-post-meta-copy {
+          min-block-size: 36px;
+          min-inline-size: 36px;
+          padding: 6px 10px;
+          font-size: 12px;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #grok-post-sidebar,
+        #grok-post-sidebar-toggle {
+          transition: none !important;
+        }
+      }
+      @media (forced-colors: active) {
+        #grok-post-sidebar,
+        #grok-post-sidebar-toggle,
+        .grok-post-meta-copy,
+        #grok-post-sidebar-prompt {
+          border: 1px solid CanvasText;
+        }
+        #grok-post-sidebar :focus-visible,
+        #grok-post-sidebar-toggle:focus-visible {
+          outline: 2px solid Highlight;
+          outline-offset: 2px;
+          box-shadow: none;
+        }
       }
     `;
     document.head.appendChild(s);
   }
 
+  let currentPromptText = '';
+  let sidebarStatusTimer = null;
+
+  function announceSidebarStatus(message) {
+    const el = document.getElementById('grok-post-sidebar-status');
+    if (!el) return;
+    el.textContent = message || '';
+    if (sidebarStatusTimer) clearTimeout(sidebarStatusTimer);
+    if (message) {
+      sidebarStatusTimer = setTimeout(() => {
+        if (el.isConnected) el.textContent = '';
+      }, 2200);
+    }
+  }
+
+  function bindSidebarKeyboardDismiss() {
+    if (document.body.dataset.grokPostSidebarKeysBound) return;
+    document.body.dataset.grokPostSidebarKeysBound = '1';
+    document.addEventListener('keydown', e => {
+      if (e.key !== 'Escape' || !sidebarExpanded) return;
+      const panel = document.getElementById('grok-post-sidebar');
+      if (!panel) return;
+      const target = e.target;
+      const isField = target && (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable);
+      if (isField && !panel.contains(target)) return;
+      if (document.querySelector('[role="dialog"]:not([hidden])')) return;
+      setSidebarExpanded(false);
+      document.getElementById('grok-post-sidebar-toggle')?.focus();
+    });
+  }
+
   function buildSidebar() {
     if (document.getElementById('grok-post-sidebar')) return;
+    let backdrop = document.getElementById('grok-post-sidebar-backdrop');
+    if (!backdrop) {
+      backdrop = document.createElement('div');
+      backdrop.id = 'grok-post-sidebar-backdrop';
+      backdrop.setAttribute('aria-hidden', 'true');
+      backdrop.addEventListener('click', () => {
+        setSidebarExpanded(false);
+        document.getElementById('grok-post-sidebar-toggle')?.focus();
+      });
+      document.body.appendChild(backdrop);
+    }
     const aside = document.createElement('aside');
     aside.id = 'grok-post-sidebar';
+    aside.setAttribute('aria-label', 'Saved post information');
     aside.innerHTML = `
       <div id="grok-post-sidebar-header">
         <h2>Saved post</h2>
@@ -518,12 +673,24 @@
           <div id="grok-post-sidebar-meta" class="grok-post-meta-empty">Loading…</div>
         </section>
         <section class="grok-post-sidebar-section">
-          <h3>Prompt</h3>
+          <div class="grok-post-section-head">
+            <h3>Prompt</h3>
+            <button type="button" id="grok-post-copy-prompt" class="grok-post-meta-copy" aria-label="Copy prompt" title="Copy prompt to clipboard" hidden>Copy prompt</button>
+          </div>
           <div id="grok-post-sidebar-prompt" class="empty">Loading…</div>
+          <div id="grok-post-sidebar-status" role="status" aria-live="polite" aria-atomic="true"></div>
         </section>
       </div>
     `;
     document.body.appendChild(aside);
+    aside.querySelector('#grok-post-copy-prompt')?.addEventListener('click', async e => {
+      const btn = e.currentTarget;
+      const ok = await copyText(currentPromptText);
+      btn.textContent = ok ? 'Copied' : 'Failed';
+      announceSidebarStatus(ok ? 'Prompt copied' : 'Copy failed');
+      setTimeout(() => { if (btn.isConnected) btn.textContent = 'Copy prompt'; }, 1400);
+    });
+    bindSidebarKeyboardDismiss();
     ensureToggleButton();
   }
 
@@ -533,6 +700,7 @@
     btn.type = 'button';
     btn.id = 'grok-post-sidebar-toggle';
     btn.setAttribute('aria-label', 'Toggle post info panel');
+    btn.setAttribute('aria-controls', 'grok-post-sidebar');
     btn.addEventListener('click', () => setSidebarExpanded(!sidebarExpanded));
     document.body.appendChild(btn);
     try {
@@ -546,10 +714,17 @@
   function setSidebarExpanded(expanded) {
     sidebarExpanded = expanded;
     const panel = document.getElementById('grok-post-sidebar');
+    const backdrop = document.getElementById('grok-post-sidebar-backdrop');
     const btn = document.getElementById('grok-post-sidebar-toggle');
-    if (panel) panel.classList.toggle('collapsed', !expanded);
+    if (panel) {
+      panel.classList.toggle('collapsed', !expanded);
+      panel.inert = !expanded;
+    }
+    if (backdrop) {
+      backdrop.classList.toggle('visible', expanded);
+    }
     if (btn) {
-      btn.title = expanded ? 'Hide post info' : 'Show post info';
+      btn.title = expanded ? 'Hide post info (Esc)' : 'Show post info';
       btn.setAttribute('aria-expanded', String(expanded));
       btn.innerHTML = expanded
         ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
@@ -566,11 +741,13 @@
     } catch { /* ignore */ }
   }
 
-  function copyText(text) {
-    if (!text) return;
+  async function copyText(text) {
+    if (!text) return false;
     if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(text).catch(() => {});
-      return;
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch { /* fall through to execCommand */ }
     }
     const ta = document.createElement('textarea');
     ta.value = text;
@@ -578,8 +755,10 @@
     ta.style.left = '-9999px';
     document.body.appendChild(ta);
     ta.select();
-    try { document.execCommand('copy'); } catch { /* ignore */ }
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
     ta.remove();
+    return ok;
   }
 
   function renderMetadata(rows) {
@@ -593,18 +772,29 @@
     el.className = '';
     el.innerHTML = `<dl class="grok-post-meta-list">${rows.map(row => {
       const ddClass = row.mono ? ' class="mono"' : '';
+      const valHtml = row.href
+        ? `<a class="grok-post-meta-link" href="${escapeHtml(row.href)}" title="Open parent post">${escapeHtml(row.value)}</a>`
+        : escapeHtml(row.value);
       const copyBtn = row.copyValue
-        ? `<button type="button" class="grok-post-meta-copy" data-copy="${escapeHtml(row.copyValue)}" title="Copy">Copy</button>`
+        ? `<button type="button" class="grok-post-meta-copy" data-copy="${escapeHtml(row.copyValue)}" data-label="${escapeHtml(row.label)}" aria-label="Copy ${escapeHtml(row.label)}" title="Copy ${escapeHtml(row.label)}">Copy</button>`
         : '';
-      return `<dt>${escapeHtml(row.label)}</dt><dd${ddClass}>${escapeHtml(row.value)}${copyBtn}</dd>`;
+      return `<dt>${escapeHtml(row.label)}</dt><dd${ddClass}>${valHtml}${copyBtn}</dd>`;
     }).join('')}</dl>`;
     el.querySelectorAll('.grok-post-meta-copy').forEach(btn => {
-      btn.addEventListener('click', () => copyText(btn.dataset.copy));
+      btn.addEventListener('click', async () => {
+        const ok = await copyText(btn.dataset.copy);
+        btn.textContent = ok ? 'Copied' : 'Failed';
+        announceSidebarStatus(ok ? `${btn.dataset.label || 'Value'} copied` : 'Copy failed');
+        setTimeout(() => { if (btn.isConnected) btn.textContent = 'Copy'; }, 1200);
+      });
     });
   }
 
   function renderPrompt(text, sourceHint, isInherited) {
     const el = document.getElementById('grok-post-sidebar-prompt');
+    const copyBtn = document.getElementById('grok-post-copy-prompt');
+    currentPromptText = text || '';
+    if (copyBtn) copyBtn.hidden = !currentPromptText;
     if (!el) return;
     if (!text) {
       el.textContent = 'No prompt in index or API for this post.';
@@ -627,10 +817,16 @@
     const postId = getPostIdFromUrl();
     if (!postId) {
       document.getElementById('grok-post-sidebar')?.remove();
+      document.getElementById('grok-post-sidebar-backdrop')?.remove();
       document.getElementById('grok-post-sidebar-toggle')?.remove();
       lastLoadedPostId = null;
       return;
     }
+
+    // Rebuild the sidebar if an SPA navigation away from /imagine/post/* previously removed it.
+    injectStyles();
+    buildSidebar();
+    ensureToggleButton();
 
     const seq = ++refreshSeq;
     const metaEl = document.getElementById('grok-post-sidebar-meta');

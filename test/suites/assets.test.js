@@ -85,14 +85,30 @@ module.exports = {
 
     t.group('propagateBatchPrompts propagates prompts across conversation siblings');
     const batchBox = createIndexSandbox();
-    const b1 = batchBox.normalizePost({ id: 'b1', prompt: 'glowing futuristic city', conversationId: 'conv-batch-42', createTime: '2026-08-27T12:00:00Z' });
-    const b2 = batchBox.normalizePost({ id: 'b2', prompt: '', conversationId: 'conv-batch-42', createTime: '2026-08-27T12:00:05Z' });
-    const b3 = batchBox.normalizePost({ id: 'b3', prompt: '', conversationId: 'conv-batch-42', createTime: '2026-08-27T12:00:10Z' });
+    const b1 = batchBox.addPostRow(batchBox.normalizePost({ id: 'b1', prompt: 'glowing futuristic city', conversationId: 'conv-batch-42', createTime: '2026-08-27T12:00:00Z' }));
+    const b2 = batchBox.addPostRow(batchBox.normalizePost({ id: 'b2', prompt: '', conversationId: 'conv-batch-42', createTime: '2026-08-27T12:00:05Z' }));
+    const b3 = batchBox.addPostRow(batchBox.normalizePost({ id: 'b3', prompt: '', conversationId: 'conv-batch-42', createTime: '2026-08-27T12:00:10Z' }));
+    const promptMapBefore = batchBox.buildPromptById();
     const batchRows = [b1, b2, b3];
     const propagatedCount = batchBox.propagateBatchPrompts(batchRows, null);
     t.equal('two siblings received prompt', propagatedCount, 2);
     t.equal('sibling 2 got prompt', b2.prompt, 'glowing futuristic city');
     t.equal('sibling 3 got prompt', b3.prompt, 'glowing futuristic city');
+    t.ok('sibling 2 _search cache is immediately searchable',
+      batchBox.getSearchablePromptText(b2, batchBox.buildPromptById()).includes('futuristic'), b2._search);
+    t.ok('buildPromptById cache was invalidated after propagation',
+      batchBox.buildPromptById() !== promptMapBefore && batchBox.buildPromptById().get('b2') === 'glowing futuristic city');
+
+    t.group('resolveAndApplyPostPrompt refreshes _search and prompt cache');
+    const resBox = createIndexSandbox();
+    resBox.addPostRow(resBox.normalizePost({ id: 'rp-parent', prompt: 'sunlit alpine lake', createTime: '2026-08-27T12:00:00Z' }));
+    const rpChild = resBox.addPostRow(resBox.normalizePost({ id: 'rp-child', isChild: true, parentId: 'rp-parent', prompt: '', createTime: '2026-08-27T12:01:00Z' }));
+    const rpMapBefore = resBox.buildPromptById();
+    const didResolve = await resBox.resolveAndApplyPostPrompt(rpChild);
+    t.equal('child prompt resolved from parent', didResolve, true);
+    t.equal('child prompt populated', rpChild.prompt, 'sunlit alpine lake');
+    t.ok('child _search updated', rpChild._search.includes('alpine'), rpChild._search);
+    t.ok('prompt cache invalidated', resBox.buildPromptById() !== rpMapBefore && resBox.buildPromptById().get('rp-child') === 'sunlit alpine lake');
 
     t.group('parsing an asset into an index row');
     const row = m.parseAsset(asset('a'));
@@ -308,6 +324,28 @@ module.exports = {
     t.equal('but the media url is refreshed', merged.mediaUrl, 'https://assets.grok.com/users/u-1/generated/a1/image.jpg');
     t.equal('and the prompt is taken from the asset', merged.prompt, 'a red fox');
 
+    t.group('asset list merge preserves backfilled model and video poster thumbnail');
+    s = createIndexSandbox();
+    s.addPostRow(s.normalizePost({
+      id: 'v-keep', prompt: 'aurora sky', model: 'imagine-video-gen',
+      mediaType: 'MEDIA_POST_TYPE_VIDEO',
+      thumbnail: 'https://assets.grok.com/users/u-1/v-keep/poster.jpg',
+      mediaUrl: 'https://assets.grok.com/users/u-1/v-keep/video.mp4',
+      createTime: '2026-08-26T07:05:59.377Z',
+    }));
+    s.setAssetPages([{
+      assets: [asset('v-keep', {
+        mimeType: 'video/mp4',
+        key: 'users/u-1/v-keep/video.mp4',
+        mediaGenInput: null,
+      })],
+    }]);
+    await s.syncAssetsFeed(null);
+    const keptVid = s.postById.get('v-keep');
+    t.equal('model is not wiped by a list row lacking mediaGenInput', keptVid.model, 'imagine-video-gen');
+    t.equal('jpg poster thumbnail is not overwritten by .mp4 url',
+      keptVid.thumbnail, 'https://assets.grok.com/users/u-1/v-keep/poster.jpg');
+
     // ── reconcile safety ─────────────────────────────────────────────────────────────────
     t.group('reconcile counts asset-feed rows as present');
     const r = createIndexSandbox();
@@ -386,6 +424,43 @@ module.exports = {
     s.setAssetPages([{ assets: [asset('d1')] }, { assets: [asset('d2')] }]);
     res = await s.syncAssetsFeed(null, { stopWhenKnown: false });
     t.equal('a feed that ends on the cap is not a failure', res.failed, false);
+
+    t.group('reconcile asset walk cap and repeated token safety');
+    // Ending cleanly on exactly ASSETS_MAX_PAGES with no further nextPageToken must complete.
+    const rCap = createIndexSandbox();
+    rCap.setAssetsMaxPages(2);
+    rCap.addPostRow(rCap.normalizePost({ id: 'd1', prompt: 'x', createTime: '2026-01-01T00:00:00Z' }));
+    rCap.addPostRow(rCap.normalizePost({ id: 'd2', prompt: 'y', createTime: '2026-01-01T00:00:00Z' }));
+    rCap.addPostRow(rCap.normalizePost({ id: 'gone', prompt: 'z', createTime: '2026-01-01T00:00:00Z' }));
+    rCap.setFeedPages([{ posts: [] }]);
+    rCap.setAssetPages([{ assets: [asset('d1')] }, { assets: [asset('d2')] }]);
+    const capOut = await rCap.reconcileLikedIndex(null);
+    t.equal('reconcile ending cleanly on the cap completes', capOut.ok, true);
+    t.equal('and removes genuinely absent rows', capOut.removed, 1);
+
+    // A repeated asset page token is an abnormal early stop and must block deletions.
+    const rLoop = createIndexSandbox();
+    rLoop.addPostRow(rLoop.normalizePost({ id: 'keep1', prompt: 'x', createTime: '2026-01-01T00:00:00Z' }));
+    rLoop.addPostRow(rLoop.normalizePost({ id: 'keep2', prompt: 'y', createTime: '2026-01-01T00:00:00Z' }));
+    rLoop.addPostRow(rLoop.normalizePost({ id: 'keep3', prompt: 'z', createTime: '2026-01-01T00:00:00Z' }));
+    rLoop.setFeedPages([{ posts: [] }]);
+    rLoop.setAssetPages([
+      { assets: [asset('keep1')], nextPageToken: '1' },
+      { assets: [asset('keep2')], nextPageToken: '1' },
+    ]);
+    const loopOut = await rLoop.reconcileLikedIndex(null);
+    t.equal('repeated asset token marks reconcile incomplete', loopOut.ok, false);
+    t.equal('and deletes nothing', loopOut.removed, 0);
+    t.ok('missing row survives a broken pagination loop', rLoop.postById.has('keep3'));
+
+    // syncAssetsFeed must also surface a repeated page token as a failure.
+    const sLoop = createIndexSandbox();
+    sLoop.setAssetPages([
+      { assets: [asset('l1')], nextPageToken: '1' },
+      { assets: [asset('l2')], nextPageToken: '1' },
+    ]);
+    const sLoopRes = await sLoop.syncAssetsFeed(null, { stopWhenKnown: false });
+    t.equal('syncAssetsFeed reports repeated page token as failed', sLoopRes.failed, true);
 
     t.group('every full-library walk paces the same');
     // Reindex and Verify both walk to the end of the feed; there is no reason for them to

@@ -5,7 +5,7 @@ Tampermonkey userscripts that add **full-text search**, **filters**, **downloads
 A standalone project by **Richard Lipka**, grown from [IronSniper1's](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) base script and extended with incremental sync, child-post indexing, lightbox preview, bulk downloads, deletion, and much else — see [Credits and origins](#credits-and-origins).
 
 **Repository:** [github.com/richardLipka/grok-imagine-favorites-search-enhanced](https://github.com/richardLipka/grok-imagine-favorites-search-enhanced)  
-**Current versions:** `grokSearch.user.js` **v1.81.0** · `grokPostSidebar.user.js` **v1.5.0**  
+**Current versions:** `grokSearch.user.js` **v1.82.0** · `grokPostSidebar.user.js` **v1.6.0**  
 See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
 ## Credits and origins
@@ -17,7 +17,7 @@ credit.
 |--------|---------|--------------|
 | [IronSniper1 — Grok-imagine-favorite-image-search](https://github.com/ironsniper1/Grok-imagine-favorite-image-search) | 2026-03-07 | **The base this repository was forked from.** |
 | [Strapples — Grok Imagine Favorites Search (Greasy Fork)](https://greasyfork.org/en/scripts/570473-grok-imagine-favorites-search-saved-item-pass-through) · [GrokImagineSearchandOrganize](https://github.com/Strapples/GrokImagineSearchandOrganize) | 2026-03-20 | A parallel userscript, also forked from IronSniper1. Its author asks that people link back to their GitHub, so it is linked here. |
-| **This repo** | — | Everything since: `grokSearch.user.js` v1.81.0 + `grokPostSidebar.user.js` v1.5.0 |
+| **This repo** | — | Everything since: `grokSearch.user.js` v1.82.0 + `grokPostSidebar.user.js` v1.6.0 |
 
 Earlier versions of this README described the Greasy Fork script as the original and IronSniper1 as
 downstream of it. That was the wrong way round: IronSniper1 came first, and the Greasy Fork script
@@ -112,7 +112,7 @@ from one — the code has diverged completely from where it started.
 ## First run
 
 1. Go to **https://grok.com/imagine** (saved / liked view).
-2. A floating search bar appears at the top; a **toggle** sits at the bottom-right.
+2. A compact floating search bar appears at the top; a **show/hide toggle** sits at the top-right by default.
 3. **First visit** (empty index): status shows `first-time indexing…` then `N indexed`. This walks the liked API and fills IndexedDB.
 4. **Later visits**: `cached` → `syncing…` → `up to date` or `+N new, M updated` (incremental sync, no full reindex).
 
@@ -124,55 +124,55 @@ Indexing time depends on library size. Leave the tab open until the status finis
 
 ### Search bar
 
-| Control | Action |
-|---------|--------|
-| Text field | **AND** search on prompt (parents); child rows also match **parent prompt** (`parentPrompt`). Filters **400 ms** after you stop typing. |
-| **From / To** dates | Filter by post date (child cards use **their own** date) |
-| **‹ / ›** (beside dates) | Previous / next day — **only** when a **single day** is selected (same From and To) |
-| **Date presets** | Quick filter chips next to date stepper: **Today**, **Yesterday**, **Last 7 Days**, **This Month** (click to set, click active chip to clear) |
-| **Results only** | Hide Grok’s native grid; show paginated results panel (when bar is visible) |
-| **Video only** | Show only video posts (parent or child video rows; hides images) |
-| **With video** | Parents only — image posts that have at least one video in child/descendant results |
-| **With child** | Parents only; min descendant count (full tree, not just first generation) |
-| **Hide childs** | Hide child post rows from results (show parents only) |
-| **Uploaded only** | Show only user-uploaded images (hide generated media) |
-| **Liked only** | Show only posts you have liked (posts whose like state is unknown are excluded) |
-| **Model** | Filter by generation model; the list is built from the models present in your index (hidden when none are recorded) |
-| **Per page / Size** | Pagination size (1–300) and thumbnail scale (10–200%) |
-| **Compact** | Fold child results into their parent’s card as a thumbnail strip, one card per family (see [Compact groups](#compact-groups)) |
-| **Batch groups** | Group multi-image generations sharing the same batch conversation into a single card with thumbnail previews (see [Batch groups](#batch-groups)) |
-| **Button** | Which corner the show/hide button sits in — top right (default), bottom right, top left, bottom left |
-| **Default** | Reset to 44 per page, 100% size, **Compact** off, **Batch groups** off, button in the top-right corner |
-| **Sort** | Newest or oldest (remembered between sessions) |
-| **Clear** | Clears text, dates, model, liked, and media filters |
-| **Grip** (the handle above the bar) | Drag the whole bar anywhere on screen. Double-click it, or press Escape with it focused, to put it back in the centre. Arrow keys nudge it, Shift+arrows move it further. The position is remembered |
-| **Download selected** | In the match-count area — save checked images to a folder (Chrome/Edge) |
-| **Download by tag** | Save the **whole indexed catalogue** into one folder per tag (see [Tags](#tags)) |
-| **Import JSON** | Merge a previously exported index file back in (adds and updates; never deletes) |
-| **Export JSON** | Download full index (schema v5, parents + children) |
-| **Export results** | Export filtered results or selected subset as **JSON** (schema v5) or **CSV** (RFC-4180 table with prompt, model, media URLs, parent/child IDs) |
-| **Verify** | Reconcile the index against the feed — removes posts that are gone and repairs anything a truncated sync missed |
-| **Reindex** | Clear DB and rebuild from API (use after upgrades or bad cache). Warns first with a time estimate — on a ~23,000 image library it takes roughly eight minutes, because Grok rate-limits the feed about every 31 pages and each pause has to be waited out |
-| **Rate wait** | How long to pause when Grok rate-limits the feed during Reindex or Verify. Default **5s**, which is the measured value; lower settings retry inside a window that has not refilled and can truncate the index |
-| **Prune missing** | Probes each indexed item's **own** media for HTTP 404/deleted and bulk-removes what is gone, after user confirmation. Every candidate is probed — a thumbnail that failed to paint is not taken as proof |
-| **Fix prompts** | Reads the prompt, model and parent image for every row the library feed did not carry them for. See [Why prompts go missing](#why-prompts-go-missing) |
+By default the search bar stays a single compact row (search input + inline `×` clear, **Model**, **Sort**, match count, **Filters**, **⚙ Tools**, and **`?` Shortcuts**), with removable **Active filter chips** directly underneath whenever any filter is active.
 
-### Results panel header
+| Control | Where | Action |
+|---------|-------|--------|
+| Text field + inline `×` | Primary bar | **AND** search on prompt (parents); child rows also match **parent prompt** (`parentPrompt`). Filters **400 ms** after you stop typing. |
+| **Model** | Primary bar | Filter by generation model; built from the models present in your index (hidden when none are recorded) |
+| **Sort** | Primary bar | Newest or oldest (remembered between sessions) |
+| **Filters** *(badge shows count)* | Primary bar | Opens/closes the date, media, liked, uploaded, and tag filter drawer (state persisted; `Esc` closes) |
+| **⚙ Tools** | Primary bar | Opens/closes the **Display** settings and **Library** maintenance drawer (state persisted; `Esc` closes) |
+| **`?`** | Primary bar | Opens the **Keyboard shortcuts** reference modal |
+| **Active filter chips** | Under primary bar | One-click removable pills for every active filter, plus **Clear all** when two or more filters are active |
+| **From / To** dates & **‹ / ›** | **Filters** | Filter by post date (child cards use **their own** date); **‹ / ›** step by day when a single day is selected |
+| **Date presets** | **Filters** | Quick filter chips: **Today**, **Yesterday**, **Last 7 Days**, **This Month** (click to set, click active chip to clear) |
+| **Clear filter** | **Filters** | Clears text, dates, model, tag, liked, uploaded, and media filters |
+| **Videos only** | **Filters** | Show only video posts (parent or child video rows; hides images) |
+| **Images w/ video** | **Filters** | Parents only — image posts that have at least one video in child/descendant results |
+| **Has variations ≥** | **Filters** | Parents only; minimum descendant count (full tree, not just first generation) |
+| **Originals only** | **Filters** | Hide variation/child post rows from results (show parents/originals only) |
+| **Liked only** | **Filters** | Show only posts you have liked (posts whose like state is unknown are excluded) |
+| **Uploaded only** | **Filters** | Show only user-uploaded images (hide generated media) |
+| **Tag** | **Filters** | Show only images carrying a Grok tag/collection (appears once you have custom tags) |
+| **Full-screen panel** | **⚙ Tools → Display** | Hide Grok’s native grid; show paginated results panel (when bar is visible) |
+| **Per page / Size** | **⚙ Tools → Display** | Pagination size (1–300) and thumbnail scale (10–200%) |
+| **Group variations** | **⚙ Tools → Display** | Fold variation/child results into their parent’s card as a thumbnail strip, one card per family (see [Compact groups](#compact-groups)) |
+| **Group batches** | **⚙ Tools → Display** | Group multi-image generations sharing the same batch conversation into a single card with thumbnail previews (see [Batch groups](#batch-groups)) |
+| **Toggle corner** | **⚙ Tools → Display** | Which corner the show/hide button sits in — top right (default), bottom right, top left, bottom left |
+| **API delay** | **⚙ Tools → Display** | How long to pause when Grok rate-limits the feed during Reindex or Verify. Default **5s** (measured); lower settings retry inside a window that has not refilled and can truncate the index |
+| **Default** | **⚙ Tools → Display** | Reset to 44 per page, 100% size, grouping off, API delay 5s, and toggle button in the top-right corner |
+| **Grip** (handle above bar) | Above bar | Drag the whole bar anywhere on screen. Double-click, or press `Enter`/`Space`/`Home`/`Esc` when focused, to put it back in the centre. Arrow keys nudge it (`Shift`+arrows move further). Position is remembered |
+| **Download selected** | **⚙ Tools → Library** / Selection bar | Save checked images to a folder (Chrome/Edge) |
+| **Download by tag** | **⚙ Tools → Library** | Save the **whole indexed catalogue** into one folder per tag (see [Tags](#tags)) |
+| **Import JSON** | **⚙ Tools → Library** | Merge a previously exported index file back in (adds and updates; never deletes) |
+| **Export JSON** | **⚙ Tools → Library** | Download full index (schema v5, parents + children) |
+| **Export results** | **⚙ Tools → Library** / Panel header | Export filtered results or selected subset as **JSON** (schema v5) or **CSV** (RFC-4180 table with prompt, model, media URLs, parent/child IDs) |
+| **Verify** | **⚙ Tools → Library** | Reconcile the index against the feed — removes posts that are gone and repairs anything a truncated sync missed |
+| **Reindex** | **⚙ Tools → Library** | Clear DB and rebuild from API (use after upgrades or bad cache). Warns first with a time estimate — on a ~23,000 image library it takes roughly eight minutes because of Grok's rate-limit bucket |
+| **Prune missing** | **⚙ Tools → Library** | Probes each indexed item's **own** media for HTTP 404/deleted and bulk-removes what is gone, after user confirmation. Every candidate is probed — a thumbnail that failed to paint is not taken as proof |
+| **Fix prompts** | **⚙ Tools → Library** | Reads the prompt, model and parent image for every row the library feed did not carry them for. See [Why prompts go missing](#why-prompts-go-missing) |
+| **Tags** | **⚙ Tools → Library** / Selection bar | Create, rename, and delete Grok collections/tags and bulk-tag selected items |
 
-Shown when **Results only** is on (default). These controls are **not** in the search bar:
+### Results panel header & Selection Action Bar
 
-| Control | Action |
-|---------|--------|
-| **Download data** | Export **current matched results** as JSON (active filters + row metadata) |
-| **Download selected** | Same as toolbar — folder bulk download with progress under “Search results” |
-| **Check all** | Select every item in the current filter/match set (all pages) |
-| **Clear selection** | Uncheck all selected items |
+When **Full-screen panel** is on (default), the panel header provides **Export results**, **Download selected**, **Check all**, **Clear selection**, and **Delete selected**.
+
+Whenever one or more cards are checked (or a bulk download is running or has retries), a floating **Selection Action Bar** also appears at the bottom center in **both Full-screen panel mode and Inline mode**, providing one-click **Download**, **Tag…**, **Export…**, **Delete**, **Select all**, **Clear**, and **Cancel / Retry**.
 
 > Selections **persist across filter changes** — searching or changing dates after checking
 > items no longer clears them. **Download selected** saves everything currently checked, not
-> just the items matching the active filter; use **Clear selection** to start over.
-
-> **Inline mode** (`Results only` off): the panel is hidden, so **Download data**, **Check all**, and **Clear selection** are unavailable. Use **Download selected** from the search bar or turn **Results only** back on.
+> just the items matching the active filter; use **Clear** / **Clear selection** to start over.
 
 #### Moving the bar
 
@@ -191,17 +191,20 @@ somewhere you cannot reach. Double-click the grip to put it back in the centre.
 
 - Click the **show/hide** button to hide the bar (only that button stays). It sits in the
   **top right** by default, below Grok’s own header controls so it does not cover them, and
-  **Button** in the display row moves it to any corner. On viewports narrower than 1040px the
-  top corners fall back to the bottom, because the search bar itself reaches the right edge there.
-- **Results only** turns off while hidden; native Grok grid shows.
-- **Ctrl/Cmd+F** expands the bar and focuses search.
+  **Toggle corner** under **⚙ Tools → Display** moves it to any corner. On viewports narrower than
+  1040px the top corners fall back to the bottom, because the search bar itself reaches the right
+  edge there.
+- When filters are active while collapsed, the toggle button displays an active-filter count badge
+  (and announces the count in its tooltip and `aria-label`).
+- **Full-screen panel** turns off while hidden; native Grok grid shows.
+- **Ctrl/Cmd+F** or **`/`** expands the bar and focuses search.
 
 ### Results
 
-- **Left-click** a card → **lightbox** over current matched results (←/→ inside lightbox, **Download** in footer, Esc to close).
-- **Right-click** a card → context menu: Open, open in new tab, copy prompt/URL, download image/video, download all descendants, filter to date, open parent (child rows), open original (variations of a variation).
-- **Checkbox** (top-left, subtle until hover/selected) → select for **Download selected**.
-- **Date badge** (top center) → filter to that day (click again to clear).
+- **Left-click** a card (or press `Enter`/`Space` on its keyboard trigger) → **lightbox** over current matched results (`←`/`→` to step, **Copy prompt**, **Open media**, **Open post**, **Download**, **Like**, **Delete**, and `Esc` to close).
+- **Right-click** a card, click its **`⋮` menu button**, or press **`Shift+F10`** / `ContextMenu` → keyboard-navigable actions menu: Open, open in new tab, copy prompt/URL, download image/video, download all descendants, like/unlike, delete, filter to date, open parent (child rows), open original (variations of a variation).
+- **Checkbox** (top-left) → select for bulk download, tagging, export, or deletion via the Selection Action Bar.
+- **Date badge** (top center `<button>`) → filter to that day (click again to clear).
 - **Parent** cards: video / descendant image badges (counts include **all generations** in `childPosts` tree).
 - **Child** cards: purple **child** icon (bottom-left), own date badge. A variation that has variations of its own shows its **own** counts, so **Download all** works from it too.
 - **Video thumbnails**: video results automatically resolve to their parental image, root image, child image, or generation batch sibling image (`conversationId`) so video cards and strips are never blank.
@@ -209,9 +212,9 @@ somewhere you cannot reach. Double-click the grip to put it back in the centre.
 
 <a id="compact-groups"></a>
 
-#### Compact groups
+#### Compact groups (**Group variations**)
 
-**Compact** (display row, off by default) gives each *family* one card instead of each post one
+**Group variations** (under **⚙ Tools → Display**, off by default) gives each *family* one card instead of each post one
 cell. A matched child is folded into the outermost matched ancestor above it and drawn as a thumbnail
 in a strip under the parent image; anything past the first eight becomes a **+N** chip pinned to
 the right of the strip.
@@ -219,34 +222,34 @@ the right of the strip.
 - **Click a thumbnail** in the strip to open that child, not the parent. Right-click acts on the
   child too.
 - **The parent’s checkbox selects the whole group**, because the folded children have no
-  checkbox of their own — without that they could not be downloaded or deleted while compact.
+  checkbox of their own — without that they could not be downloaded or deleted while grouped.
 - **Per page counts cards, not images**, so the match count reads e.g. `1,240 matches in 380
   groups` and there are fewer pages.
 - Children with no matched ancestor (their parent is filtered out, or is not in the index) keep a
   cell of their own — nothing disappears.
-- **Hide childs** and **Compact** are independent: *Hide childs* removes children from the
-  results, *Compact* keeps them but folds them in.
+- **Originals only** and **Group variations** are independent: *Originals only* removes variations
+  from the results, *Group variations* keeps them but folds them in.
 
 <a id="batch-groups"></a>
 
-#### Batch generation groups
+#### Batch generation groups (**Group batches**)
 
-**Batch groups** (display row, off by default) groups generations originating from the same batch conversation (`conversationId`) into a single primary card with small thumbnail previews.
+**Group batches** (under **⚙ Tools → Display**, off by default) groups generations originating from the same batch conversation (`conversationId`) into a single primary card with small thumbnail previews.
 - Multi-image prompts generated together collapse into a single card, drastically reducing grid clutter.
-- Works seamlessly in tandem with **Compact** mode: parent-child trees are folded first, then remaining generation siblings are grouped under the primary card.
+- Works seamlessly in tandem with **Group variations**: parent-child trees are folded first, then remaining generation siblings are grouped under the primary card.
 - Selections, downloads, and lightbox navigation preserve every item in the generation without losing individual media links.
 
 #### Parent and related posts details
 
 When inspecting a selected result in the lightbox:
-- The **Related posts** sidebar on the left displays all associated media:
+- The **Related posts** sidebar on the left displays all associated media as keyboard-accessible buttons:
   - **Parent** and **Root** ancestors
   - **Child** and **Descendant** generations
   - **Sibling** branches sharing the same parent or root
   - **Batch** siblings generated together in the same generation conversation
   - **Same prompt** posts matching the prompt text
-- Clicking on any thumbnail in the left sidebar immediately switches the lightbox details to that selected post.
-- The footer lists descendant children with direct links.
+- Clicking any thumbnail in the left sidebar immediately switches the lightbox to that post, and a **`← Back`** button (`Alt+←`) appears at top-left so you can retrace your steps.
+- When the Related sidebar is visible, the redundant footer child thumbnail strip is hidden automatically to keep the modal uncluttered.
 
 ### Downloads and metadata
 
@@ -298,12 +301,15 @@ downloads, untagged.
 | Key | Action |
 |-----|--------|
 | `/` or `Ctrl/Cmd+F` | Expand search bar and focus search input from anywhere (safely ignored when typing in input/textarea) |
-| `Esc` | Close lightbox, export dialog, bulk-download confirm, or context menu; blur search input when focused |
+| `?` | Open or close the **Keyboard shortcuts** help modal |
+| `Esc` | Close topmost dialog, context menu, lightbox, open **Filters** / **⚙ Tools** drawer, or blur search input |
 | `←` / `→` | Lightbox prev/next when open; otherwise previous/next results page |
-| `C` | (Lightbox) Instant copy prompt to clipboard with status toast |
-| `L` | (Lightbox) Instant toggle Like / Unlike state |
+| `Alt+←` | (Lightbox) Go back to the previous item after jumping via the Related sidebar |
+| `Shift+F10` / `ContextMenu` | Open the card actions menu when a card is focused (`↑`/`↓`/`Home`/`End` navigate items) |
+| `C` | (Lightbox) Copy prompt to clipboard with live status confirmation |
+| `L` | (Lightbox) Toggle Like / Unlike state |
 | `D` | (Lightbox) Download active media file |
-| `Delete` / `Backspace` | (Lightbox) Open single-post delete / prune confirmation dialog. After a confirmed delete the lightbox moves to the **next** image rather than closing |
+| `Delete` / `Backspace` | (Lightbox) Open single-post delete confirmation dialog; after a confirmed delete the lightbox advances to the **next** image |
 
 ---
 
@@ -311,9 +317,9 @@ downloads, untagged.
 
 On `https://grok.com/imagine/post/{uuid}`:
 
-- Shows **prompt**, post ID, date, model, type, child/video counts.
-- Uses IndexedDB when available, else Grok **post/get** API.
-- Collapsible like the search bar (bottom-right toggle).
+- Shows **prompt** (with one-click **Copy prompt** button and live status announcement), post ID, clickable **Parent ID** link (`/imagine/post/{parentId}`), date, model, type, and child/video counts.
+- Uses IndexedDB when available, else Grok **post/get** / **assets** API.
+- Collapsible via the bottom-right toggle button, **`Esc`**, or clicking the backdrop on narrow screens (`< 768px`).
 
 Install together with `grokSearch.user.js` so the index is shared.
 
@@ -581,7 +587,7 @@ req.onsuccess = e => {
 | Recent posts missing, even after **Reindex** | Check the **Model** dropdown reads *All models* — it is a saved preference, so **Reindex** does not clear it and posts made with any other model stay hidden. **Clear** resets it. Then run [`tools/diagnose.js`](tools/diagnose.js) in the console if they are still missing |
 | A post you just liked is missing | If it is an older post it is not near the top of the feed; click **Verify** |
 | **Reindex** stops at about 1,980 images | Fixed in v1.76.1 — update the script. Grok rate-limits the feed roughly every 31 pages; older versions retried too impatiently and gave up at the first limit, indexing 33 pages and calling it done. **Verify** failed the same way, so it could not repair it either |
-| **Reindex** seems to hang | It pauses on purpose. A full walk of ~23,000 images takes around eight minutes, most of it waiting out rate limits. The toolbar names each pause (`rate limited — waiting 5s`). Raise **Rate wait** if your account is limited harder; lowering it re-creates the bug above |
+| **Reindex** seems to hang | It pauses on purpose. A full walk of ~23,000 images takes around eight minutes, most of it waiting out rate limits. The toolbar names each pause (`rate limited — waiting 5s`). Raise **API delay** (under **⚙ Tools → Display**) if your account is limited harder; lowering it re-creates the bug above |
 | Reindex or Verify says *incomplete* | The walk did not reach the end of the feed — connection, or rate limits it could not wait out. Nothing was deleted; just run it again |
 | A deleted image is still in Grok | The status will say *N still in library*: Grok accepted the delete but the image is still in the asset feed the library is built from. The row is deliberately kept so your index does not disagree with Grok. Please report it — the fix needs the request Grok's own UI sends when it deletes |
 | **Verify** says *aborted — unexpected feed response* | It refused to delete more than half the index; check the console and retry later |
@@ -590,11 +596,11 @@ req.onsuccess = e => {
 | A bulk download is taking too long | Click **Cancel**, then **Retry N files** later — it resumes into the same folder without re-prompting |
 | Some files failed | Click **Retry N files**. Each file already got three attempts, so a repeat failure usually means the media URL expired — run **Verify**, then retry |
 | **Retry** button disappeared | It only survives while the page is open; the queue is not persisted. Re-select and download again |
-| No **Check all** / **Download data** | Turn on **Results only** or use the results panel header |
+| Where are **Filters**, **Export results**, **Reindex**, or **Display** controls? | Click **Filters** or **⚙ Tools** on the primary search row (collapsed by default to keep the results grid visible); selecting any card also reveals the bottom **Selection Action Bar** in both Full-screen panel and Inline modes |
 | No metadata in a downloaded file | JPEG, PNG and WebP only — videos are never tagged. Check the browser console for `[GrokSearch]` warnings |
 | A tool reads the prompt from JPEG but not PNG | Some readers only look at `tEXt`; a prompt with characters outside Latin-1 is written as `iTXt` instead. `exiftool` reads both |
 | `piexif` / CDN blocked | Allow `cdn.jsdelivr.net` or reinstall script so `@require` can load |
-| Video/child filters still show child cards | **With video** / **With child** are parents-only; **Video only** includes child video rows; use **Hide childs** to drop child rows |
+| Video/child filters still show child cards | **Images w/ video** / **Has variations ≥** are parents-only; **Videos only** includes child video rows; use **Originals only** to drop child rows |
 | Greasy Fork + this script | Use **one** search script to avoid conflicts |
 
 ---

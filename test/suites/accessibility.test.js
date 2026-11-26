@@ -57,9 +57,42 @@ module.exports = {
       t.ok('and a box-shadow as well', /box-shadow:/.test(focusRule[0]), focusRule[0]);
     }
     for (const root of ['grok-search-wrap', 'grok-results-panel', 'grok-results-grid',
-                        'grok-result-lightbox', 'grok-pager']) {
+                        'grok-result-lightbox', 'grok-tag-manager', 'grok-pager',
+                        'grok-text-prompt-dialog', 'grok-shortcuts-dialog', 'grok-selection-bar']) {
       t.ok(`${root} is covered`, src.includes(`#${root} :focus-visible`), 'not in the focus rule');
     }
+    t.ok('first/last pager buttons have accessible names',
+      /id="grok-page-first"[^>]*aria-label="First page"/.test(src)
+      && /id="grok-page-last"[^>]*aria-label="Last page"/.test(src));
+    t.ok('first-page SVG bar is vertical, not diagonal',
+      /<line x1="1" y1="1" x2="1" y2="10"\/>/.test(src));
+
+    t.group('post sidebar accessibility and IndexedDB safety');
+    const fs = require('fs');
+    const path = require('path');
+    const sidebarSrc = fs.readFileSync(path.join(__dirname, '..', '..', 'grokPostSidebar.user.js'), 'utf8');
+    t.ok('post sidebar declares its own :focus-visible outline and shadow',
+      /#grok-post-sidebar :focus-visible[\s\S]*?outline: 2px[\s\S]*?box-shadow:/.test(sidebarSrc));
+    t.ok('post sidebar sets inert when collapsed', /panel\.inert = !expanded/.test(sidebarSrc));
+    t.ok('post sidebar never creates an empty IndexedDB schema on read',
+      /req\.onupgradeneeded = e => \{[\s\S]*?transaction\.abort\(\)/.test(sidebarSrc));
+    t.ok('post sidebar rebuilds UI on SPA return',
+      /async function refreshContent\(\) \{[\s\S]*?buildSidebar\(\);/.test(sidebarSrc));
+    t.ok('post sidebar includes Copy prompt button and live status region',
+      sidebarSrc.includes('id="grok-post-copy-prompt"') && sidebarSrc.includes('id="grok-post-sidebar-status"')
+      && /id="grok-post-sidebar-status"[^>]*role="status"[^>]*aria-live="polite"/.test(sidebarSrc));
+    t.ok('post sidebar links Parent ID to its post page',
+      /push\('Parent ID'[\s\S]*?href: `\/imagine\/post\//.test(sidebarSrc));
+    t.ok('post sidebar supports Escape dismiss, reduced motion, forced colors, and coarse pointers',
+      /e\.key !== 'Escape'/.test(sidebarSrc)
+      && /@media \(prefers-reduced-motion: reduce\)/.test(sidebarSrc)
+      && /@media \(forced-colors: active\)/.test(sidebarSrc)
+      && /@media \(pointer: coarse\)/.test(sidebarSrc));
+    const sidebarLowText = sidebarSrc.split(/\r?\n/).filter(l => {
+      const m = l.match(/(?:^|[\s;{])color:\s*rgba\(\s*255\s*,\s*255\s*,\s*255\s*,\s*([\d.]+)\s*\)/);
+      return m && parseFloat(m[1]) < 0.55;
+    });
+    t.equal('post sidebar has no low-contrast white text (< 0.55 alpha)', sidebarLowText.length, 0);
 
     t.group('the lightbox keeps focus');
     t.ok('Tab is trapped inside the dialog', /if \(e\.key === 'Tab'\) \{\s*trapLightboxFocus\(e\);/.test(stripComments(src)));
@@ -98,5 +131,49 @@ module.exports = {
       t.ok(`${sel} is at least ${min} alpha`, Boolean(alpha) && parseFloat(alpha[1]) >= min,
         rule ? rule[0].slice(0, 90) : 'rule missing');
     }
+
+    t.group('tier 1–3 GUI, keyboard, contrast, and UX invariants');
+    const lowWhiteText = src.split(/\r?\n/).filter(l => {
+      const m = l.match(/(?:^|[\s;{])color:\s*rgba\(\s*255\s*,\s*255\s*,\s*255\s*,\s*([\d.]+)\s*\)/);
+      return m && parseFloat(m[1]) < 0.55;
+    });
+    t.equal('grokSearch has no low-contrast white text (< 0.55 alpha)', lowWhiteText.length, 0);
+    t.ok('result cards have a native keyboard open trigger, button date pill, and menu button',
+      /<button type="button" class="grok-result-open-trigger"/.test(skeleton)
+      && /<button type="button" class="grok-result-date"/.test(skeleton)
+      && /<button type="button" class="grok-result-menu-btn"[^>]*aria-haspopup="menu"/.test(skeleton));
+    t.ok('lightbox related items are native buttons, not clickable divs',
+      /<button type="button" class="grok-lightbox-related-item/.test(src)
+      && !/<div class="grok-lightbox-related-item/.test(src));
+    t.ok('context menu supports arrow keys, Home/End, Escape, and Shift+F10',
+      /e\.key === 'ArrowDown'/.test(src) && /e\.key === 'Home'/.test(src)
+      && /e\.key === 'F10'/.test(src));
+    t.ok('live status regions are wired on stamp status, download status, and no-results',
+      /id="grok-stamp-status"[^>]*role="status"[^>]*aria-live="polite"/.test(src)
+      && /id="grok-panel-download-status"[^>]*role="status"[^>]*aria-live="polite"/.test(src)
+      && /noResults\.setAttribute\('aria-live', 'polite'\)/.test(src));
+    t.ok('media preferences are honored (hover:none, pointer:coarse, reduced-motion, forced-colors)',
+      /@media \(hover: none\)/.test(src)
+      && /@media \(pointer: coarse\)/.test(src)
+      && /@media \(prefers-reduced-motion: reduce\)/.test(src)
+      && /@media \(forced-colors: active\)/.test(src));
+    t.ok('native window.prompt() is replaced by the accessible dark text-prompt dialog',
+      !/\bprompt\s*\(\s*['"]/.test(stripComments(src))
+      && src.includes('function promptTextDialog(')
+      && src.includes('aria-invalid'));
+    t.ok('lightbox has visible Copy prompt, Back history, distinct Open media/Open post, and sidebar deduplication',
+      src.includes('id="grok-lightbox-copy-prompt"') || src.includes("btn.id = 'grok-lightbox-copy-prompt'")
+      && src.includes("btn.id = 'grok-lightbox-back'")
+      && /grok-lightbox-open-tab[\s\S]{0,260}getPostMediaUrl/.test(src)
+      && /if \(sidebar && !sidebar\.hidden\) \{\s*row\.hidden = true;/.test(src));
+    t.ok('collapsible toolbar drawers manage inert and aria-expanded',
+      src.includes('function ensureToolbarDrawers()')
+      && /el\.inert = !open/.test(src)
+      && src.includes('grok-toggle-filters-btn')
+      && src.includes('grok-toggle-tools-btn'));
+    t.ok('contextual selection bar, active filter chips, and shortcuts dialog exist',
+      src.includes('function ensureSelectionBar()')
+      && src.includes('function ensureActiveFilterChips()')
+      && src.includes('function ensureShortcutsDialog()'));
   },
 };

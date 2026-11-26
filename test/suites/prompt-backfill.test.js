@@ -256,7 +256,29 @@ module.exports = {
     s.recomputeChildCounts(null);
     t.equal('a parent that had none gains the real one', root2.childPostCount, 1);
     t.equal('counted by kind', root2.childVideoCount, 1);
+    t.equal('and videoCount is updated to match', root2.videoCount, 1);
     t.equal('and not double-counted as an image', root2.childImageCount, 0);
+
+    t.group('multi-generation backfill resolves transitive rootId, videoCount, and model revision');
+    const rChain = IMAGE('r0', 'root forest prompt');
+    const cChain = IMAGE('c0', 'child snow prompt', {
+      mediaGenInput: { imageToImage: { prompt: 'child snow prompt', inputAssets: ['r0'], modelName: 'model-v2' } },
+    });
+    const gChain = VIDEO('g0', 'c0', '');
+    s = await indexedFrom([gChain, cChain, rChain]);
+    const revBeforeModel = s.indexRevision;
+    s.setAssetDetails({ r0: rChain, c0: cChain, g0: gChain });
+    await s.backfillAssetDetails({});
+    t.equal('grandchild points at immediate parent', s.postById.get('g0').parentId, 'c0');
+    t.equal('grandchild rootId resolves transitively to root', s.postById.get('g0').rootId, 'r0');
+    t.equal('grandchild inherits rootPrompt for search', s.postById.get('g0').rootPrompt, 'root forest prompt');
+    t.ok('grandchild matches root wording',
+      s.getSearchablePromptText(s.postById.get('g0'), s.buildPromptById()).includes('forest'));
+    t.equal('root counts both child and grandchild', s.postById.get('r0').childPostCount, 2);
+    t.equal('root counts grandchild video in childVideoCount', s.postById.get('r0').childVideoCount, 1);
+    t.equal('root updates videoCount too', s.postById.get('r0').videoCount, 1);
+    t.ok('discovering models on existing rows bumps indexRevision for the model filter',
+      s.indexRevision > revBeforeModel, { before: revBeforeModel, after: s.indexRevision });
 
     t.group('a reindex is not finished until the detail pass has run');
     // Otherwise a rebuild produces 23,000 rows of untitled thumbnails and reports success.

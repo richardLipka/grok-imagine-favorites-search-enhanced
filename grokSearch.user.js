@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine Favorites Search + Saved Item Pass-Through
 // @namespace    http://tampermonkey.net/
-// @version      1.81.0
+// @version      1.82.0
 // @description  Search, filter, and paginate saved Grok media; lightbox, resumable bulk download, full EXIF/XMP tagging (JPEG, PNG, WebP).
 // @author       Richard Lipka, based on IronSniper1
 // @homepage     https://github.com/richardLipka/grok-imagine-favorites-search-enhanced
@@ -193,7 +193,7 @@
   const METADATA_REFRESH_KEY = 'metadataRefreshedAt';
   const INDEX_SCHEMA_VERSION = 5;
   /** Keep in step with the @version header — it is stamped into downloaded image metadata. */
-  const SCRIPT_VERSION = '1.81.0';
+  const SCRIPT_VERSION = '1.82.0';
   /**
    * Grok stopped requiring a like for media to stay in history, so the index covers the whole
    * library rather than only likes. The enum value for "everything" is not documented, so the
@@ -351,9 +351,10 @@
   let bulkDownloadCancelled = false;
   /** Aborts the in-flight media request so Cancel takes effect mid-file, not after it. */
   let bulkDownloadAbort = null;
-  /** Posts that failed in the last bulk run, plus the folder they were headed for. */
+  /** Posts that failed in the last bulk run, plus the folder and grouping they were headed for. */
   let lastFailedDownloads = [];
   let lastDownloadDirHandle = null;
+  let lastDownloadFolderNamesFor = null;
   let reconcileInProgress = false;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -369,18 +370,25 @@
     try { localStorage.setItem(key, value); } catch { /* ignore */ }
   }
 
-  // IndexedDB functions (unchanged)
+  // IndexedDB functions
   function openDB() {
     return new Promise((resolve, reject) => {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
       req.onupgradeneeded = e => {
-        const db = e.target.result;
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+        const database = e.target.result;
+        if (!database.objectStoreNames.contains(STORE_NAME)) {
+          const store = database.createObjectStore(STORE_NAME, { keyPath: 'id' });
           store.createIndex('createTime', 'createTime', { unique: false });
         }
       };
-      req.onsuccess = e => resolve(e.target.result);
+      req.onsuccess = e => {
+        const database = e.target.result;
+        database.onversionchange = () => {
+          database.close();
+          if (db === database) db = null;
+        };
+        resolve(database);
+      };
       req.onerror = e => reject(e.target.error);
     });
   }
@@ -392,6 +400,7 @@
       const req = store.getAll();
       req.onsuccess = e => resolve(e.target.result);
       req.onerror = e => reject(e.target.error);
+      tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -402,6 +411,7 @@
       posts.forEach(p => store.put(toStorageRecord(p)));
       tx.oncomplete = resolve;
       tx.onerror = e => reject(e.target.error);
+      tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -412,6 +422,7 @@
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error);
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -424,6 +435,7 @@
       unique.forEach(id => store.delete(id));
       tx.oncomplete = resolve;
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
     });
   }
 
@@ -505,8 +517,11 @@
         headers: { ...(method !== 'GET' ? { 'Content-Type': 'application/json' } : { Accept: 'application/json' }), ...(headers || {}) },
         data: method !== 'GET' && body != null ? JSON.stringify(body) : undefined,
         withCredentials: true,
+        timeout: 30000,
         onload: res => resolve({ status: res.status, text: res.responseText, headers: res.responseHeaders }),
         onerror: () => resolve({ status: 0, text: '', headers: '' }),
+        ontimeout: () => resolve({ status: 0, text: '', headers: '' }),
+        onabort: () => resolve({ status: 0, text: '', headers: '' }),
       });
     });
   }
@@ -972,6 +987,10 @@
     }
     if (current.prompt !== next.prompt) {
       cachedPromptById = null;
+      if (typeof postsByPromptSource !== 'undefined') postsByPromptSource = null;
+    }
+    if (String(current.model || '') !== String(next.model || '')) {
+      indexRevision++;
     }
     for (const key of Object.keys(current)) {
       if (!(key in next)) delete current[key];
@@ -1291,8 +1310,11 @@
         headers: { 'Content-Type': 'application/json', ...(tpl.headers || {}) },
         data: req.method === 'GET' ? undefined : JSON.stringify(req.body),
         withCredentials: true,
+        timeout: 30000,
         onload: res => resolve({ ok: res.status >= 200 && res.status < 300, status: res.status, text: res.responseText }),
         onerror: () => resolve({ ok: false, status: 0 }),
+        ontimeout: () => resolve({ ok: false, status: 0 }),
+        onabort: () => resolve({ ok: false, status: 0 }),
       });
     });
   }
@@ -1459,6 +1481,9 @@
   async function renameTag(id, name) {
     const clean = normalizeTagName(name);
     if (!clean) return { ok: false, reason: 'empty' };
+    if (tagList.some(t => t.id !== id && t.name.toLowerCase() === clean.toLowerCase())) {
+      return { ok: false, reason: 'duplicate' };
+    }
     const res = await postJsonWithRetry(COLLECTION_UPDATE, { id, name: clean }, 'tag rename');
     if (!res.ok) return { ok: false, reason: 'request', status: res.status };
     const tag = getTagById(id);
@@ -1647,7 +1672,7 @@
         }
 
         // If prompt is still blank and there is a parent, resolve prompt from parent
-        if (!remote.prompt && remote.parentId && depth < maxDepth) {
+        if (!remote.prompt && remote.parentId && remote.parentId !== id && depth < maxDepth) {
           const parentId = remote.parentId;
           const cachedParent = postById.get(parentId);
           if (cachedParent?.prompt) {
@@ -1671,9 +1696,20 @@
   function mergePostFromRemote(cached, remote) {
     const parsed = parsePost(remote);
     if (!parsed) return cached;
+    const thumbnail = isLikelyImageUrl(parsed.thumbnail)
+      ? parsed.thumbnail
+      : (isLikelyImageUrl(cached.thumbnail) ? cached.thumbnail : (parsed.thumbnail || cached.thumbnail || ''));
     return normalizePost({
       ...cached,
       ...parsed,
+      thumbnail,
+      mediaUrl: parsed.mediaUrl || cached.mediaUrl || '',
+      createTime: parsed.createTime || cached.createTime || '',
+      model: parsed.model || cached.model || '',
+      mediaType: parsed.mediaType || cached.mediaType || '',
+      isLiked: parsed.isLiked ?? cached.isLiked ?? null,
+      isUploaded: Boolean(cached.isUploaded || parsed.isUploaded),
+      conversationId: parsed.conversationId || cached.conversationId || '',
       isChild: remote.parentId ? true : (cached.isChild || false),
       parentId: remote.parentId || cached.parentId || null,
       rootId: remote.rootId || cached.rootId || remote.parentId || cached.parentId || null,
@@ -1687,29 +1723,37 @@
     if (!post?.id) return false;
     if (post.prompt && post.prompt.trim()) return false;
 
+    const commitResolved = async nextFields => {
+      const merged = normalizePost({ ...post, ...nextFields });
+      const live = updatePostRow(merged) || Object.assign(post, merged);
+      if (typeof dbPutMany === 'function') await dbPutMany([live]);
+      return true;
+    };
+
     // 1. Check parent in postById if parentId is known
     if (post.parentId && typeof postById !== 'undefined') {
       const cachedParent = postById.get(post.parentId);
       if (cachedParent && (cachedParent.prompt || cachedParent.parentPrompt)) {
         const pPrompt = cachedParent.prompt || cachedParent.parentPrompt;
-        post.parentPrompt = cachedParent.prompt || cachedParent.parentPrompt;
-        post.rootPrompt = cachedParent.rootPrompt || pPrompt;
-        post.prompt = pPrompt;
-        updatePostRow(post);
-        if (typeof dbPutMany === 'function') await dbPutMany([post]);
-        return true;
+        return commitResolved({
+          parentPrompt: pPrompt,
+          rootPrompt: cachedParent.rootPrompt || pPrompt,
+          prompt: pPrompt,
+        });
       }
     }
 
     // 2. Try sibling batch match by conversationId
-    if (post.conversationId && typeof allPosts !== 'undefined') {
-      for (const other of allPosts) {
+    if (post.conversationId) {
+      const siblings = typeof getPostsByConversation === 'function'
+        ? (getPostsByConversation().get(String(post.conversationId)) || [])
+        : (typeof allPosts !== 'undefined' ? allPosts : []);
+      for (const other of siblings) {
         if (other.id !== post.id && other.conversationId === post.conversationId && other.prompt && other.prompt.trim()) {
-          post.prompt = other.prompt.trim();
-          if (other.model && !post.model) post.model = other.model;
-          updatePostRow(post);
-          if (typeof dbPutMany === 'function') await dbPutMany([post]);
-          return true;
+          return commitResolved({
+            prompt: other.prompt.trim(),
+            model: post.model || other.model || '',
+          });
         }
       }
     }
@@ -1719,10 +1763,9 @@
       const remote = await fetchRemotePost(post.id);
       if (remote && (remote.prompt || remote.model || remote.parentId)) {
         const merged = mergePostFromRemote(post, remote);
-        if (merged.prompt || merged.parentId) {
-          Object.assign(post, merged);
-          updatePostRow(post);
-          if (typeof dbPutMany === 'function') await dbPutMany([post]);
+        if (merged.prompt || merged.parentId || (merged.model && !post.model)) {
+          const live = updatePostRow(merged) || Object.assign(post, merged);
+          if (typeof dbPutMany === 'function') await dbPutMany([live]);
           return true;
         }
       }
@@ -1857,22 +1900,40 @@
       if (list) list.push(p);
       else byParent.set(p.parentId, [p]);
     }
+    const countDescendants = rootId => {
+      let total = 0;
+      let videos = 0;
+      const seen = new Set([rootId]);
+      const stack = [...(byParent.get(rootId) || [])];
+      while (stack.length) {
+        const k = stack.pop();
+        if (!k || seen.has(k.id)) continue;
+        seen.add(k.id);
+        total++;
+        if (isVideoMediaType(k.mediaType)) videos++;
+        const sub = byParent.get(k.id);
+        if (sub && sub.length) stack.push(...sub);
+      }
+      return { total, videos };
+    };
     let changed = 0;
     for (const p of allPosts) {
-      const kids = byParent.get(p.id);
-      if (!kids || !kids.length) continue;
-      const videos = kids.reduce((n, k) => n + (isVideoMediaType(k.mediaType) ? 1 : 0), 0);
-      const nextPosts = Math.max(p.childPostCount ?? 0, kids.length);
+      if (!byParent.has(p.id)) continue;
+      const { total, videos } = countDescendants(p.id);
+      const nextPosts = Math.max(p.childPostCount ?? 0, total);
       const nextVideos = Math.max(p.childVideoCount ?? 0, videos);
-      const nextImages = Math.max(p.childImageCount ?? 0, kids.length - videos);
+      const nextImages = Math.max(p.childImageCount ?? 0, total - videos);
+      const nextVideoTotal = Math.max(p.videoCount ?? 0, (isVideoMediaType(p.mediaType) ? 1 : 0) + nextVideos);
       if ((p.childPostCount ?? 0) === nextPosts
           && (p.childVideoCount ?? 0) === nextVideos
-          && (p.childImageCount ?? 0) === nextImages) continue;
+          && (p.childImageCount ?? 0) === nextImages
+          && (p.videoCount ?? 0) === nextVideoTotal) continue;
       const row = normalizePost({
         ...p,
         childPostCount: nextPosts,
         childImageCount: nextImages,
         childVideoCount: nextVideos,
+        videoCount: nextVideoTotal,
       });
       const live = updatePostRow(row) || row;
       if (writer) writer.put(live);
@@ -1967,7 +2028,18 @@
             const previousPrompt = cached.prompt;
             // Deliberately not stamped: METADATA_REFRESH_KEY tracks the last *deep*
             // (post/get) refresh, and the list payload may carry a shallower child tree.
-            const merged = normalizePost({ ...cached, ...parsed });
+            const merged = normalizePost({
+              ...cached,
+              ...parsed,
+              prompt: parsed.prompt || cached.prompt || '',
+              model: parsed.model || cached.model || '',
+              isLiked: parsed.isLiked ?? cached.isLiked ?? null,
+              isUploaded: Boolean(parsed.isUploaded || cached.isUploaded),
+              thumbnail: isLikelyImageUrl(parsed.thumbnail)
+                ? parsed.thumbnail
+                : (isLikelyImageUrl(cached.thumbnail) ? cached.thumbnail : (parsed.thumbnail || cached.thumbnail || '')),
+              mediaUrl: parsed.mediaUrl || cached.mediaUrl || '',
+            });
             const changed = postMetadataChanged(cached, merged);
             const row = changed ? (updatePostRow(merged) || cached) : cached;
             if (changed) {
@@ -2107,6 +2179,7 @@
     for (const id of doomed) {
       knownIds.delete(id);
       selectedPostIds.delete(id);
+      if (typeof tagsByAsset !== 'undefined') tagsByAsset.delete(id);
       writer.del(id);
     }
     rebuildPostIndex();
@@ -2174,8 +2247,10 @@
     if (complete) {
       let assetToken = null;
       let assetPages = 0;
+      let assetMoreToRead = false;
       const seenAssetTokens = new Set();
       while (assetPages < ASSETS_MAX_PAGES) {
+        assetMoreToRead = false;
         const page = await fetchAssetPage(assetToken);
         if (!page.ok) {
           console.warn('[GrokSearch] Reconcile: asset walk failed, refusing to delete anything');
@@ -2189,12 +2264,18 @@
         }
         assetPages++;
         if (statusEl) setLoadStatus(`verifying (asset feed)… ${remoteIds.size.toLocaleString()} remote found (page ${assetPages})`);
-        if (!page.nextPageToken || seenAssetTokens.has(page.nextPageToken)) break;
+        if (!page.nextPageToken) break;
+        if (seenAssetTokens.has(page.nextPageToken)) {
+          console.warn('[GrokSearch] Reconcile: repeated asset page token, refusing to delete');
+          complete = false;
+          break;
+        }
         seenAssetTokens.add(page.nextPageToken);
         assetToken = page.nextPageToken;
+        assetMoreToRead = true;
         await sleep(FULL_WALK_PAGE_DELAY_MS);
       }
-      if (assetPages >= ASSETS_MAX_PAGES) {
+      if (assetPages >= ASSETS_MAX_PAGES && assetMoreToRead) {
         console.warn('[GrokSearch] Reconcile: asset walk hit the page cap, refusing to delete');
         complete = false;
       }
@@ -2291,6 +2372,9 @@
         },
         ontimeout() {
           resolve({ ok: false, status: 408 });
+        },
+        onabort() {
+          resolve({ ok: false, status: 0 });
         },
       });
     });
@@ -2450,9 +2534,11 @@
           url,
           headers: { Accept: 'application/json' },
           withCredentials: true,
+          timeout: 30000,
           onload: r => resolve({ status: r.status, text: r.responseText, headers: r.responseHeaders }),
           onerror: () => resolve({ status: 0, text: '', headers: '' }),
           ontimeout: () => resolve({ status: 0, text: '', headers: '' }),
+          onabort: () => resolve({ status: 0, text: '', headers: '' }),
         });
       });
       if (res.status >= 200 && res.status < 300) {
@@ -2657,6 +2743,7 @@
           post.rootPrompt = post.rootPrompt || parent.rootPrompt || pPrompt;
           post.rootId = post.rootId || parent.rootId || parent.id;
           post.prompt = pPrompt;
+          post[RUNTIME_SEARCH] = computeSearchText(post);
           propagated++;
           if (writer) writer.put(post);
         }
@@ -2672,6 +2759,9 @@
       }
     }
 
+    // Build a single O(N) lookup over allPosts only when at least one group lacks a local donor,
+    // avoiding an O(N^2) scan during full reindexes with thousands of promptless conversations.
+    let existingDonors = null;
     for (const [convId, group] of byConv.entries()) {
       let donorPrompt = '';
       let donorModel = '';
@@ -2683,12 +2773,22 @@
         }
       }
       if (!donorPrompt && typeof allPosts !== 'undefined') {
-        for (const existing of allPosts) {
-          if (existing.conversationId === convId && existing.prompt && existing.prompt.trim()) {
-            donorPrompt = existing.prompt.trim();
-            donorModel = existing.model || '';
-            break;
+        if (!existingDonors) {
+          existingDonors = new Map();
+          for (const existing of allPosts) {
+            if (!existing.conversationId || existingDonors.has(existing.conversationId)) continue;
+            if (existing.prompt && existing.prompt.trim()) {
+              existingDonors.set(existing.conversationId, {
+                prompt: existing.prompt.trim(),
+                model: existing.model || '',
+              });
+            }
           }
+        }
+        const found = existingDonors.get(convId);
+        if (found) {
+          donorPrompt = found.prompt;
+          donorModel = found.model;
         }
       }
       if (donorPrompt) {
@@ -2696,6 +2796,7 @@
           if (!p.prompt || !p.prompt.trim()) {
             p.prompt = donorPrompt;
             if (donorModel && !p.model) p.model = donorModel;
+            p[RUNTIME_SEARCH] = computeSearchText(p);
             propagated++;
             if (writer) writer.put(p);
           }
@@ -2703,6 +2804,10 @@
       }
     }
 
+    if (propagated > 0) {
+      cachedPromptById = null;
+      if (typeof postsByPromptSource !== 'undefined') postsByPromptSource = null;
+    }
     return propagated;
   }
 
@@ -2744,11 +2849,20 @@
           added++;
           continue;
         }
-        // An existing row may have come from the old feed, which carried child links and like
-        // state the asset feed does not. Keep those rather than blanking them.
+        // An existing row may have come from the old feed or a detail backfill, carrying child
+        // links, model, poster thumbnail, or like state the asset list feed does not. Keep those
+        // rather than blanking them.
         const merged = normalizePost({
           ...cached,
           ...parsed,
+          thumbnail: isLikelyImageUrl(parsed.thumbnail)
+            ? parsed.thumbnail
+            : (isLikelyImageUrl(cached.thumbnail) ? cached.thumbnail : (parsed.thumbnail || cached.thumbnail || '')),
+          mediaUrl: parsed.mediaUrl || cached.mediaUrl || '',
+          createTime: parsed.createTime || cached.createTime || '',
+          model: parsed.model || cached.model || '',
+          mediaType: parsed.mediaType || cached.mediaType || '',
+          conversationId: parsed.conversationId || cached.conversationId || '',
           isChild: Boolean(cached.parentId || parsed.parentId || cached.isChild || parsed.isChild),
           parentId: cached.parentId || parsed.parentId || null,
           rootId: cached.rootId || parsed.rootId || cached.parentId || parsed.parentId || null,
@@ -2781,6 +2895,7 @@
       if (!page.nextPageToken) break;
       if (seenTokens.has(page.nextPageToken)) {
         console.warn('[GrokSearch] Asset walk stopped: repeated page token');
+        failed = true;
         break;
       }
       seenTokens.add(page.nextPageToken);
@@ -3031,6 +3146,26 @@
         if (done % BACKFILL_FLUSH_EVERY === 0) await writer.flush();
       });
 
+      // Parent links arrived in arbitrary worker order, so a 3+ generation chain (root -> child ->
+      // grandchild) may still have grandchild.rootId pointing at the intermediate child. Resolve
+      // every child's rootId to the top-level ancestor before denormalizing prompts and counts.
+      for (const row of allPosts) {
+        if (!isChildPost(row) || !row.parentId) continue;
+        let cur = row;
+        const seen = new Set([row.id]);
+        while (cur.parentId && !seen.has(cur.parentId)) {
+          seen.add(cur.parentId);
+          const up = postById.get(cur.parentId);
+          if (!up) break;
+          cur = up;
+        }
+        const resolvedRootId = cur.id !== row.id ? cur.id : row.parentId;
+        if (resolvedRootId && row.rootId !== resolvedRootId) {
+          const updated = normalizePost({ ...row, rootId: resolvedRootId });
+          writer.put(updatePostRow(updated) || updated);
+        }
+      }
+
       // Parent links only just appeared, so the denormalized parent/root prompts on child rows
       // have to be recomputed -- that is what makes a video searchable by the prompt of the
       // still it was generated from -- and a parent that gained children needs its counts back,
@@ -3257,8 +3392,8 @@
       }
 
       if (addedCount) sortAllPostsNewestFirst();
+      for (const row of backfillChildParentPrompts()) writer.put(row);
       await writer.flush();
-      backfillChildParentPrompts();
       applyFilter();
 
       const summary = `imported +${addedCount} new, ${updatedCount} updated`
@@ -3308,22 +3443,15 @@
           'id', 'prompt', 'parentPrompt', 'parentId', 'rootId', 'rootPrompt', 'isChild',
           'thumbnail', 'mediaUrl', 'createTime', 'model', 'mediaType',
           'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount', 'isLiked',
-          'conversationId',
-          METADATA_REFRESH_KEY,
+          'isUploaded', 'conversationId',
+          PROMPT_PROBE_KEY, METADATA_REFRESH_KEY,
         ],
         posts,
       };
       const json = JSON.stringify(payload, null, 2);
       const blob = new Blob([json], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
       const stamp = new Date().toISOString().slice(0, 10);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `grok-search-index-${stamp}.json`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+      triggerBlobDownload(blob, `grok-search-index-${stamp}.json`);
       if (statusEl) {
         statusEl.textContent = `exported ${posts.length.toLocaleString()}`;
         setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
@@ -3350,6 +3478,7 @@
       filterMinChildren,
       filterModel,
       filterLikedOnly,
+      filterTagId,
       sort: currentSort,
       resultsOnly,
     };
@@ -3383,7 +3512,8 @@
     const rows = [headers.join(',')];
     for (const post of posts) {
       const prompt = post.prompt || post.parentPrompt || post.rootPrompt || '';
-      const date = post.createTime ? new Date(post.createTime).toISOString() : '';
+      const d = post.createTime ? new Date(post.createTime) : null;
+      const date = d && !Number.isNaN(d.getTime()) ? d.toISOString() : String(post.createTime || '');
       const row = [
         csvEscape(post.id),
         csvEscape(prompt),
@@ -3428,13 +3558,25 @@
         'thumbnail', 'mediaUrl', 'createTime', 'model', 'mediaType',
         'childPostCount', 'childImageCount', 'childVideoCount', 'videoCount', 'isLiked',
         'conversationId', 'isUploaded',
-        METADATA_REFRESH_KEY,
+        PROMPT_PROBE_KEY, METADATA_REFRESH_KEY,
       ],
       posts: storagePosts,
     };
     const json = JSON.stringify(payload, null, 2);
     const blob = new Blob([json], { type: 'application/json' });
     triggerBlobDownload(blob, filename);
+  }
+
+  let exportDialogReturnFocus = null;
+
+  function closeExportFormatDialog() {
+    const dlg = document.getElementById('grok-export-format-dialog');
+    if (dlg) dlg.hidden = true;
+    const returnTo = exportDialogReturnFocus;
+    exportDialogReturnFocus = null;
+    if (returnTo && returnTo.isConnected) {
+      try { returnTo.focus(); } catch { /* ignore */ }
+    }
   }
 
   function ensureExportFormatDialog() {
@@ -3459,21 +3601,15 @@
     document.body.appendChild(dlg);
 
     dlg.querySelectorAll('[data-grok-export-cancel]').forEach(el => {
-      el.addEventListener('click', () => { dlg.hidden = true; });
+      el.addEventListener('click', () => closeExportFormatDialog());
     });
     dlg.querySelector('.grok-export-btn-csv')?.addEventListener('click', () => {
-      dlg.hidden = true;
+      closeExportFormatDialog();
       executeSubsetExport('csv');
     });
     dlg.querySelector('.grok-export-btn-json')?.addEventListener('click', () => {
-      dlg.hidden = true;
+      closeExportFormatDialog();
       executeSubsetExport('json');
-    });
-    document.addEventListener('keydown', e => {
-      if (!dlg.hidden && e.key === 'Escape') {
-        e.preventDefault();
-        dlg.hidden = true;
-      }
     });
     return dlg;
   }
@@ -3486,6 +3622,7 @@
       return;
     }
     const dlg = ensureExportFormatDialog();
+    exportDialogReturnFocus = document.activeElement;
     const titleEl = document.getElementById('grok-export-format-title');
     const msgEl = document.getElementById('grok-export-format-message');
     const noun = posts.length === 1 ? 'item' : 'items';
@@ -3570,13 +3707,24 @@
           const merged = normalizePost({
             ...parentRow,
             ...parsed,
+            thumbnail: isLikelyImageUrl(parsed.thumbnail)
+              ? parsed.thumbnail
+              : (isLikelyImageUrl(parentRow.thumbnail) ? parentRow.thumbnail : (parsed.thumbnail || parentRow.thumbnail || '')),
+            mediaUrl: parsed.mediaUrl || parentRow.mediaUrl || '',
+            createTime: parsed.createTime || parentRow.createTime || '',
+            model: parentRow.model || parsed.model || '',
+            mediaType: parsed.mediaType || parentRow.mediaType || '',
             isChild: Boolean(parentRow.isChild || parsed.isChild),
             parentId: parentRow.parentId || parsed.parentId || null,
             rootId: parentRow.rootId || parsed.rootId || parentRow.parentId || parsed.parentId || null,
+            parentPrompt: parentRow.parentPrompt || parsed.parentPrompt || null,
+            rootPrompt: parentRow.rootPrompt || parsed.rootPrompt || null,
             childPostCount: Math.max(parentRow.childPostCount || 0, parsed.childPostCount || 0),
             childImageCount: Math.max(parentRow.childImageCount || 0, parsed.childImageCount || 0),
             childVideoCount: Math.max(parentRow.childVideoCount || 0, parsed.childVideoCount || 0),
+            videoCount: Math.max(parentRow.videoCount || 0, parsed.videoCount || 0),
             isLiked: parsed.isLiked ?? parentRow.isLiked ?? null,
+            isUploaded: Boolean(parentRow.isUploaded || parsed.isUploaded),
             prompt: parentRow.prompt || parsed.prompt || '',
           });
           if (postMetadataChanged(parentRow, merged)) {
@@ -3599,6 +3747,7 @@
       // A cursor that repeats (or a feed that never terminates) would otherwise loop forever.
       if (seenCursors.has(cursor)) {
         console.warn('[GrokSearch] Full index stopped: repeated cursor');
+        legacyFailed = true;
         break;
       }
       seenCursors.add(cursor);
@@ -4017,11 +4166,11 @@
           <div class="grok-results-panel-title-wrap">
             <span class="grok-results-panel-title" id="grok-panel-title">Search results</span>
             <span id="grok-panel-range" class="grok-results-panel-range"></span>
-            <span id="grok-panel-download-status" class="grok-panel-download-status"></span>
+            <span id="grok-panel-download-status" class="grok-panel-download-status" role="status" aria-live="polite" aria-atomic="true"></span>
           </div>
           <div id="grok-panel-count-wrap" class="grok-results-count-wrap">
             <span id="grok-panel-count"></span>
-            <button type="button" class="grok-download-results-btn grok-toolbar-btn" title="Download current search results as JSON">Download data</button>
+            <button type="button" class="grok-download-results-btn grok-toolbar-btn" title="Export filtered results or selected subset as JSON or CSV">Export results</button>
             <button type="button" class="grok-download-selected-btn grok-toolbar-btn" title="Download selected images to a folder">Download selected</button>
             <button type="button" class="grok-check-all-btn grok-toolbar-btn" title="Select all results in current search">Check all</button>
             <button type="button" class="grok-clear-selection-btn grok-toolbar-btn" title="Clear image selection">Clear selection</button>
@@ -4040,11 +4189,11 @@
           <div class="grok-results-panel-title-wrap">
             <span class="grok-results-panel-title" id="grok-panel-title">Search results</span>
             <span id="grok-panel-range" class="grok-results-panel-range"></span>
-            <span id="grok-panel-download-status" class="grok-panel-download-status"></span>
+            <span id="grok-panel-download-status" class="grok-panel-download-status" role="status" aria-live="polite" aria-atomic="true"></span>
           </div>
           <div id="grok-panel-count-wrap" class="grok-results-count-wrap">
             <span id="grok-panel-count"></span>
-            <button type="button" class="grok-download-results-btn grok-toolbar-btn" title="Download current search results as JSON">Download data</button>
+            <button type="button" class="grok-download-results-btn grok-toolbar-btn" title="Export filtered results or selected subset as JSON or CSV">Export results</button>
             <button type="button" class="grok-download-selected-btn grok-toolbar-btn" title="Download selected images to a folder">Download selected</button>
             <button type="button" class="grok-check-all-btn grok-toolbar-btn" title="Select all results in current search">Check all</button>
             <button type="button" class="grok-clear-selection-btn grok-toolbar-btn" title="Clear image selection">Clear selection</button>
@@ -4060,11 +4209,17 @@
 
   function ensurePanelDownloadStatus() {
     const titleWrap = document.querySelector('.grok-results-panel-title-wrap');
-    if (!titleWrap || document.getElementById('grok-panel-download-status')) return;
-    const status = document.createElement('span');
-    status.id = 'grok-panel-download-status';
-    status.className = 'grok-panel-download-status';
-    titleWrap.appendChild(status);
+    if (!titleWrap) return;
+    let status = document.getElementById('grok-panel-download-status');
+    if (!status) {
+      status = document.createElement('span');
+      status.id = 'grok-panel-download-status';
+      status.className = 'grok-panel-download-status';
+      titleWrap.appendChild(status);
+    }
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    status.setAttribute('aria-atomic', 'true');
   }
 
   function layoutPagerInPanel() {
@@ -4359,6 +4514,34 @@
     return byConv;
   }
 
+  let postsByPrompt = new Map();
+  let postsByPromptSource = null;
+  let postsByPromptLength = -1;
+  let postsByPromptRev = -1;
+
+  function getPostsByPrompt() {
+    const rev = typeof indexRevision !== 'undefined' ? indexRevision : 0;
+    if (postsByPromptSource === allPosts && postsByPromptLength === allPosts.length && postsByPromptRev === rev) {
+      return postsByPrompt;
+    }
+    const byPrompt = new Map();
+    for (const p of allPosts) {
+      const key = String(p.prompt || p.parentPrompt || p.rootPrompt || '').trim().toLowerCase();
+      if (key.length < 5) continue;
+      let list = byPrompt.get(key);
+      if (!list) {
+        list = [];
+        byPrompt.set(key, list);
+      }
+      list.push(p);
+    }
+    postsByPrompt = byPrompt;
+    postsByPromptSource = allPosts;
+    postsByPromptLength = allPosts.length;
+    postsByPromptRev = rev;
+    return byPrompt;
+  }
+
   /**
    * Resolves an image thumbnail URL for a post/asset.
    *
@@ -4510,7 +4693,12 @@
 
     // 5. Siblings sharing rootId (for grandchildren / deep trees)
     if (rootId && rootId !== parentId && (!limit || related.length < limit)) {
-      if (typeof allPosts !== 'undefined') {
+      if (typeof getAllDescendantPosts === 'function') {
+        for (const s of getAllDescendantPosts(rootId)) {
+          if (limit && related.length >= limit) break;
+          if (s.id !== id) add(s, 'sibling', 'Branch');
+        }
+      } else if (typeof allPosts !== 'undefined') {
         for (const s of allPosts) {
           if (limit && related.length >= limit) break;
           if (s.rootId === rootId && s.id !== id) add(s, 'sibling', 'Branch');
@@ -4540,13 +4728,11 @@
     // 7. Posts with the exact same non-empty prompt
     const promptText = String(post.prompt || post.parentPrompt || post.rootPrompt || '').trim().toLowerCase();
     if (promptText.length >= 5 && (!limit || related.length < limit) && typeof allPosts !== 'undefined') {
-      for (const p of allPosts) {
+      const twins = getPostsByPrompt().get(promptText) || [];
+      for (const p of twins) {
         if (limit && related.length >= limit) break;
         if (p.id === id || seen.has(p.id)) continue;
-        const pPrompt = String(p.prompt || p.parentPrompt || p.rootPrompt || '').trim().toLowerCase();
-        if (pPrompt === promptText) {
-          add(p, 'prompt', 'Same prompt');
-        }
+        add(p, 'prompt', 'Same prompt');
       }
     }
 
@@ -5255,7 +5441,7 @@
   function isDownloadableImagePost(post) {
     if (isVideoMediaType(post.mediaType)) return false;
     const url = getPostMediaUrl(post);
-    return !/\.mp4(\?|$)/i.test(url);
+    return !/\.(mp4|webm|mov|mkv)(\?|$)/i.test(url);
   }
 
   async function prepareDownloadBlob(post, signal) {
@@ -5295,14 +5481,7 @@
     if (!filename) return;
     prepareDownloadBlob(post)
       .then(blob => {
-        const objUrl = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = objUrl;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(objUrl);
+        triggerBlobDownload(blob, filename);
         flashStampStatus('downloaded');
       })
       .catch(() => flashStampStatus('download failed'));
@@ -5321,9 +5500,14 @@
   function syncSelectionOnGrid() {
     document.querySelectorAll('.grok-result-select-input').forEach(input => {
       const id = input.dataset.id;
-      const checked = selectedPostIds.has(id);
-      input.checked = checked;
-      input.closest('.grok-result-card')?.classList.toggle('grok-result-card--selected', checked);
+      const card = input.closest('.grok-result-card');
+      const ids = String(card?.dataset.group || id || '').split(' ').filter(Boolean);
+      const selectedCount = ids.reduce((n, x) => n + (selectedPostIds.has(x) ? 1 : 0), 0);
+      const allSelected = ids.length > 0 && selectedCount === ids.length;
+      const someSelected = selectedCount > 0 && !allSelected;
+      input.checked = allSelected;
+      input.indeterminate = someSelected;
+      card?.classList.toggle('grok-result-card--selected', selectedCount > 0);
     });
   }
 
@@ -5382,15 +5566,315 @@
   }
 
   let bulkDownloadConfirmResolver = null;
+  let bulkConfirmReturnFocus = null;
 
   function closeBulkDownloadConfirm(result) {
     const dlg = document.getElementById('grok-bulk-download-confirm');
     if (dlg) dlg.hidden = true;
+    const returnTo = bulkConfirmReturnFocus;
+    bulkConfirmReturnFocus = null;
+    if (returnTo && returnTo.isConnected) {
+      try { returnTo.focus(); } catch { /* ignore */ }
+    }
     if (bulkDownloadConfirmResolver) {
       const resolve = bulkDownloadConfirmResolver;
       bulkDownloadConfirmResolver = null;
       resolve(result);
     }
+  }
+
+  let textPromptResolver = null;
+  let textPromptReturnFocus = null;
+  let textPromptValidator = null;
+
+  function closeTextPromptDialog(result) {
+    const dlg = document.getElementById('grok-text-prompt-dialog');
+    if (dlg) dlg.hidden = true;
+    const errEl = document.getElementById('grok-text-prompt-error');
+    const inputEl = document.getElementById('grok-text-prompt-input');
+    if (errEl) { errEl.textContent = ''; errEl.hidden = true; }
+    if (inputEl) {
+      inputEl.removeAttribute('aria-invalid');
+      inputEl.removeAttribute('aria-describedby');
+    }
+    const resolve = textPromptResolver;
+    textPromptResolver = null;
+    textPromptValidator = null;
+    const returnTo = textPromptReturnFocus;
+    textPromptReturnFocus = null;
+    if (returnTo && returnTo.isConnected) {
+      try { returnTo.focus(); } catch { /* ignore */ }
+    }
+    if (resolve) resolve(result);
+  }
+
+  function ensureTextPromptDialog() {
+    let dlg = document.getElementById('grok-text-prompt-dialog');
+    if (dlg) return dlg;
+    dlg = document.createElement('div');
+    dlg.id = 'grok-text-prompt-dialog';
+    dlg.className = 'grok-bulk-download-confirm grok-text-prompt-dialog';
+    dlg.hidden = true;
+    dlg.innerHTML = `
+      <div class="grok-bulk-download-confirm-backdrop" data-grok-prompt-cancel></div>
+      <div class="grok-bulk-download-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="grok-text-prompt-title">
+        <div class="grok-bulk-download-confirm-title" id="grok-text-prompt-title"></div>
+        <label class="grok-text-prompt-label" id="grok-text-prompt-label" for="grok-text-prompt-input"></label>
+        <input type="text" id="grok-text-prompt-input" class="grok-page-jump grok-text-prompt-input" maxlength="60" autocomplete="off" />
+        <p id="grok-text-prompt-error" class="grok-text-prompt-error" role="alert" hidden></p>
+        <div class="grok-bulk-download-confirm-actions">
+          <button type="button" class="grok-toolbar-btn" data-grok-prompt-cancel>Cancel</button>
+          <button type="button" class="grok-toolbar-btn grok-bulk-download-confirm-ok" id="grok-text-prompt-ok">Save</button>
+        </div>
+      </div>`;
+    document.body.appendChild(dlg);
+
+    const submit = () => {
+      const inputEl = document.getElementById('grok-text-prompt-input');
+      const errEl = document.getElementById('grok-text-prompt-error');
+      const val = inputEl ? inputEl.value : '';
+      if (typeof textPromptValidator === 'function') {
+        const err = textPromptValidator(val);
+        if (err) {
+          if (errEl) { errEl.textContent = err; errEl.hidden = false; }
+          if (inputEl) {
+            inputEl.setAttribute('aria-invalid', 'true');
+            inputEl.setAttribute('aria-describedby', 'grok-text-prompt-error');
+            inputEl.focus();
+          }
+          return;
+        }
+      }
+      closeTextPromptDialog(val);
+    };
+
+    dlg.querySelectorAll('[data-grok-prompt-cancel]').forEach(el => {
+      el.addEventListener('click', e => { e.preventDefault(); closeTextPromptDialog(null); });
+    });
+    dlg.querySelector('#grok-text-prompt-ok')?.addEventListener('click', e => {
+      e.preventDefault();
+      submit();
+    });
+    dlg.querySelector('#grok-text-prompt-input')?.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submit();
+      }
+    });
+    return dlg;
+  }
+
+  function promptTextDialog({ title, label, initialValue = '', placeholder = '', okLabel = 'Save', maxLength = 60, validate = null }) {
+    const dlg = ensureTextPromptDialog();
+    if (textPromptResolver) closeTextPromptDialog(null);
+    return new Promise(resolve => {
+      textPromptResolver = resolve;
+      textPromptValidator = validate;
+      textPromptReturnFocus = document.activeElement;
+      const titleEl = document.getElementById('grok-text-prompt-title');
+      const labelEl = document.getElementById('grok-text-prompt-label');
+      const inputEl = document.getElementById('grok-text-prompt-input');
+      const errEl = document.getElementById('grok-text-prompt-error');
+      const okBtn = document.getElementById('grok-text-prompt-ok');
+      if (titleEl) titleEl.textContent = title || 'Enter value';
+      if (labelEl) labelEl.textContent = label || '';
+      if (errEl) { errEl.textContent = ''; errEl.hidden = true; }
+      if (okBtn) okBtn.textContent = okLabel || 'Save';
+      if (inputEl) {
+        inputEl.value = initialValue || '';
+        inputEl.placeholder = placeholder || '';
+        inputEl.maxLength = maxLength;
+        inputEl.removeAttribute('aria-invalid');
+        inputEl.removeAttribute('aria-describedby');
+      }
+      dlg.hidden = false;
+      if (inputEl) {
+        inputEl.focus();
+        inputEl.select();
+      }
+    });
+  }
+
+  let shortcutsReturnFocus = null;
+
+  function ensureShortcutsDialog() {
+    let dlg = document.getElementById('grok-shortcuts-dialog');
+    if (dlg) return dlg;
+    dlg = document.createElement('div');
+    dlg.id = 'grok-shortcuts-dialog';
+    dlg.className = 'grok-bulk-download-confirm';
+    dlg.hidden = true;
+    dlg.innerHTML = `
+      <div class="grok-bulk-download-confirm-backdrop" data-grok-shortcuts-close></div>
+      <div class="grok-bulk-download-confirm-panel grok-shortcuts-panel" role="dialog" aria-modal="true" aria-labelledby="grok-shortcuts-title">
+        <div class="grok-bulk-download-confirm-title" id="grok-shortcuts-title">Keyboard shortcuts</div>
+        <table class="grok-shortcuts-table">
+          <caption class="grok-sr-only">Available keyboard shortcuts</caption>
+          <thead>
+            <tr><th scope="col">Key</th><th scope="col">Action</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>Focus search box</td></tr>
+            <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>Previous / next page (or item in lightbox)</td></tr>
+            <tr><td><kbd>Alt</kbd>+<kbd>←</kbd></td><td>Back to previous item after opening a related post</td></tr>
+            <tr><td><kbd>?</kbd></td><td>Open or close this shortcuts help</td></tr>
+            <tr><td><kbd>Shift</kbd>+<kbd>F10</kbd></td><td>Open card actions menu when a card is focused</td></tr>
+            <tr><td><kbd>C</kbd></td><td>Copy prompt (in lightbox)</td></tr>
+            <tr><td><kbd>L</kbd></td><td>Like or unlike post (in lightbox)</td></tr>
+            <tr><td><kbd>D</kbd></td><td>Download media (in lightbox)</td></tr>
+            <tr><td><kbd>Delete</kbd> / <kbd>Backspace</kbd></td><td>Delete post with confirmation (in lightbox)</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Close dialog, menu, popover, or lightbox</td></tr>
+          </tbody>
+        </table>
+        <div class="grok-bulk-download-confirm-actions">
+          <button type="button" class="grok-toolbar-btn" data-grok-shortcuts-close>Close</button>
+        </div>
+      </div>`;
+    document.body.appendChild(dlg);
+    dlg.querySelectorAll('[data-grok-shortcuts-close]').forEach(el => {
+      el.addEventListener('click', e => { e.preventDefault(); closeShortcutsDialog(); });
+    });
+    return dlg;
+  }
+
+  function openShortcutsDialog() {
+    const dlg = ensureShortcutsDialog();
+    shortcutsReturnFocus = document.activeElement;
+    dlg.hidden = false;
+    dlg.querySelector('[data-grok-shortcuts-close].grok-toolbar-btn')?.focus();
+  }
+
+  function closeShortcutsDialog() {
+    const dlg = document.getElementById('grok-shortcuts-dialog');
+    if (dlg) dlg.hidden = true;
+    const returnTo = shortcutsReturnFocus;
+    shortcutsReturnFocus = null;
+    if (returnTo && returnTo.isConnected) {
+      try { returnTo.focus(); } catch { /* ignore */ }
+    }
+  }
+
+  const FILTERS_DRAWER_KEY = 'grokSearchFiltersDrawerOpen';
+  const TOOLS_DRAWER_KEY = 'grokSearchToolsDrawerOpen';
+
+  function setToolbarDrawerOpen(kind, open, persist = true) {
+    const wrap = document.getElementById('grok-search-wrap');
+    if (!wrap) return;
+    const isFilters = kind === 'filters';
+    const cls = isFilters ? 'grok-filters-open' : 'grok-tools-open';
+    const btn = document.getElementById(isFilters ? 'grok-toggle-filters-btn' : 'grok-toggle-tools-btn');
+    const targets = isFilters
+      ? [document.getElementById('grok-bar-date-row'), document.getElementById('grok-bar-filters')]
+      : [document.getElementById('grok-results-only-row'), document.getElementById('grok-bar-actions')];
+    wrap.classList.toggle(cls, Boolean(open));
+    if (btn) btn.setAttribute('aria-expanded', String(Boolean(open)));
+    for (const el of targets) {
+      if (el) el.inert = !open;
+    }
+    if (persist) {
+      writeStoredString(isFilters ? FILTERS_DRAWER_KEY : TOOLS_DRAWER_KEY, open ? '1' : '0');
+    }
+    updateResultsPanelOffset();
+  }
+
+  function syncQueryClearButton() {
+    const input = document.getElementById('grok-search-input');
+    const btn = document.getElementById('grok-search-query-clear');
+    if (!btn) return;
+    btn.hidden = !(input && input.value.length > 0);
+  }
+
+  function ensureToolbarDrawers() {
+    const wrap = document.getElementById('grok-search-wrap');
+    const line1 = document.querySelector('#grok-search-bar .grok-bar-line-1');
+    if (!wrap || !line1) return;
+
+    const searchInput = document.getElementById('grok-search-input');
+    if (searchInput && !document.getElementById('grok-search-query-clear')) {
+      const clearQ = document.createElement('button');
+      clearQ.type = 'button';
+      clearQ.id = 'grok-search-query-clear';
+      clearQ.className = 'grok-query-clear-btn';
+      clearQ.setAttribute('aria-label', 'Clear search query');
+      clearQ.title = 'Clear search query';
+      clearQ.textContent = '×';
+      clearQ.hidden = !searchInput.value;
+      clearQ.addEventListener('click', e => {
+        e.preventDefault();
+        searchInput.value = '';
+        currentQuery = '';
+        currentPage = 0;
+        syncQueryClearButton();
+        updateClearButton();
+        applyFilter();
+        searchInput.focus();
+      });
+      searchInput.insertAdjacentElement('afterend', clearQ);
+    }
+
+    const shortcutsBtn = document.getElementById('grok-shortcuts-btn');
+    if (!document.getElementById('grok-toggle-filters-btn')) {
+      const fBtn = document.createElement('button');
+      fBtn.type = 'button';
+      fBtn.id = 'grok-toggle-filters-btn';
+      fBtn.className = 'grok-toolbar-btn grok-drawer-toggle-btn';
+      fBtn.textContent = 'Filters';
+      fBtn.title = 'Show or hide date, media, and tag filters';
+      fBtn.setAttribute('aria-expanded', 'false');
+      fBtn.setAttribute('aria-controls', 'grok-bar-date-row grok-bar-filters');
+      fBtn.addEventListener('click', () => {
+        const next = !wrap.classList.contains('grok-filters-open');
+        setToolbarDrawerOpen('filters', next, true);
+      });
+      if (shortcutsBtn) line1.insertBefore(fBtn, shortcutsBtn);
+      else line1.appendChild(fBtn);
+    }
+
+    if (!document.getElementById('grok-toggle-tools-btn')) {
+      const tBtn = document.createElement('button');
+      tBtn.type = 'button';
+      tBtn.id = 'grok-toggle-tools-btn';
+      tBtn.className = 'grok-toolbar-btn grok-drawer-toggle-btn';
+      tBtn.textContent = '⚙ Tools';
+      tBtn.title = 'Show or hide display settings and library maintenance tools';
+      tBtn.setAttribute('aria-expanded', 'false');
+      tBtn.setAttribute('aria-controls', 'grok-results-only-row grok-bar-actions');
+      tBtn.addEventListener('click', () => {
+        const next = !wrap.classList.contains('grok-tools-open');
+        setToolbarDrawerOpen('tools', next, true);
+      });
+      if (shortcutsBtn) line1.insertBefore(tBtn, shortcutsBtn);
+      else line1.appendChild(tBtn);
+    }
+
+    const displayRow = document.getElementById('grok-results-only-row');
+    if (displayRow && !displayRow.dataset.sectionLabel) displayRow.dataset.sectionLabel = 'Display';
+    const actionsRow = document.getElementById('grok-bar-actions');
+    if (actionsRow && !actionsRow.dataset.sectionLabel) actionsRow.dataset.sectionLabel = 'Library';
+
+    const filtersOpen = readStoredString(FILTERS_DRAWER_KEY, '0') === '1';
+    const toolsOpen = readStoredString(TOOLS_DRAWER_KEY, '0') === '1';
+    setToolbarDrawerOpen('filters', filtersOpen, false);
+    setToolbarDrawerOpen('tools', toolsOpen, false);
+    syncQueryClearButton();
+    renderActiveFilterChips();
+  }
+
+  function ensureShortcutsButton() {
+    const line1 = document.querySelector('#grok-search-bar .grok-bar-line-1');
+    if (!line1 || document.getElementById('grok-shortcuts-btn')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'grok-shortcuts-btn';
+    btn.className = 'grok-toolbar-btn grok-icon-action-btn';
+    btn.textContent = '?';
+    btn.setAttribute('aria-label', 'Keyboard shortcuts');
+    btn.title = 'Keyboard shortcuts (?)';
+    btn.addEventListener('click', e => {
+      e.preventDefault();
+      openShortcutsDialog();
+    });
+    line1.appendChild(btn);
   }
 
   function ensureBulkDownloadConfirmDialog() {
@@ -5420,20 +5904,14 @@
     root.querySelector('.grok-bulk-download-confirm-ok')?.addEventListener('click', () => {
       closeBulkDownloadConfirm(true);
     });
-    document.addEventListener('keydown', e => {
-      const dlg = document.getElementById('grok-bulk-download-confirm');
-      if (!dlg || dlg.hidden) return;
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        closeBulkDownloadConfirm(false);
-      }
-    });
   }
 
   function confirmBulkDownload(count, body = '') {
     ensureBulkDownloadConfirmDialog();
+    if (bulkDownloadConfirmResolver) closeBulkDownloadConfirm(false);
     return new Promise(resolve => {
       bulkDownloadConfirmResolver = resolve;
+      bulkConfirmReturnFocus = document.activeElement;
       const dlg = document.getElementById('grok-bulk-download-confirm');
       const msg = document.getElementById('grok-bulk-download-confirm-message');
       const titleEl = document.getElementById('grok-bulk-download-confirm-title');
@@ -5465,6 +5943,7 @@
   function clearFailedDownloads() {
     lastFailedDownloads = [];
     lastDownloadDirHandle = null;
+    lastDownloadFolderNamesFor = null;
     syncDownloadSelectedButtons();
   }
 
@@ -5478,8 +5957,10 @@
    */
   function confirmDangerousAction({ title, message, okLabel }) {
     ensureBulkDownloadConfirmDialog();
+    if (bulkDownloadConfirmResolver) closeBulkDownloadConfirm(false);
     return new Promise(resolve => {
       bulkDownloadConfirmResolver = resolve;
+      bulkConfirmReturnFocus = document.activeElement;
       const dlg = document.getElementById('grok-bulk-download-confirm');
       const titleEl = document.getElementById('grok-bulk-download-confirm-title');
       const msgEl = document.getElementById('grok-bulk-download-confirm-message');
@@ -5568,6 +6049,7 @@
     const signal = bulkDownloadAbort?.signal;
     lastFailedDownloads = [];
     lastDownloadDirHandle = null;
+    lastDownloadFolderNamesFor = null;
     syncDownloadSelectedButtons();
 
     let ok = 0;
@@ -5590,8 +6072,15 @@
           const blob = await prepareDownloadBlobWithRetry(post, signal);
           // Fetched once, written as many times as it has tags. A second download of the same
           // bytes to put them in a second folder would double a catalogue-sized run for nothing.
-          const folders = folderNamesFor ? folderNamesFor(post) : [''];
-          for (const folder of (folders.length ? folders : [''])) {
+          // Deduplicate sanitized keys per post so two colliding tag names do not overwrite the
+          // same file twice or inflate the file count.
+          const rawFolders = folderNamesFor ? folderNamesFor(post) : [''];
+          const folders = rawFolders.length ? rawFolders : [''];
+          const writtenKeys = new Set();
+          for (const folder of folders) {
+            const key = folder ? sanitizeFolderName(folder) : '';
+            if (writtenKeys.has(key)) continue;
+            writtenKeys.add(key);
             const target = await resolveDownloadFolder(dirHandle, folderCache, folder);
             await saveBlobToFolder(target, filename, blob);
             files++;
@@ -5613,6 +6102,7 @@
       }
       lastFailedDownloads = failed;
       lastDownloadDirHandle = failed.length ? dirHandle : null;
+      lastDownloadFolderNamesFor = failed.length ? folderNamesFor : null;
       // Filed by tag, the file count exceeds the image count whenever a set carries two tags,
       // and reporting only one of the two numbers makes the other look like a bug.
       const savedText = folderNamesFor
@@ -5638,8 +6128,9 @@
   async function retryFailedDownloads() {
     const posts = lastFailedDownloads.slice();
     const dirHandle = lastDownloadDirHandle;
+    const folderNamesFor = lastDownloadFolderNamesFor;
     if (posts.length === 0) return;
-    await downloadPostsToFolder(posts, { dirHandle });
+    await downloadPostsToFolder(posts, { dirHandle, folderNamesFor });
   }
 
   // ─── Delete ─────────────────────────────────────────────────────────────────
@@ -5830,6 +6321,8 @@
     await downloadPostsToFolder(posts);
   }
 
+  let contextMenuTriggerEl = null;
+
   function ensureResultContextMenu() {
     let menu = document.getElementById('grok-result-context-menu');
     if (menu) return menu;
@@ -5837,15 +6330,48 @@
     menu.id = 'grok-result-context-menu';
     menu.className = 'grok-result-context-menu';
     menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', 'Result actions');
     menu.hidden = true;
+    menu.addEventListener('keydown', e => {
+      const items = [...menu.querySelectorAll('[role="menuitem"]:not(:disabled)')];
+      if (!items.length) return;
+      const idx = items.indexOf(document.activeElement);
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        items[(idx + 1) % items.length].focus();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        items[(idx - 1 + items.length) % items.length].focus();
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        items[0].focus();
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        items[items.length - 1].focus();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        hideResultContextMenu(true);
+      } else if (e.key === 'Tab') {
+        hideResultContextMenu(false);
+      }
+    });
     document.body.appendChild(menu);
     return menu;
   }
 
-  function hideResultContextMenu() {
+  function hideResultContextMenu(restoreFocus = false) {
     const menu = document.getElementById('grok-result-context-menu');
     if (menu) menu.hidden = true;
     contextMenuPostId = null;
+    const trigger = contextMenuTriggerEl;
+    contextMenuTriggerEl = null;
+    if (trigger) {
+      trigger.setAttribute('aria-expanded', 'false');
+      if (restoreFocus && trigger.isConnected) {
+        try { trigger.focus(); } catch { /* ignore */ }
+      }
+    }
   }
 
   function positionFloatingMenu(menu, x, y) {
@@ -5892,11 +6418,16 @@
     return items;
   }
 
-  function showResultContextMenu(clientX, clientY, post) {
+  function showResultContextMenu(clientX, clientY, post, triggerEl = null, focusFirst = false) {
     const menu = ensureResultContextMenu();
+    if (contextMenuTriggerEl && contextMenuTriggerEl !== triggerEl) {
+      contextMenuTriggerEl.setAttribute('aria-expanded', 'false');
+    }
+    contextMenuTriggerEl = triggerEl || null;
+    if (contextMenuTriggerEl) contextMenuTriggerEl.setAttribute('aria-expanded', 'true');
     contextMenuPostId = post.id;
     menu.innerHTML = buildContextMenuItems(post).map(item => `
-      <button type="button" class="grok-result-context-item${item.disabled ? ' grok-result-context-item--disabled' : ''}" role="menuitem" data-action="${escapeHtml(item.action)}"${item.disabled ? ' disabled' : ''}>
+      <button type="button" class="grok-result-context-item${item.disabled ? ' grok-result-context-item--disabled' : ''}" role="menuitem" tabindex="-1" data-action="${escapeHtml(item.action)}"${item.disabled ? ' disabled' : ''}>
         ${escapeHtml(item.label)}
       </button>
     `).join('');
@@ -5907,11 +6438,14 @@
         if (btn.disabled) return;
         const action = btn.dataset.action;
         const target = getPostById(contextMenuPostId);
-        hideResultContextMenu();
+        hideResultContextMenu(false);
         if (target) runContextMenuAction(action, target);
       });
     });
     positionFloatingMenu(menu, clientX, clientY);
+    if (focusFirst) {
+      menu.querySelector('[role="menuitem"]:not(:disabled)')?.focus();
+    }
   }
 
   async function runContextMenuAction(action, post) {
@@ -5999,8 +6533,81 @@
    * and Delete were therefore never injected at all. An `ensure*` that guards on one element must
    * never be the thing that creates another.
    */
+  function ensureLightboxCopyPromptButton(lb) {
+    const actions = lb?.querySelector('.grok-lightbox-actions');
+    if (!actions || document.getElementById('grok-lightbox-copy-prompt')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'grok-toolbar-btn';
+    btn.id = 'grok-lightbox-copy-prompt';
+    btn.textContent = 'Copy prompt';
+    btn.title = 'Copy prompt to clipboard (C)';
+    const openTab = document.getElementById('grok-lightbox-open-tab');
+    actions.insertBefore(btn, openTab || actions.firstChild);
+    btn.addEventListener('click', async e => {
+      e.preventDefault();
+      e.stopPropagation();
+      const post = getCurrentLightboxPost();
+      if (!post) return;
+      const text = post.prompt || post.parentPrompt || post.rootPrompt || '';
+      if (!text) {
+        flashStampStatus('no prompt to copy');
+        return;
+      }
+      const ok = await copyText(text);
+      btn.textContent = ok ? 'Copied' : 'Copy failed';
+      flashStampStatus(ok ? 'prompt copied' : 'copy failed');
+      setTimeout(() => { if (btn.isConnected) btn.textContent = 'Copy prompt'; }, 1400);
+    });
+  }
+
+  const lightboxHistory = [];
+  let lightboxNavigatingHistory = false;
+
+  function ensureLightboxBackButton(lb) {
+    const stageWrap = lb?.querySelector('.grok-lightbox-stage-wrap');
+    if (!stageWrap || document.getElementById('grok-lightbox-back')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'grok-lightbox-back';
+    btn.className = 'grok-toolbar-btn grok-lightbox-back-btn';
+    btn.textContent = '← Back';
+    btn.title = 'Return to previous item (Alt+Left)';
+    btn.setAttribute('aria-label', 'Return to previous item');
+    btn.hidden = true;
+    stageWrap.insertBefore(btn, stageWrap.firstChild);
+    btn.addEventListener('click', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      goBackResultLightbox();
+    });
+  }
+
+  function syncLightboxBackButton() {
+    const btn = document.getElementById('grok-lightbox-back');
+    if (!btn) return;
+    btn.hidden = lightboxHistory.length === 0;
+  }
+
+  function goBackResultLightbox() {
+    if (!lightboxHistory.length) return;
+    const prev = lightboxHistory.pop();
+    if (!prev?.post) {
+      syncLightboxBackButton();
+      return;
+    }
+    lightboxNavigatingHistory = true;
+    try {
+      openResultLightbox(prev.post);
+    } finally {
+      lightboxNavigatingHistory = false;
+    }
+  }
+
   function ensureLightboxButtons(lb) {
     ensureLightboxDownloadButton(lb);
+    ensureLightboxCopyPromptButton(lb);
+    ensureLightboxBackButton(lb);
     ensureLightboxLikeButton(lb);
     ensureLightboxDeleteButton(lb);
     ensureLightboxChildRow(lb);
@@ -6045,12 +6652,16 @@
       const tagId = chip.dataset.tagId;
       if (!post || !tagId) return;
       chip.disabled = true;
-      const res = await applyTagToPost(post, tagId, false);
-      flashStampStatus(describeTagResult(res, false));
-      renderLightboxTagRow(post);
-      // The filter reads per-row membership, so a set-wide change moves rows in and out of the
-      // current result page even when the row that was clicked is not the one that moved.
-      if (filterTagId) applyFilter();
+      try {
+        const res = await applyTagToPost(post, tagId, false);
+        flashStampStatus(describeTagResult(res, false));
+      } finally {
+        chip.disabled = false;
+        renderLightboxTagRow(post);
+        // The filter reads per-row membership, so a set-wide change moves rows in and out of the
+        // current result page even when the row that was clicked is not the one that moved.
+        if (filterTagId) applyFilter();
+      }
     });
 
     row.querySelector('.grok-lightbox-tag-add')?.addEventListener('change', async e => {
@@ -6063,7 +6674,21 @@
       try {
         let tagId = value;
         if (value === '__new__') {
-          const name = prompt('New tag name:');
+          const name = await promptTextDialog({
+            title: 'Create new tag',
+            label: 'Tag name',
+            placeholder: 'e.g. Portraits',
+            okLabel: 'Create tag',
+            maxLength: TAG_NAME_MAX,
+            validate: raw => {
+              const clean = normalizeTagName(raw);
+              if (!clean) return 'Please enter a tag name.';
+              if (tagList.some(t => t.name.toLowerCase() === clean.toLowerCase())) {
+                return `A tag named "${clean}" already exists.`;
+              }
+              return '';
+            },
+          });
           if (!name) return;
           const made = await createTag(name);
           if (!made.ok) {
@@ -6171,6 +6796,13 @@
   function renderLightboxChildRow(post) {
     const row = document.getElementById('grok-lightbox-kids');
     if (!row) return;
+    const sidebar = document.getElementById('grok-lightbox-sidebar');
+    // When the left Related sidebar is visible, it already shows every child variation with full
+    // thumbnails and badges — hide the duplicate footer strip to keep the lightbox clean.
+    if (sidebar && !sidebar.hidden) {
+      row.hidden = true;
+      return;
+    }
     const kids = post ? getAllDescendantPosts(post.id) : [];
     if (!kids.length) {
       if (row.dataset.sig !== '') {
@@ -6268,12 +6900,12 @@
       const dateStr = formatPostDate(p.createTime);
       const badgeClass = `grok-lightbox-badge--${relation}`;
       return `
-        <div class="grok-lightbox-related-item grok-lightbox-related--${relation}"
+        <button type="button" class="grok-lightbox-related-item grok-lightbox-related--${relation}"
              data-id="${escapeHtml(p.id)}"
              title="${escapeHtml(label)}: ${escapeHtml(promptText || '(no prompt)')}">
           <div class="grok-lightbox-related-thumb-wrap">
             <img class="grok-lightbox-related-thumb" loading="lazy" src="${escapeHtml(thumb)}" alt="" />
-            ${isVideo ? '<span class="grok-lightbox-related-play" title="Video">▶</span>' : ''}
+            ${isVideo ? '<span class="grok-lightbox-related-play" aria-hidden="true">▶</span>' : ''}
             <span class="grok-lightbox-badge ${badgeClass}">${escapeHtml(label)}</span>
             ${isUploaded ? '<span class="grok-lightbox-badge grok-lightbox-badge--uploaded" title="Uploaded image">Upload</span>' : ''}
           </div>
@@ -6281,7 +6913,7 @@
             ${dateStr ? `<span class="grok-lightbox-related-date">${escapeHtml(dateStr)}</span>` : ''}
             <span class="grok-lightbox-related-prompt">${escapeHtml(truncateMetadataText(promptText, 60))}</span>
           </div>
-        </div>
+        </button>
       `;
     }).join('');
 
@@ -6305,9 +6937,13 @@
       const post = getCurrentLightboxPost();
       if (!post) return;
       btn.disabled = true;
-      const res = await deleteSinglePost(post);
-      btn.disabled = false;
-      if (res.deleted > 0) advanceLightboxAfterDelete();
+      let res = null;
+      try {
+        res = await deleteSinglePost(post);
+      } finally {
+        btn.disabled = false;
+      }
+      if (res && res.deleted > 0) advanceLightboxAfterDelete();
     });
   }
 
@@ -6349,9 +6985,12 @@
       const post = getCurrentLightboxPost();
       if (!post) return;
       btn.disabled = true;
-      await togglePostLiked(post);
-      btn.disabled = false;
-      syncLightboxLikeButton();
+      try {
+        await togglePostLiked(post);
+      } finally {
+        btn.disabled = false;
+        syncLightboxLikeButton();
+      }
     });
   }
 
@@ -6398,8 +7037,8 @@
             <div class="grok-lightbox-sub" id="grok-lightbox-sub"></div>
           </div>
           <div class="grok-lightbox-actions">
-            <button type="button" class="grok-toolbar-btn" id="grok-lightbox-open-tab">Open on new tab</button>
-            <button type="button" class="grok-toolbar-btn" id="grok-lightbox-open-post">Open post</button>
+            <button type="button" class="grok-toolbar-btn" id="grok-lightbox-open-tab" title="Open raw image or video file in a new tab">Open media</button>
+            <button type="button" class="grok-toolbar-btn" id="grok-lightbox-open-post" title="Open post page on Grok in a new tab">Open post</button>
             <button type="button" class="grok-toolbar-btn" id="grok-lightbox-download" title="Download current image or video (D)">Download</button>
           </div>
         </div>
@@ -6425,13 +7064,13 @@
       e.preventDefault();
       const post = getCurrentLightboxPost();
       if (!post) return;
-      if (post.id) window.open(getPostDetailUrl(post.id), '_blank');
-      else window.open(getPostMediaUrl(post), '_blank');
+      const url = getPostMediaUrl(post) || (post.id ? getPostDetailUrl(post.id) : '');
+      if (url) window.open(url, '_blank', 'noopener,noreferrer');
     });
     document.getElementById('grok-lightbox-open-post')?.addEventListener('click', e => {
       e.preventDefault();
       const post = getCurrentLightboxPost();
-      if (post?.id) window.open(getPostDetailUrl(post.id), '_blank');
+      if (post?.id) window.open(getPostDetailUrl(post.id), '_blank', 'noopener,noreferrer');
     });
     bindLightboxDownloadButton();
 
@@ -6452,7 +7091,7 @@
     if (!post || !stage || !promptEl || !subEl) return;
 
     const mediaUrl = getPostMediaUrl(post);
-    const isVideo = isVideoMediaType(post.mediaType) || /\.mp4(\?|$)/i.test(mediaUrl);
+    const isVideo = isVideoMediaType(post.mediaType) || isVideoUrl(mediaUrl);
     stage.innerHTML = isVideo
       ? `<video class="grok-lightbox-media" src="${escapeHtml(mediaUrl)}" controls autoplay playsinline></video>`
       : `<img class="grok-lightbox-media" src="${escapeHtml(mediaUrl)}" alt="${escapeHtml(imageAltText(post.prompt))}" />`;
@@ -6534,15 +7173,22 @@
             if (!post.prompt && (post.parentPrompt || post.rootPrompt)) updatedBits.push('Parent prompt');
             subEl.textContent = updatedBits.join(' · ');
           }
+          renderLightboxRelatedSidebar(post);
+          renderLightboxTagRow(post);
         }
       });
     }
 
+    renderLightboxRelatedSidebar(post);
     renderLightboxChildRow(post);
     renderLightboxTagRow(post);
     ensureLightboxTagRowLoaded();
-    renderLightboxRelatedSidebar(post);
     syncLightboxLikeButton();
+    syncLightboxBackButton();
+    const openTabBtn = document.getElementById('grok-lightbox-open-tab');
+    if (openTabBtn) openTabBtn.disabled = !mediaUrl && !post.id;
+    const openPostBtn = document.getElementById('grok-lightbox-open-post');
+    if (openPostBtn) openPostBtn.disabled = !post.id;
     if (prevBtn) prevBtn.disabled = lightboxIndex <= 0;
     if (nextBtn) nextBtn.disabled = lightboxIndex < 0 || lightboxIndex >= matchedPosts.length - 1;
     lb.hidden = false;
@@ -6604,7 +7250,13 @@
     if (!post) return;
     hideResultContextMenu();
     const alreadyOpen = isResultLightboxOpen();
-    if (!alreadyOpen) lightboxReturnFocus = document.activeElement;
+    if (!alreadyOpen) {
+      lightboxReturnFocus = document.activeElement;
+      lightboxHistory.length = 0;
+    } else if (!lightboxNavigatingHistory && lightboxActivePost && lightboxActivePost.id !== post.id) {
+      lightboxHistory.push({ post: lightboxActivePost, index: lightboxIndex });
+      if (lightboxHistory.length > 50) lightboxHistory.shift();
+    }
     const idx = matchedPosts.findIndex(p => p.id === post.id);
     lightboxIndex = idx;
     lightboxActivePost = post;
@@ -6626,6 +7278,7 @@
     document.documentElement.classList.remove('grok-lightbox-open');
     lightboxIndex = -1;
     lightboxActivePost = null;
+    lightboxHistory.length = 0;
     // Back to the card that opened it, so keyboard users do not land at the top of the document.
     const returnTo = lightboxReturnFocus;
     lightboxReturnFocus = null;
@@ -6657,20 +7310,121 @@
     }
   }
 
+  function getTopOpenModalDialog() {
+    // Ordered by stacking priority: text prompt and confirm dialogs can open over lightbox or tag manager.
+    const promptDlg = document.getElementById('grok-text-prompt-dialog');
+    if (promptDlg && !promptDlg.hidden) {
+      return { el: promptDlg, close: () => closeTextPromptDialog(null) };
+    }
+    const confirmDlg = document.getElementById('grok-bulk-download-confirm');
+    if (confirmDlg && !confirmDlg.hidden) {
+      return { el: confirmDlg, close: () => closeBulkDownloadConfirm(false) };
+    }
+    const shortcutsDlg = document.getElementById('grok-shortcuts-dialog');
+    if (shortcutsDlg && !shortcutsDlg.hidden) {
+      return { el: shortcutsDlg, close: () => closeShortcutsDialog() };
+    }
+    const exportDlg = document.getElementById('grok-export-format-dialog');
+    if (exportDlg && !exportDlg.hidden) {
+      return { el: exportDlg, close: () => closeExportFormatDialog() };
+    }
+    const tagDlg = document.getElementById('grok-tag-manager');
+    if (tagDlg && !tagDlg.hidden) {
+      return { el: tagDlg, close: () => closeTagManager() };
+    }
+    return null;
+  }
+
+  function trapDialogFocus(dlg, e) {
+    if (!dlg || dlg.hidden) return;
+    const items = [...dlg.querySelectorAll('button, a[href], input, select, textarea, [tabindex]')]
+      .filter(el => {
+        if (el.disabled || el.getAttribute('tabindex') === '-1') return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+    if (!items.length) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (!dlg.contains(document.activeElement)) {
+      e.preventDefault();
+      (e.shiftKey ? last : first).focus();
+      return;
+    }
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
   function bindGlobalResultUiListeners() {
     if (document.body.dataset.grokResultUiBound) return;
     document.body.dataset.grokResultUiBound = '1';
 
     document.addEventListener('click', e => {
-      if (!e.target.closest('#grok-result-context-menu')) hideResultContextMenu();
+      if (!e.target.closest('#grok-result-context-menu') && !e.target.closest('.grok-result-menu-btn')) {
+        hideResultContextMenu(false);
+      }
     });
-    document.addEventListener('scroll', hideResultContextMenu, true);
-    window.addEventListener('resize', hideResultContextMenu);
+    document.addEventListener('scroll', () => hideResultContextMenu(false), true);
+    window.addEventListener('resize', () => hideResultContextMenu(false));
 
     document.addEventListener('keydown', e => {
+      const topModal = getTopOpenModalDialog();
+      if (topModal) {
+        if (e.key === 'Tab') {
+          trapDialogFocus(topModal.el, e);
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();
+          topModal.close();
+          return;
+        }
+        return;
+      }
+
+      const menuEl = document.getElementById('grok-result-context-menu');
+      if (menuEl && !menuEl.hidden && e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        hideResultContextMenu(true);
+        return;
+      }
+
+      if (!isResultLightboxOpen() && e.key === 'Escape') {
+        const wrap = document.getElementById('grok-search-wrap');
+        if (wrap && (wrap.classList.contains('grok-filters-open') || wrap.classList.contains('grok-tools-open'))) {
+          const focusInWrap = wrap.contains(document.activeElement);
+          if (focusInWrap) {
+            e.preventDefault();
+            e.stopPropagation();
+            const returnBtn = wrap.classList.contains('grok-tools-open')
+              ? document.getElementById('grok-toggle-tools-btn')
+              : document.getElementById('grok-toggle-filters-btn');
+            setToolbarDrawerOpen('filters', false, true);
+            setToolbarDrawerOpen('tools', false, true);
+            returnBtn?.focus();
+            return;
+          }
+        }
+      }
+
       const isInput = e.target && (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName) || e.target.isContentEditable);
       const isSlash = e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey;
       const isCtrlF = (e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'f' || e.key === 'F');
+      const isQuestion = e.key === '?' && !e.ctrlKey && !e.metaKey && !e.altKey;
+
+      if (isQuestion && !isInput) {
+        e.preventDefault();
+        e.stopPropagation();
+        openShortcutsDialog();
+        return;
+      }
 
       if ((isSlash && !isInput) || isCtrlF) {
         focusSearchInputFromShortcut(e);
@@ -6686,6 +7440,12 @@
           e.preventDefault();
           e.stopPropagation();
           closeResultLightbox();
+          return;
+        }
+        if (e.altKey && e.key === 'ArrowLeft' && lightboxHistory.length > 0) {
+          e.preventDefault();
+          e.stopPropagation();
+          goBackResultLightbox();
           return;
         }
         if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
@@ -6719,7 +7479,6 @@
               e.stopPropagation();
               togglePostLiked(post).then(() => {
                 syncLightboxLikeButton();
-                flashStampStatus(post.isLiked ? 'liked' : 'unliked');
               });
             }
             return;
@@ -6742,7 +7501,7 @@
               e.preventDefault();
               e.stopPropagation();
               deleteSinglePost(post).then(res => {
-                if (res && res.deleted > 0) closeResultLightbox();
+                if (res && res.deleted > 0) advanceLightboxAfterDelete();
               });
             }
             return;
@@ -6843,6 +7602,22 @@
         if (post) togglePostLiked(post);
         return;
       }
+      const menuBtn = e.target.closest('.grok-result-menu-btn');
+      if (menuBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        const cardEl = menuBtn.closest('.grok-result-card');
+        const post = getPostById(cardEl?.dataset.id);
+        if (!post) return;
+        const menu = document.getElementById('grok-result-context-menu');
+        if (menu && !menu.hidden && contextMenuTriggerEl === menuBtn) {
+          hideResultContextMenu(true);
+          return;
+        }
+        const rect = menuBtn.getBoundingClientRect();
+        showResultContextMenu(rect.left, rect.bottom + 4, post, menuBtn, true);
+        return;
+      }
       if (e.target.closest('.grok-result-date')) {
         e.preventDefault();
         e.stopPropagation();
@@ -6859,6 +7634,20 @@
       } else if (card.dataset.media) {
         window.open(card.dataset.media, '_blank');
       }
+    });
+
+    container.addEventListener('keydown', e => {
+      if (e.key !== 'ContextMenu' && !(e.shiftKey && e.key === 'F10')) return;
+      const card = e.target.closest('.grok-result-card');
+      if (!card || !container.contains(card)) return;
+      const kid = e.target.closest('.grok-result-kid');
+      const post = getPostById(kid ? kid.dataset.id : card.dataset.id);
+      if (!post) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const trigger = card.querySelector('.grok-result-menu-btn') || card;
+      const rect = trigger.getBoundingClientRect();
+      showResultContextMenu(rect.left, rect.bottom + 4, post, trigger, true);
     });
   }
 
@@ -7053,6 +7842,8 @@
     pruneSelection();
     syncResultsView();
     syncDownloadSelectedButtons();
+    renderActiveFilterChips();
+    syncToggleFilterBadge();
   }
 
   let enforceTimer = null;
@@ -7103,15 +7894,13 @@
 
     let countText = '';
     const n = matchedPosts.length.toLocaleString();
-    const hasText = Boolean(currentQuery.trim());
-    const hasDates = hasDateFilter();
-    if (hasText || hasDates || filterVideoOnly || filterWithVideo || filterOnlyChildren || filterHideChilds || filterUploadedOnly) {
+    if (hasActiveFilter()) {
       countText = `${n} match${matchedPosts.length !== 1 ? 'es' : ''}`;
     } else {
       countText = `${n} saved`;
     }
     const groups = getDisplayCount();
-    if (compactGroups && groups !== matchedPosts.length) {
+    if ((compactGroups || batchGroups) && groups !== matchedPosts.length) {
       countText += ` in ${groups.toLocaleString()} group${groups !== 1 ? 's' : ''}`;
     }
     if (countEl) countEl.textContent = countText;
@@ -7325,13 +8114,15 @@
     const card = document.createElement('div');
     card.className = 'grok-result-card';
     card.innerHTML = `
+      <button type="button" class="grok-result-open-trigger" aria-label="Preview result"></button>
       <label class="grok-result-select" title="Select for download">
         <input type="checkbox" class="grok-result-select-input" aria-label="Select for download" />
       </label>
       <span class="grok-result-child-mark" title="Child post" hidden>${CHILD_MARK_SVG}</span>
       <button type="button" class="grok-result-like" aria-pressed="false">${HEART_SVG}</button>
+      <button type="button" class="grok-result-menu-btn" aria-haspopup="menu" aria-expanded="false" aria-label="More actions" title="More actions (Shift+F10)">⋮</button>
       <button type="button" class="grok-result-prune-btn" aria-label="Remove broken image from database" title="Remove broken image from database" hidden>✕</button>
-      <div class="grok-result-date" hidden></div>
+      <button type="button" class="grok-result-date" aria-pressed="false" hidden></button>
       <div class="grok-result-broken-overlay" hidden>
         <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
           <circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>
@@ -7354,7 +8145,11 @@
     const post = entry.post;
     const children = entry.children || [];
     const childCard = isChildPost(post);
-    const selected = selectedPostIds.has(post.id);
+    const groupIdList = children.length ? [post.id, ...children.map(c => c.id)] : [post.id];
+    const selectedCount = groupIdList.reduce((n, id) => n + (selectedPostIds.has(id) ? 1 : 0), 0);
+    const allSelected = selectedCount === groupIdList.length;
+    const someSelected = selectedCount > 0 && !allSelected;
+    const selected = selectedCount > 0;
     const dateKey = formatPostDateKey(post.createTime);
     const dateStr = formatPostDate(post.createTime);
     const mediaUrl = post.mediaUrl || '';
@@ -7372,15 +8167,14 @@
 
     // Folded children have no checkbox of their own, so the parent's covers the whole group --
     // otherwise compact mode would make them impossible to select for download or delete.
-    const groupIds = children.length
-      ? [post.id, ...children.map(c => c.id)].join(' ')
-      : post.id;
+    const groupIds = groupIdList.join(' ');
     if (card.dataset.group !== groupIds) card.dataset.group = groupIds;
 
     const input = card.querySelector('.grok-result-select-input');
     if (input) {
       if (input.dataset.id !== post.id) input.dataset.id = post.id;
-      if (input.checked !== selected) input.checked = selected;
+      if (input.checked !== allSelected) input.checked = allSelected;
+      if (input.indeterminate !== someSelected) input.indeterminate = someSelected;
     }
 
     const selectLabel = card.querySelector('.grok-result-select');
@@ -7410,14 +8204,35 @@
       if (like.title !== title) like.title = title;
     }
 
+    const openTrigger = card.querySelector('.grok-result-open-trigger');
+    if (openTrigger) {
+      const openLabel = `Preview: ${imageAltText(prompt)}`;
+      if (openTrigger.getAttribute('aria-label') !== openLabel) {
+        openTrigger.setAttribute('aria-label', openLabel);
+      }
+    }
+    const menuBtn = card.querySelector('.grok-result-menu-btn');
+    if (menuBtn) {
+      const menuLabel = `More actions for ${imageAltText(prompt)}`;
+      if (menuBtn.getAttribute('aria-label') !== menuLabel) {
+        menuBtn.setAttribute('aria-label', menuLabel);
+      }
+    }
+
     const dateEl = card.querySelector('.grok-result-date');
     if (dateEl) {
       dateEl.hidden = !dateStr;
       if (dateStr) {
+        const isDateActive = Boolean(dateKey) && isFilteredToSingleDay(dateKey);
         if (dateEl.textContent !== dateStr) dateEl.textContent = dateStr;
         if (dateEl.dataset.date !== dateKey) dateEl.dataset.date = dateKey;
         dateEl.title = `Filter to ${dateStr} (click again to clear)`;
-        dateEl.classList.toggle('grok-result-date-active', Boolean(dateKey) && isFilteredToSingleDay(dateKey));
+        const dateAria = `Filter results to ${dateStr}`;
+        if (dateEl.getAttribute('aria-label') !== dateAria) dateEl.setAttribute('aria-label', dateAria);
+        if (dateEl.getAttribute('aria-pressed') !== String(isDateActive)) {
+          dateEl.setAttribute('aria-pressed', String(isDateActive));
+        }
+        dateEl.classList.toggle('grok-result-date-active', isDateActive);
       }
     }
 
@@ -7626,6 +8441,7 @@
     if (!isBatch) return entries;
 
     const convLeaders = new Map();
+    const convSeen = new Map();
     const out = [];
 
     for (const entry of entries) {
@@ -7637,10 +8453,12 @@
       const leader = convLeaders.get(convId);
       if (!leader) {
         convLeaders.set(convId, entry);
+        const seenIds = new Set(entry.children.map(c => c.id));
+        seenIds.add(entry.post.id);
+        convSeen.set(convId, seenIds);
         out.push(entry);
       } else {
-        const seenChildIds = new Set(leader.children.map(c => c.id));
-        seenChildIds.add(leader.post.id);
+        const seenChildIds = convSeen.get(convId);
         if (!seenChildIds.has(entry.post.id)) {
           leader.children.push(entry.post);
           seenChildIds.add(entry.post.id);
@@ -7961,7 +8779,8 @@
   function hasActiveFilter() {
     return Boolean(
       currentQuery.trim() || hasDateFilter() || filterVideoOnly || filterWithVideo
-      || filterOnlyChildren || filterHideChilds || filterUploadedOnly || filterModel || filterLikedOnly
+      || filterOnlyChildren || filterHideChilds || filterUploadedOnly || filterModel
+      || filterLikedOnly || filterTagId
     );
   }
 
@@ -7992,11 +8811,237 @@
   }
 
 
+  function getActiveFilterEntries() {
+    const entries = [];
+    const q = (currentQuery || '').trim();
+    if (q) {
+      entries.push({
+        key: 'query',
+        label: `Search: "${q.length > 26 ? `${q.slice(0, 25)}…` : q}"`,
+        clear: () => {
+          currentQuery = '';
+          const el = document.getElementById('grok-search-input');
+          if (el) el.value = '';
+        },
+      });
+    }
+    if (filterModel) {
+      entries.push({
+        key: 'model',
+        label: `Model: ${filterModel}`,
+        clear: () => {
+          filterModel = '';
+          try { localStorage.setItem(FILTER_MODEL_KEY, ''); } catch { /* ignore */ }
+          const el = document.getElementById('grok-filter-model');
+          if (el) el.value = '';
+        },
+      });
+    }
+    if (hasDateFilter()) {
+      const dateText = dateStart && dateEnd
+        ? (dateStart === dateEnd ? dateStart : `${dateStart} – ${dateEnd}`)
+        : (dateStart ? `From ${dateStart}` : `Until ${dateEnd}`);
+      entries.push({
+        key: 'date',
+        label: `Date: ${dateText}`,
+        clear: () => {
+          dateStart = '';
+          dateEnd = '';
+          const s = document.getElementById('grok-date-start');
+          const e = document.getElementById('grok-date-end');
+          if (s) s.value = '';
+          if (e) e.value = '';
+        },
+      });
+    }
+    if (filterTagId) {
+      const tag = getTagById(filterTagId);
+      entries.push({
+        key: 'tag',
+        label: `Tag: ${tag ? tag.name : filterTagId}`,
+        clear: () => {
+          filterTagId = '';
+          writeStoredString(FILTER_TAG_KEY, '');
+          const el = document.getElementById('grok-filter-tag');
+          if (el) el.value = '';
+        },
+      });
+    }
+    if (filterVideoOnly) {
+      entries.push({
+        key: 'videoOnly',
+        label: 'Videos only',
+        clear: () => {
+          filterVideoOnly = false;
+          try { localStorage.setItem(FILTER_VIDEO_ONLY_KEY, '0'); } catch { /* ignore */ }
+          const el = document.getElementById('grok-filter-video-only');
+          if (el) el.checked = false;
+        },
+      });
+    }
+    if (filterWithVideo) {
+      entries.push({
+        key: 'withVideo',
+        label: 'Images w/ video',
+        clear: () => {
+          filterWithVideo = false;
+          try { localStorage.setItem(FILTER_WITH_VIDEO_KEY, '0'); } catch { /* ignore */ }
+          const el = document.getElementById('grok-filter-with-video');
+          if (el) el.checked = false;
+        },
+      });
+    }
+    if (filterOnlyChildren) {
+      entries.push({
+        key: 'children',
+        label: `Variations ≥ ${filterMinChildren}`,
+        clear: () => {
+          filterOnlyChildren = false;
+          try { localStorage.setItem(FILTER_CHILDREN_KEY, '0'); } catch { /* ignore */ }
+          const el = document.getElementById('grok-filter-children');
+          if (el) el.checked = false;
+          syncMediaMinSelects();
+        },
+      });
+    }
+    if (filterHideChilds) {
+      entries.push({
+        key: 'hideChilds',
+        label: 'Originals only',
+        clear: () => {
+          filterHideChilds = false;
+          try { localStorage.setItem(FILTER_HIDE_CHILDS_KEY, '0'); } catch { /* ignore */ }
+          const el = document.getElementById('grok-filter-hide-childs');
+          if (el) el.checked = false;
+        },
+      });
+    }
+    if (filterLikedOnly) {
+      entries.push({
+        key: 'liked',
+        label: 'Liked only',
+        clear: () => {
+          filterLikedOnly = false;
+          try { localStorage.setItem(FILTER_LIKED_KEY, '0'); } catch { /* ignore */ }
+          const el = document.getElementById('grok-filter-liked');
+          if (el) el.checked = false;
+        },
+      });
+    }
+    if (filterUploadedOnly) {
+      entries.push({
+        key: 'uploaded',
+        label: 'Uploaded only',
+        clear: () => {
+          filterUploadedOnly = false;
+          try { localStorage.setItem(FILTER_UPLOADED_ONLY_KEY, '0'); } catch { /* ignore */ }
+          const el = document.getElementById('grok-filter-uploaded-only');
+          if (el) el.checked = false;
+        },
+      });
+    }
+    return entries;
+  }
+
+  function ensureActiveFilterChips() {
+    const bar = document.getElementById('grok-search-bar');
+    if (!bar) return null;
+    let host = document.getElementById('grok-active-filters');
+    if (!host) {
+      host = document.createElement('div');
+      host.id = 'grok-active-filters';
+      host.className = 'grok-active-filters';
+      host.setAttribute('role', 'region');
+      host.setAttribute('aria-label', 'Active filters');
+      host.hidden = true;
+      const line1 = bar.querySelector('.grok-bar-line-1');
+      if (line1) line1.insertAdjacentElement('afterend', host);
+      else bar.appendChild(host);
+    }
+    if (!host.dataset.grokChipsBound) {
+      host.dataset.grokChipsBound = '1';
+      host.addEventListener('click', e => {
+        const chip = e.target.closest('.grok-active-filter-chip');
+        if (!chip) return;
+        e.preventDefault();
+        const key = chip.dataset.filterKey;
+        if (key === '__all__') {
+          document.getElementById('grok-search-clear')?.click();
+          return;
+        }
+        const entry = getActiveFilterEntries().find(item => item.key === key);
+        if (!entry) return;
+        entry.clear();
+        currentPage = 0;
+        updateClearButton();
+        applyFilter();
+        flashStampStatus(`cleared ${entry.label}`);
+      });
+    }
+    renderActiveFilterChips();
+    return host;
+  }
+
+  function renderActiveFilterChips() {
+    const host = document.getElementById('grok-active-filters');
+    const entries = getActiveFilterEntries();
+    if (host) {
+      if (!entries.length) {
+        host.hidden = true;
+        host.innerHTML = '';
+      } else {
+        const chips = entries.map(item => `
+          <button type="button" class="grok-active-filter-chip" data-filter-key="${escapeHtml(item.key)}" aria-label="Remove filter: ${escapeHtml(item.label)}" title="Click to remove filter">
+            <span>${escapeHtml(item.label)}</span>
+            <span class="grok-active-filter-chip-x" aria-hidden="true">×</span>
+          </button>`).join('');
+        const clearAll = entries.length >= 2
+          ? '<button type="button" class="grok-active-filter-chip grok-active-filter-chip--clear" data-filter-key="__all__" aria-label="Clear all filters">Clear all</button>'
+          : '';
+        host.innerHTML = chips + clearAll;
+        host.hidden = false;
+      }
+    }
+    const filterDrawerBtn = document.getElementById('grok-toggle-filters-btn');
+    if (filterDrawerBtn) {
+      const nonQueryCount = entries.filter(item => item.key !== 'query').length;
+      filterDrawerBtn.textContent = nonQueryCount > 0 ? `Filters (${nonQueryCount})` : 'Filters';
+      filterDrawerBtn.classList.toggle('grok-drawer-btn--active', nonQueryCount > 0);
+    }
+  }
+
+  function syncToggleFilterBadge() {
+    const btn = document.getElementById('grok-search-toggle');
+    if (!btn) return;
+    const count = getActiveFilterEntries().length;
+    let badge = btn.querySelector('.grok-toggle-filter-badge');
+    if (!searchBarExpanded && count > 0) {
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'grok-toggle-filter-badge';
+        badge.setAttribute('aria-hidden', 'true');
+        btn.appendChild(badge);
+      }
+      badge.textContent = String(count);
+      const label = `Show search bar (${count} active filter${count === 1 ? '' : 's'})`;
+      btn.title = label;
+      btn.setAttribute('aria-label', label);
+    } else {
+      if (badge) badge.remove();
+      const label = searchBarExpanded ? 'Hide search bar' : 'Show search bar';
+      btn.title = label;
+      btn.setAttribute('aria-label', label);
+    }
+  }
+
   function updateClearButton() {
     const clearBtn = document.getElementById('grok-search-clear');
     if (clearBtn) clearBtn.classList.toggle('visible', hasActiveFilter());
+    syncQueryClearButton();
     updateDateNavButtons();
     syncDatePresetChips();
+    renderActiveFilterChips();
+    syncToggleFilterBadge();
   }
 
   const DATE_NAV_PREV_SVG = `<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="7,1 3,5 7,9"/></svg>`;
@@ -8154,6 +9199,8 @@
         width: min(900px, 92vw);
         transition: transform 0.28s ease, opacity 0.22s ease, visibility 0.28s;
       }
+      #grok-search-wrap[hidden],
+      #grok-search-toggle[hidden] { display: none !important; }
       #grok-search-wrap.collapsed {
         transform: translateX(-50%) translateY(calc(-100% - 24px));
         opacity: 0;
@@ -8176,12 +9223,13 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        height: 14px;
-        margin: 0 auto -2px;
-        width: 72px;
-        border-radius: 7px;
-        background: rgba(15, 15, 20, 0.85);
-        border: 1px solid rgba(255, 255, 255, 0.12);
+        min-block-size: 24px;
+        height: 24px;
+        margin: 0 auto -4px;
+        width: 84px;
+        border-radius: 10px 10px 4px 4px;
+        background: rgba(15, 15, 20, 0.88);
+        border: 1px solid rgba(255, 255, 255, 0.24);
         cursor: grab;
         touch-action: none;
         transition: background 0.15s, border-color 0.15s;
@@ -8263,11 +9311,11 @@
         display: flex;
         align-items: center;
         gap: 6px;
-        font-size: 11px;
-        color: rgba(255,255,255,0.62);
+        font-size: 12px;
+        color: rgba(255,255,255,0.74);
         white-space: nowrap;
         user-select: none;
-        min-height: 24px;
+        min-height: 26px;
       }
       .grok-display-control span.grok-display-val {
         min-width: 2.2em;
@@ -8282,17 +9330,18 @@
         cursor: pointer;
       }
       .grok-display-select {
-        background: rgba(255,255,255,0.07);
-        border: 1px solid rgba(255,255,255,0.15);
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.24);
         border-radius: 7px;
-        color: rgba(255,255,255,0.8);
+        color: rgba(255,255,255,0.88);
         font-size: 11px;
-        padding: 2px 5px;
+        min-block-size: 24px;
+        padding: 2px 6px;
         outline: none;
         cursor: pointer;
         font-family: inherit;
       }
-      .grok-display-select:hover { border-color: rgba(139,92,246,0.5); color: #fff; }
+      .grok-display-select:hover { border-color: rgba(139,92,246,0.65); color: #fff; }
       .grok-display-select option { background: #1a1a2e; color: #fff; }
       .grok-display-control input[type="checkbox"] {
         margin: 0;
@@ -8300,12 +9349,14 @@
         cursor: pointer;
       }
       .grok-display-default-btn {
-        font-size: 10px;
-        padding: 2px 7px;
+        font-size: 11px;
+        min-block-size: 24px;
+        min-inline-size: 24px;
+        padding: 3px 9px;
         border-radius: 6px;
-        border: 1px solid rgba(255,255,255,0.15);
-        background: rgba(255,255,255,0.06);
-        color: rgba(255,255,255,0.65);
+        border: 1px solid rgba(255,255,255,0.24);
+        background: rgba(255,255,255,0.08);
+        color: rgba(255,255,255,0.82);
         cursor: pointer;
         font-family: inherit;
         flex-shrink: 0;
@@ -8398,30 +9449,31 @@
         width: 100%;
       }
       .grok-date-input {
-        background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.15);
-        border-radius: 8px; color: rgba(255,255,255,0.85); font-size: 11px;
+        background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.24);
+        border-radius: 8px; color: rgba(255,255,255,0.9); font-size: 11px;
+        min-block-size: 26px;
         padding: 3px 6px; outline: none; cursor: pointer; flex-shrink: 0;
         font-family: -apple-system, BlinkMacSystemFont, sans-serif;
         transition: border-color 0.15s, color 0.15s;
         color-scheme: dark;
       }
-      .grok-date-input:hover { border-color: rgba(139,92,246,0.5); }
-      .grok-date-input:focus { border-color: rgba(139,92,246,0.6); color: #fff; }
-      .grok-date-sep { color: rgba(255,255,255,0.62); font-size: 11px; flex-shrink: 0; }
+      .grok-date-input:hover { border-color: rgba(139,92,246,0.65); }
+      .grok-date-input:focus { border-color: rgba(139,92,246,0.75); color: #fff; }
+      .grok-date-sep { color: rgba(255,255,255,0.66); font-size: 11px; flex-shrink: 0; }
       .grok-date-nav-btn {
         display: flex; align-items: center; justify-content: center;
-        flex-shrink: 0; width: 28px; height: 28px; padding: 0;
-        border-radius: 8px; border: 1px solid rgba(255,255,255,0.15);
-        background: rgba(255,255,255,0.07); color: rgba(255,255,255,0.85);
+        flex-shrink: 0; min-inline-size: 28px; min-block-size: 28px; width: 28px; height: 28px; padding: 0;
+        border-radius: 8px; border: 1px solid rgba(255,255,255,0.24);
+        background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.9);
         cursor: pointer; transition: border-color 0.15s, background 0.15s, opacity 0.15s;
       }
       .grok-date-nav-btn:hover:not(:disabled) {
-        border-color: rgba(139,92,246,0.55);
-        background: rgba(139,92,246,0.22);
+        border-color: rgba(139,92,246,0.65);
+        background: rgba(139,92,246,0.24);
         color: #fff;
       }
       .grok-date-nav-btn:disabled {
-        opacity: 0.28;
+        opacity: 0.32;
         cursor: default;
         pointer-events: none;
       }
@@ -8429,15 +9481,16 @@
       .grok-date-presets {
         display: inline-flex;
         align-items: center;
-        gap: 3px;
+        gap: 4px;
         margin-left: 2px;
       }
       .grok-date-preset-btn {
-        background: rgba(255, 255, 255, 0.07);
-        color: rgba(255, 255, 255, 0.72);
-        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.08);
+        color: rgba(255, 255, 255, 0.84);
+        border: 1px solid rgba(255, 255, 255, 0.24);
         border-radius: 12px;
-        padding: 2px 7px;
+        min-block-size: 24px;
+        padding: 3px 9px;
         font-size: 11px;
         font-weight: 500;
         cursor: pointer;
@@ -8446,27 +9499,27 @@
         user-select: none;
       }
       .grok-date-preset-btn:hover {
-        background: rgba(255, 255, 255, 0.14);
+        background: rgba(255, 255, 255, 0.16);
         color: #fff;
-        border-color: rgba(255, 255, 255, 0.22);
+        border-color: rgba(255, 255, 255, 0.35);
       }
       .grok-date-preset-btn.grok-date-preset-active {
-        background: rgba(59, 130, 246, 0.25);
-        color: #93c5fd;
-        border-color: rgba(96, 165, 250, 0.45);
+        background: rgba(59, 130, 246, 0.28);
+        color: #bfdbfe;
+        border-color: rgba(96, 165, 250, 0.6);
         font-weight: 600;
       }
       #grok-search-bar:focus-within {
-        border-color: rgba(139,92,246,0.6);
-        box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 0 3px rgba(139,92,246,0.15);
+        border-color: rgba(139,92,246,0.65);
+        box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 0 3px rgba(139,92,246,0.18);
       }
-      #grok-search-icon { color: rgba(255,255,255,0.4); flex-shrink: 0; }
+      #grok-search-icon { color: rgba(255,255,255,0.65); flex-shrink: 0; }
       #grok-search-input {
         background: transparent; border: none; outline: none;
         color: #fff; font-size: 14px; flex: 1; min-width: 100px; width: auto;
         caret-color: #8b5cf6;
       }
-      #grok-search-input::placeholder { color: rgba(255,255,255,0.28); }
+      #grok-search-input::placeholder { color: rgba(255,255,255,0.6); }
       #grok-search-count {
         display: flex;
         align-items: center;
@@ -8500,9 +9553,9 @@
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        font-size: 10px;
-        padding: 3px 7px;
-        line-height: 1;
+        font-size: 12px;
+        padding: 4px 9px;
+        line-height: 1.1;
         white-space: nowrap;
       }
       /* These rules set display, so the hidden attribute needs to outrank them. */
@@ -8525,7 +9578,7 @@
         background: rgba(251,191,36,0.15);
         color: #fff;
       }
-      #grok-stamp-status { font-size: 10px; color: rgba(255,255,255,0.62); white-space: nowrap; flex-shrink: 0; }
+      #grok-stamp-status { font-size: 11px; color: rgba(255,255,255,0.68); white-space: nowrap; flex-shrink: 0; }
       #grok-search-clear,
       .grok-clear-filters-btn {
         display: inline-flex; align-items: center; justify-content: center;
@@ -8537,8 +9590,9 @@
       }
       #grok-search-clear.visible { opacity: 1; pointer-events: auto; }
       #grok-sort-select {
-        background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.15);
-        border-radius: 8px; color: rgba(255,255,255,0.7); font-size: 11px;
+        background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.24);
+        border-radius: 8px; color: rgba(255,255,255,0.88); font-size: 11px;
+        min-block-size: 26px;
         padding: 3px 6px; outline: none; cursor: pointer; flex-shrink: 0;
         font-family: -apple-system, BlinkMacSystemFont, sans-serif;
         transition: border-color 0.15s, color 0.15s;
@@ -8603,13 +9657,14 @@
         top: 8px;
         left: 50%;
         transform: translateX(-50%);
-        z-index: 2;
-        padding: 5px 10px;
+        z-index: 5;
+        min-block-size: 24px;
+        padding: 4px 10px;
         font-size: 10px;
         font-weight: 600;
-        color: rgba(255, 255, 255, 0.95);
-        background: rgba(0, 0, 0, 0.55);
-        border: 1px solid rgba(255, 255, 255, 0.12);
+        color: rgba(255, 255, 255, 0.96);
+        background: rgba(0, 0, 0, 0.68);
+        border: 1px solid rgba(255, 255, 255, 0.24);
         border-radius: 8px;
         font-family: -apple-system, BlinkMacSystemFont, sans-serif;
         pointer-events: auto;
@@ -8681,7 +9736,7 @@
       }
       .grok-results-panel-range {
         font-size: 11px;
-        color: rgba(255, 255, 255, 0.5);
+        color: rgba(255, 255, 255, 0.66);
         line-height: 1.35;
       }
       .grok-panel-download-status {
@@ -8769,6 +9824,27 @@
         overflow: hidden; background: rgba(255,255,255,0.05);
         transition: transform 0.2s, box-shadow 0.2s;
       }
+      .grok-result-open-trigger {
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        border: none;
+        border-radius: 14px;
+        background: transparent;
+        cursor: pointer;
+      }
+      .grok-result-open-trigger:focus-visible {
+        outline-offset: -3px !important;
+      }
+      .grok-result-card--group .grok-result-open-trigger {
+        height: auto;
+        bottom: 39px;
+        border-radius: 14px 14px 0 0;
+      }
       .grok-result-card--child {
         box-shadow: inset 0 0 0 2px rgba(139, 92, 246, 0.45);
       }
@@ -8809,7 +9885,7 @@
       .grok-result-prune-btn {
         position: absolute;
         top: 8px;
-        right: 38px;
+        right: 68px;
         z-index: 6;
         width: 26px;
         height: 26px;
@@ -8826,6 +9902,37 @@
         padding: 0;
         line-height: 1;
         transition: background 0.15s, transform 0.15s;
+      }
+      .grok-result-menu-btn {
+        position: absolute;
+        top: 8px;
+        right: 38px;
+        z-index: 6;
+        width: 26px;
+        height: 26px;
+        border-radius: 50%;
+        border: 1px solid rgba(255, 255, 255, 0.24);
+        background: rgba(0, 0, 0, 0.58);
+        color: rgba(255, 255, 255, 0.9);
+        font-size: 15px;
+        font-weight: 700;
+        line-height: 1;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        opacity: 0.72;
+        transition: opacity 0.15s, background 0.15s, border-color 0.15s;
+      }
+      .grok-result-card:hover .grok-result-menu-btn,
+      .grok-result-card:focus-within .grok-result-menu-btn,
+      .grok-result-menu-btn:hover,
+      .grok-result-menu-btn[aria-expanded="true"] {
+        opacity: 1;
+        background: rgba(0, 0, 0, 0.8);
+        border-color: rgba(139, 92, 246, 0.65);
+        color: #fff;
       }
       .grok-result-prune-btn:hover {
         background: #ef4444;
@@ -8861,27 +9968,28 @@
         width: 26px;
         height: 26px;
         border-radius: 8px;
-        background: rgba(0, 0, 0, 0.15);
-        border: 1px solid rgba(255, 255, 255, 0.06);
+        background: rgba(0, 0, 0, 0.52);
+        border: 1px solid rgba(255, 255, 255, 0.26);
         cursor: pointer;
-        opacity: 0.28;
+        opacity: 0.72;
         transition: background 0.15s, border-color 0.15s, opacity 0.15s;
       }
-      .grok-result-card:hover .grok-result-select {
-        opacity: 0.7;
-        background: rgba(0, 0, 0, 0.45);
-        border-color: rgba(255, 255, 255, 0.14);
+      .grok-result-card:hover .grok-result-select,
+      .grok-result-card:focus-within .grok-result-select {
+        opacity: 0.95;
+        background: rgba(0, 0, 0, 0.65);
+        border-color: rgba(255, 255, 255, 0.34);
       }
       .grok-result-select:hover {
         opacity: 1;
-        background: rgba(0, 0, 0, 0.72);
-        border-color: rgba(139, 92, 246, 0.45);
+        background: rgba(0, 0, 0, 0.78);
+        border-color: rgba(139, 92, 246, 0.65);
       }
       .grok-result-select:has(.grok-result-select-input:checked),
       .grok-result-card--selected .grok-result-select {
         opacity: 1;
-        background: rgba(0, 0, 0, 0.72);
-        border-color: rgba(139, 92, 246, 0.55);
+        background: rgba(0, 0, 0, 0.78);
+        border-color: rgba(139, 92, 246, 0.7);
       }
       .grok-result-select-input {
         width: 16px;
@@ -8889,9 +9997,10 @@
         margin: 0;
         cursor: pointer;
         accent-color: #8b5cf6;
-        opacity: 0.45;
+        opacity: 0.9;
       }
       .grok-result-card:hover .grok-result-select-input,
+      .grok-result-card:focus-within .grok-result-select-input,
       .grok-result-select:hover .grok-result-select-input,
       .grok-result-select:has(.grok-result-select-input:checked) .grok-result-select-input {
         opacity: 1;
@@ -8906,6 +10015,8 @@
       /* A compact card is image + strip, so the overlays that hug the bottom of the image have
          to clear the strip rather than sit on top of it. */
       .grok-result-kids {
+        position: relative;
+        z-index: 4;
         display: flex;
         align-items: center;
         gap: 3px;
@@ -8970,15 +10081,17 @@
          size against their own fixed button, are untouched. */
       .grok-result-card > img { contain: size; }
       .grok-result-prompt {
-        position: absolute; bottom: 0; left: 0; right: 0;
-        background: linear-gradient(transparent, rgba(0,0,0,0.85));
-        color: rgba(255,255,255,0.85); font-size: 10px; line-height: 1.4;
+        position: absolute; bottom: 0; left: 0; right: 0; z-index: 2;
+        background: linear-gradient(transparent, rgba(0,0,0,0.88));
+        color: rgba(255,255,255,0.92); font-size: 11px; line-height: 1.4;
         padding: 20px 8px 8px; border-radius: 0 0 12px 12px;
         display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
         overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        pointer-events: none;
         opacity: 0; transition: opacity 0.2s;
       }
-      .grok-result-card:hover .grok-result-prompt { opacity: 1; }
+      .grok-result-card:hover .grok-result-prompt,
+      .grok-result-card:focus-within .grok-result-prompt { opacity: 1; }
       .grok-result-badges {
         position: absolute;
         bottom: 8px;
@@ -9024,7 +10137,11 @@
       #grok-result-lightbox :focus-visible,
       #grok-result-context-menu :focus-visible,
       #grok-bulk-download-confirm :focus-visible,
+      #grok-text-prompt-dialog :focus-visible,
+      #grok-shortcuts-dialog :focus-visible,
+      #grok-selection-bar :focus-visible,
       #grok-export-format-dialog :focus-visible,
+      #grok-tag-manager :focus-visible,
       #grok-pager :focus-visible,
       #grok-search-toggle:focus-visible {
         outline: 2px solid #c4b5fd;
@@ -9032,13 +10149,14 @@
         box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.45);
       }
       .grok-toolbar-btn {
-        background: rgba(255,255,255,0.07);
-        border: 1px solid rgba(255,255,255,0.15);
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.24);
         border-radius: 8px;
-        color: rgba(255,255,255,0.75);
-        font-size: 11px;
-        padding: 4px 8px;
-        min-height: 24px;
+        color: rgba(255,255,255,0.88);
+        font-size: 12px;
+        padding: 4px 9px;
+        min-block-size: 28px;
+        min-height: 28px;
         cursor: pointer;
         flex-shrink: 0;
         font-family: -apple-system, BlinkMacSystemFont, sans-serif;
@@ -9233,7 +10351,11 @@
       .grok-lightbox-related-item {
         display: flex;
         flex-direction: column;
-        border: 1px solid rgba(255, 255, 255, 0.12);
+        width: 100%;
+        text-align: left;
+        font-family: inherit;
+        color: inherit;
+        border: 1px solid rgba(255, 255, 255, 0.18);
         border-radius: 8px;
         background: rgba(255, 255, 255, 0.04);
         padding: 5px;
@@ -9300,7 +10422,7 @@
       }
       .grok-lightbox-related-date {
         font-size: 10px;
-        color: rgba(255, 255, 255, 0.4);
+        color: rgba(255, 255, 255, 0.64);
       }
       .grok-lightbox-related-prompt {
         font-size: 11px;
@@ -9436,7 +10558,7 @@
       .grok-lightbox-sub {
         margin-top: 4px;
         font-size: 11px;
-        color: rgba(255, 255, 255, 0.45);
+        color: rgba(255, 255, 255, 0.66);
       }
       .grok-lightbox-actions {
         display: flex;
@@ -9487,12 +10609,14 @@
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        width: 18px;
-        height: 18px;
+        min-inline-size: 24px;
+        min-block-size: 24px;
+        width: 24px;
+        height: 24px;
         padding: 0;
         border: none;
         border-radius: 50%;
-        background: rgba(0, 0, 0, 0.3);
+        background: rgba(0, 0, 0, 0.35);
         color: inherit;
         font-size: 13px;
         line-height: 1;
@@ -9533,7 +10657,7 @@
       }
       .grok-lightbox-kids-label {
         font-size: 11px;
-        color: rgba(255, 255, 255, 0.45);
+        color: rgba(255, 255, 255, 0.66);
         margin-right: 3px;
       }
       .grok-lightbox-kid {
@@ -9562,7 +10686,7 @@
         display: none; position: fixed; top: 50%; left: 50%;
         transform: translate(-50%,-50%); z-index: 99998; text-align: center;
         pointer-events: none; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-        color: rgba(255,255,255,0.3); font-size: 15px;
+        color: rgba(255,255,255,0.68); font-size: 15px;
       }
       #grok-no-results.visible { display: block; }
       #grok-no-results span { display: block; font-size: 36px; margin-bottom: 10px; }
@@ -9618,12 +10742,12 @@
       }
       .grok-filter-check-label {
         display: flex; align-items: center; gap: 5px;
-        font-size: 11px; color: rgba(255,255,255,0.62);
+        font-size: 12px; color: rgba(255,255,255,0.74);
         white-space: nowrap; flex-shrink: 0; cursor: pointer;
         user-select: none; transition: color 0.15s;
         /* Clicking the label toggles the box, so the label is the target that has to clear
            24px -- the 13px checkbox inside it never was the thing being aimed at. */
-        min-height: 24px;
+        min-height: 26px;
       }
       .grok-filter-check-label:hover { color: rgba(255,255,255,0.85); }
       .grok-filter-check-label input {
@@ -9643,18 +10767,19 @@
         position: absolute; top: 8px; right: 8px; z-index: 5;
         display: flex; align-items: center; justify-content: center;
         width: 26px; height: 26px; padding: 0;
-        border: none; border-radius: 50%;
-        background: rgba(0,0,0,0.45); cursor: pointer;
-        color: rgba(255,255,255,0.75);
+        border: 1px solid rgba(255,255,255,0.22); border-radius: 50%;
+        background: rgba(0,0,0,0.55); cursor: pointer;
+        color: rgba(255,255,255,0.85);
         opacity: 0; transition: opacity 0.15s, color 0.15s, background 0.15s, transform 0.12s;
       }
       .grok-result-card:hover .grok-result-like,
+      .grok-result-card:focus-within .grok-result-like,
       .grok-result-like:focus-visible { opacity: 1; }
       .grok-result-like svg { fill: none; stroke: currentColor; stroke-width: 2; }
-      .grok-result-like:hover { background: rgba(0,0,0,0.7); color: #ff6b8a; transform: scale(1.08); }
+      .grok-result-like:hover { background: rgba(0,0,0,0.75); color: #ff6b8a; transform: scale(1.08); }
       .grok-result-like.is-liked { opacity: 1; color: #ff4d6d; }
       .grok-result-like.is-liked svg { fill: currentColor; stroke: currentColor; }
-      .grok-result-like.is-unknown { color: rgba(255,255,255,0.45); }
+      .grok-result-like.is-unknown { color: rgba(255,255,255,0.68); }
       .grok-lightbox-like-btn.is-liked { color: #ff4d6d; border-color: rgba(255,77,109,0.5); }
       .grok-delete-selected-btn:not(:disabled),
       .grok-lightbox-delete-btn:not(:disabled) {
@@ -9678,13 +10803,337 @@
         color: #fff;
       }
       .grok-filter-model-select {
-        font-size: 11px; padding: 2px 6px; margin: 0;
-        max-width: 160px;
-        border-radius: 4px; border: 1px solid rgba(255,255,255,0.15);
-        background: rgba(0,0,0,0.35); color: rgba(255,255,255,0.85);
+        font-size: 12px; padding: 3px 7px; margin: 0;
+        min-block-size: 28px;
+        max-width: 170px;
+        border-radius: 7px; border: 1px solid rgba(255,255,255,0.24);
+        background: rgba(0,0,0,0.35); color: rgba(255,255,255,0.9);
         cursor: pointer; flex-shrink: 0;
       }
       .grok-filter-model-select[hidden] { display: none; }
+      .grok-icon-action-btn {
+        min-inline-size: 28px;
+        padding: 4px 8px;
+        font-weight: 700;
+      }
+      .grok-query-clear-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-inline-size: 24px;
+        min-block-size: 24px;
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        border: 1px solid rgba(255, 255, 255, 0.22);
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.08);
+        color: rgba(255, 255, 255, 0.85);
+        font-size: 15px;
+        line-height: 1;
+        cursor: pointer;
+        flex-shrink: 0;
+        transition: background 0.15s, color 0.15s, border-color 0.15s;
+      }
+      .grok-query-clear-btn[hidden] { display: none !important; }
+      .grok-query-clear-btn:hover {
+        background: rgba(255, 255, 255, 0.2);
+        border-color: rgba(255, 255, 255, 0.4);
+        color: #fff;
+      }
+      /* Keep the persistent bar to a single primary row + active chips; secondary filters
+         and display/maintenance tools live in on-demand drawers so results keep the viewport. */
+      #grok-search-wrap:not(.grok-filters-open) #grok-bar-date-row,
+      #grok-search-wrap:not(.grok-filters-open) #grok-bar-filters,
+      #grok-search-wrap:not(.grok-tools-open) #grok-results-only-row,
+      #grok-search-wrap:not(.grok-tools-open) #grok-bar-actions {
+        display: none;
+      }
+      #grok-search-wrap.grok-filters-open #grok-bar-date-row,
+      #grok-search-wrap.grok-tools-open #grok-bar-actions {
+        padding-top: 8px;
+        border-top: 1px solid rgba(255, 255, 255, 0.1);
+      }
+      #grok-results-only-row[data-section-label]::before,
+      #grok-bar-actions[data-section-label]::before {
+        content: attr(data-section-label);
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: rgba(196, 181, 253, 0.9);
+        margin-right: 4px;
+      }
+      .grok-drawer-toggle-btn[aria-expanded="true"],
+      .grok-drawer-btn--active {
+        border-color: rgba(139, 92, 246, 0.72);
+        background: rgba(139, 92, 246, 0.26);
+        color: #fff;
+      }
+      .grok-lightbox-back-btn {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        z-index: 4;
+        background: rgba(0, 0, 0, 0.68);
+        border-color: rgba(255, 255, 255, 0.28);
+        color: #fff;
+      }
+      .grok-lightbox-back-btn[hidden] { display: none !important; }
+      @media (max-width: 768px) {
+        .grok-lightbox-sidebar-list {
+          scroll-snap-type: x proximity;
+        }
+        .grok-lightbox-related-item {
+          scroll-snap-align: start;
+        }
+      }
+      .grok-active-filters {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 6px;
+        padding-top: 2px;
+      }
+      .grok-active-filters[hidden] { display: none !important; }
+      .grok-active-filter-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        min-block-size: 24px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(139, 92, 246, 0.55);
+        background: rgba(139, 92, 246, 0.22);
+        color: #ede9fe;
+        font-size: 11px;
+        font-weight: 500;
+        cursor: pointer;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        transition: background 0.15s, border-color 0.15s;
+      }
+      .grok-active-filter-chip:hover {
+        background: rgba(139, 92, 246, 0.38);
+        border-color: rgba(196, 181, 253, 0.8);
+        color: #fff;
+      }
+      .grok-active-filter-chip--clear {
+        border-color: rgba(255, 255, 255, 0.28);
+        background: rgba(255, 255, 255, 0.08);
+        color: rgba(255, 255, 255, 0.88);
+      }
+      .grok-active-filter-chip-x {
+        font-size: 13px;
+        line-height: 1;
+        opacity: 0.85;
+      }
+      .grok-toggle-filter-badge {
+        position: absolute;
+        top: -5px;
+        right: -5px;
+        min-width: 18px;
+        height: 18px;
+        padding: 0 5px;
+        border-radius: 999px;
+        background: #8b5cf6;
+        color: #fff;
+        font-size: 10px;
+        font-weight: 700;
+        line-height: 18px;
+        text-align: center;
+        border: 1.5px solid #0f0f14;
+        box-sizing: border-box;
+      }
+      .grok-selection-bar {
+        position: fixed;
+        bottom: 18px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 100001;
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 6px 8px;
+        max-width: min(860px, 94vw);
+        padding: 8px 14px;
+        border-radius: 14px;
+        border: 1px solid rgba(139, 92, 246, 0.55);
+        background: rgba(18, 18, 28, 0.96);
+        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.65);
+        backdrop-filter: blur(14px);
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+      .grok-selection-bar[hidden] { display: none !important; }
+      .grok-selection-bar-count {
+        font-size: 12px;
+        font-weight: 600;
+        color: #ede9fe;
+        padding-right: 4px;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .grok-text-prompt-label {
+        display: block;
+        margin-bottom: 6px;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.8);
+      }
+      .grok-text-prompt-input {
+        width: 100%;
+        box-sizing: border-box;
+        text-align: left;
+        padding: 7px 10px;
+        font-size: 13px;
+        margin-bottom: 10px;
+      }
+      .grok-text-prompt-error {
+        margin: -4px 0 10px;
+        font-size: 12px;
+        color: #fca5a5;
+      }
+      .grok-shortcuts-panel {
+        width: min(480px, 94vw);
+      }
+      .grok-shortcuts-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 4px 0 14px;
+        font-size: 12px;
+      }
+      .grok-shortcuts-table th {
+        text-align: left;
+        padding: 6px 8px;
+        color: rgba(255, 255, 255, 0.68);
+        font-weight: 600;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.16);
+      }
+      .grok-shortcuts-table td {
+        padding: 6px 8px;
+        color: rgba(255, 255, 255, 0.88);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      .grok-shortcuts-table kbd {
+        display: inline-block;
+        padding: 2px 6px;
+        font-size: 11px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        border-radius: 5px;
+        border: 1px solid rgba(255, 255, 255, 0.28);
+        background: rgba(255, 255, 255, 0.09);
+        color: #fff;
+      }
+      .grok-sr-only {
+        position: absolute !important;
+        clip-path: inset(50%) !important;
+        overflow: hidden !important;
+        width: 1px !important;
+        height: 1px !important;
+        margin: -1px !important;
+        padding: 0 !important;
+        border: 0 !important;
+        white-space: nowrap !important;
+      }
+      @media (hover: none) {
+        .grok-result-like,
+        .grok-result-menu-btn,
+        .grok-result-select,
+        .grok-result-prompt {
+          opacity: 1;
+        }
+      }
+      @media (pointer: coarse) {
+        .grok-toolbar-btn,
+        .grok-date-preset-btn,
+        .grok-display-default-btn,
+        .grok-page-btn,
+        .grok-date-nav-btn,
+        .grok-active-filter-chip,
+        .grok-lightbox-tag-chip-remove {
+          min-block-size: 36px;
+          min-inline-size: 36px;
+        }
+        .grok-result-select,
+        .grok-result-like,
+        .grok-result-menu-btn,
+        .grok-result-prune-btn {
+          width: 34px;
+          height: 34px;
+        }
+        .grok-result-menu-btn {
+          right: 48px;
+        }
+        .grok-result-prune-btn {
+          right: 88px;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #grok-search-wrap,
+        .grok-result-card,
+        .grok-result-prompt,
+        .grok-result-like,
+        .grok-result-select,
+        .grok-result-kid,
+        .grok-lightbox-related-item,
+        .grok-lightbox-kid,
+        .grok-toolbar-btn,
+        .grok-page-btn,
+        .grok-date-preset-btn {
+          transition: none !important;
+        }
+        .grok-result-card:hover,
+        .grok-result-like:hover,
+        .grok-result-prune-btn:hover,
+        .grok-result-kid:hover,
+        .grok-lightbox-related-item:hover,
+        .grok-lightbox-kid:hover {
+          transform: none !important;
+        }
+        .grok-loading-spinner {
+          animation: none !important;
+        }
+      }
+      @media (forced-colors: active) {
+        #grok-search-bar,
+        #grok-results-only-row,
+        #grok-results-panel,
+        .grok-lightbox-panel,
+        .grok-bulk-download-confirm-panel,
+        .grok-result-context-menu,
+        .grok-toolbar-btn,
+        .grok-date-preset-btn,
+        .grok-display-default-btn,
+        .grok-page-btn,
+        .grok-date-nav-btn,
+        .grok-result-date,
+        .grok-result-select,
+        .grok-result-like,
+        .grok-search-grip {
+          border: 1px solid CanvasText;
+        }
+        .grok-result-card--selected {
+          outline: 3px solid Highlight;
+          outline-offset: 2px;
+          box-shadow: none;
+        }
+        #grok-search-wrap :focus-visible,
+        #grok-results-panel :focus-visible,
+        #grok-results-grid :focus-visible,
+        #grok-result-lightbox :focus-visible,
+        #grok-result-context-menu :focus-visible,
+        #grok-bulk-download-confirm :focus-visible,
+        #grok-text-prompt-dialog :focus-visible,
+        #grok-shortcuts-dialog :focus-visible,
+        #grok-selection-bar :focus-visible,
+        #grok-export-format-dialog :focus-visible,
+        #grok-tag-manager :focus-visible,
+        #grok-pager :focus-visible,
+        #grok-search-toggle:focus-visible {
+          outline: 2px solid Highlight;
+          outline-offset: 2px;
+          box-shadow: none;
+        }
+      }
     `;
     document.head.appendChild(s);
   }
@@ -9751,8 +11200,8 @@
       const compact = document.createElement('label');
       compact.id = 'grok-compact-groups-label';
       compact.className = 'grok-display-control';
-      compact.title = 'Fold child results into their parent card instead of giving each one its own cell';
-      compact.innerHTML = '<input type="checkbox" id="grok-compact-groups" /> Compact';
+      compact.title = 'Fold variation/child results into their parent card instead of giving each one its own cell';
+      compact.innerHTML = '<input type="checkbox" id="grok-compact-groups" /> Group variations';
       row.appendChild(compact);
     }
     if (!document.getElementById('grok-batch-groups')) {
@@ -9760,7 +11209,7 @@
       batch.id = 'grok-batch-groups-label';
       batch.className = 'grok-display-control';
       batch.title = 'Group generations from the same batch / conversation into a single card';
-      batch.innerHTML = '<input type="checkbox" id="grok-batch-groups" /> Batch groups';
+      batch.innerHTML = '<input type="checkbox" id="grok-batch-groups" /> Group batches';
       row.appendChild(batch);
     }
     if (!document.getElementById('grok-toggle-pos-select')) {
@@ -9769,7 +11218,7 @@
       posCtrl.className = 'grok-display-control';
       posCtrl.title = 'Corner the show/hide button sits in';
       posCtrl.innerHTML = `
-        Button
+        Toggle corner
         <select id="grok-toggle-pos-select" class="grok-display-select">
           <option value="tr">Top right</option>
           <option value="br">Bottom right</option>
@@ -9786,7 +11235,7 @@
       waitCtrl.title = 'How long to wait when Grok rate-limits the feed during a reindex or verify. '
         + '5s is the measured default — lower values retry inside a window that has not refilled yet.';
       waitCtrl.innerHTML = `
-        Rate wait
+        API delay
         <select id="grok-rate-wait-select" class="grok-display-select">
           <option value="2000">2s</option>
           <option value="3000">3s</option>
@@ -9819,8 +11268,16 @@
       syncDisplayControlLabels();
       applyGridLayoutStyles();
 
-      const onPageSizeChange = () => applyPageSizeSetting(pageSlider.value, true);
-      const onGridSizeChange = () => applyGridSizeSetting(gridSlider.value);
+      const onPageSizeChange = () => {
+        const next = clampPageSize(pageSlider.value);
+        if (next === pageSize) return;
+        applyPageSizeSetting(next, true);
+      };
+      const onGridSizeChange = () => {
+        const next = clampGridSizePercent(gridSlider.value);
+        if (next === gridSizePercent) return;
+        applyGridSizeSetting(next);
+      };
 
       pageSlider.addEventListener('input', onPageSizeChange);
       pageSlider.addEventListener('change', onPageSizeChange);
@@ -10006,8 +11463,13 @@
       sel.dataset.sig = html;
       sel.innerHTML = html;
     }
-    if (filterTagId && !getTagById(filterTagId)) filterTagId = '';
-    sel.value = filterTagId;
+    // Only clear an unrecognized stored tag once tags have actually finished loading; doing so
+    // before loadTags() resolves wipes the persisted tag filter on every page reload.
+    if (tagsLoaded && filterTagId && !getTagById(filterTagId)) {
+      filterTagId = '';
+      writeStoredString(FILTER_TAG_KEY, '');
+    }
+    sel.value = getTagById(filterTagId) ? filterTagId : '';
   }
 
   function ensureTagFilterSelect() {
@@ -10036,7 +11498,11 @@
     });
     // The filter is useless until membership is known, so it loads itself rather than waiting for
     // someone to open the lightbox.
-    loadTags().then(() => { syncTagFilterOptions(); if (filterTagId) applyFilter(); });
+    loadTags().then(() => {
+      syncTagFilterOptions();
+      updateClearButton();
+      if (filterTagId && loaded) applyFilter();
+    });
   }
 
   function ensureLikedFilterCheckbox() {
@@ -10111,8 +11577,8 @@
     const signature = models.join('|');
     // A stored model that is not in the index matches nothing, which looks exactly like
     // "my newest posts are missing" if they were generated with a newer model. Clear it
-    // before either exit path, not just when the option list is rebuilt.
-    if (wanted && !models.includes(wanted)) {
+    // only after the index is loaded (never while allPosts is still empty at startup).
+    if (loaded && wanted && !models.includes(wanted)) {
       console.warn(`[GrokSearch] Model filter "${wanted}" is not present in the index — clearing it`);
       filterModel = '';
       writeStoredString(FILTER_MODEL_KEY, '');
@@ -10189,15 +11655,15 @@
       videoOnlyLabel.id = 'grok-filter-video-only-label';
       videoOnlyLabel.className = 'grok-filter-check-label';
       videoOnlyLabel.title = 'Show only video posts (hide images)';
-      videoOnlyLabel.innerHTML = '<input type="checkbox" id="grok-filter-video-only" /> Video only';
+      videoOnlyLabel.innerHTML = '<input type="checkbox" id="grok-filter-video-only" /> Videos only';
       filters.appendChild(videoOnlyLabel);
     }
     if (!document.getElementById('grok-filter-with-video')) {
       const withVideoLabel = document.createElement('label');
       withVideoLabel.id = 'grok-filter-with-video-label';
       withVideoLabel.className = 'grok-filter-check-label';
-      withVideoLabel.title = 'Show image posts that have video in child results';
-      withVideoLabel.innerHTML = '<input type="checkbox" id="grok-filter-with-video" /> With video';
+      withVideoLabel.title = 'Show image posts that have video variations';
+      withVideoLabel.innerHTML = '<input type="checkbox" id="grok-filter-with-video" /> Images w/ video';
       const videoOnlyLabel = document.getElementById('grok-filter-video-only-label');
       (videoOnlyLabel || filters).insertAdjacentElement('afterend', withVideoLabel);
     }
@@ -10205,8 +11671,8 @@
       const childLabel = document.createElement('label');
       childLabel.id = 'grok-filter-children-label';
       childLabel.className = 'grok-filter-check-label';
-      childLabel.title = 'Show only items with at least N child posts';
-      childLabel.innerHTML = '<input type="checkbox" id="grok-filter-children" /> With child';
+      childLabel.title = 'Show only items with at least N variation/child posts';
+      childLabel.innerHTML = '<input type="checkbox" id="grok-filter-children" /> Has variations ≥';
       const withVideoLabel = document.getElementById('grok-filter-with-video-label');
       (withVideoLabel || filters).insertAdjacentElement('afterend', childLabel);
     }
@@ -10250,8 +11716,8 @@
     const hideChildsLabel = document.createElement('label');
     hideChildsLabel.id = 'grok-filter-hide-childs-label';
     hideChildsLabel.className = 'grok-filter-check-label';
-    hideChildsLabel.title = 'Hide child posts from results (parents only)';
-    hideChildsLabel.innerHTML = '<input type="checkbox" id="grok-filter-hide-childs" /> Hide childs';
+    hideChildsLabel.title = 'Hide variation/child posts from results (originals/parents only)';
+    hideChildsLabel.innerHTML = '<input type="checkbox" id="grok-filter-hide-childs" /> Originals only';
     const childFilterLabel = document.getElementById('grok-filter-children-label');
     (childFilterLabel || filters).insertAdjacentElement('afterend', hideChildsLabel);
   }
@@ -10329,7 +11795,6 @@
     if (!filterHideChildsEl.dataset.grokFilterBound) {
       filterHideChildsEl.dataset.grokFilterBound = '1';
       filterHideChildsEl.addEventListener('change', onMediaFilterChange);
-      filterHideChildsEl.addEventListener('input', onMediaFilterChange);
     }
 
     if (filterUploadedOnlyEl) {
@@ -10337,7 +11802,6 @@
       if (!filterUploadedOnlyEl.dataset.grokFilterBound) {
         filterUploadedOnlyEl.dataset.grokFilterBound = '1';
         filterUploadedOnlyEl.addEventListener('change', onMediaFilterChange);
-        filterUploadedOnlyEl.addEventListener('input', onMediaFilterChange);
       }
     }
   }
@@ -10371,8 +11835,8 @@
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'grok-download-results-btn grok-toolbar-btn';
-      btn.title = 'Download current search results as JSON';
-      btn.textContent = 'Download data';
+      btn.title = 'Export filtered results or selected subset as JSON or CSV';
+      btn.textContent = 'Export results';
       wrap.appendChild(btn);
     }
 
@@ -10568,80 +12032,192 @@
       btn.title = `Download the ${pending} file${pending === 1 ? '' : 's'} the last run did not finish`;
     });
     syncExportResultsButton();
+    syncSelectionBar();
+  }
+
+  function ensureSelectionBar() {
+    let bar = document.getElementById('grok-selection-bar');
+    if (bar) {
+      syncSelectionBar();
+      return bar;
+    }
+    bar = document.createElement('div');
+    bar.id = 'grok-selection-bar';
+    bar.className = 'grok-selection-bar';
+    bar.setAttribute('role', 'region');
+    bar.setAttribute('aria-label', 'Selection actions');
+    bar.hidden = true;
+    bar.innerHTML = `
+      <span id="grok-selection-bar-count" class="grok-selection-bar-count" role="status" aria-live="polite" aria-atomic="true"></span>
+      <button type="button" class="grok-toolbar-btn grok-selbar-download" title="Download selected images to a folder">Download</button>
+      <button type="button" class="grok-toolbar-btn grok-selbar-tag" title="Apply or remove tags for selected items">Tag…</button>
+      <button type="button" class="grok-toolbar-btn grok-selbar-export" title="Export selected items as JSON or CSV">Export…</button>
+      <button type="button" class="grok-toolbar-btn grok-delete-selected-btn grok-selbar-delete" title="Permanently delete selected items from your Grok library">Delete</button>
+      <button type="button" class="grok-toolbar-btn grok-selbar-check-all" title="Select all matching results">Select all</button>
+      <button type="button" class="grok-toolbar-btn grok-selbar-clear" title="Clear selection">Clear</button>
+      <button type="button" class="grok-toolbar-btn grok-cancel-download-btn grok-selbar-cancel" title="Stop the download after the current file" hidden>Cancel</button>
+      <button type="button" class="grok-toolbar-btn grok-retry-download-btn grok-selbar-retry" title="Retry failed downloads" hidden>Retry failed</button>
+    `;
+    document.body.appendChild(bar);
+    bar.querySelector('.grok-selbar-download')?.addEventListener('click', () => downloadSelectedPosts());
+    bar.querySelector('.grok-selbar-tag')?.addEventListener('click', async () => {
+      await loadTags({ force: true });
+      openTagManager();
+    });
+    bar.querySelector('.grok-selbar-export')?.addEventListener('click', () => downloadResultsJson());
+    bar.querySelector('.grok-selbar-delete')?.addEventListener('click', () => deleteSelectedPosts());
+    bar.querySelector('.grok-selbar-check-all')?.addEventListener('click', () => selectAllMatchedPosts());
+    bar.querySelector('.grok-selbar-clear')?.addEventListener('click', () => clearSelection());
+    bar.querySelector('.grok-selbar-cancel')?.addEventListener('click', () => cancelBulkDownload());
+    bar.querySelector('.grok-selbar-retry')?.addEventListener('click', () => retryFailedDownloads());
+    syncSelectionBar();
+    return bar;
+  }
+
+  function syncSelectionBar() {
+    const bar = document.getElementById('grok-selection-bar');
+    if (!bar) return;
+    const count = selectedPostIds.size;
+    const total = matchedPosts.length;
+    const busy = bulkDownloadInProgress;
+    const pending = lastFailedDownloads.length;
+    const shouldShow = searchBarExpanded && (count > 0 || busy || pending > 0);
+    bar.hidden = !shouldShow;
+    if (!shouldShow) return;
+    const countEl = document.getElementById('grok-selection-bar-count');
+    if (countEl) {
+      if (busy) countEl.textContent = 'Downloading…';
+      else if (count > 0) countEl.textContent = `${count.toLocaleString()} selected`;
+      else countEl.textContent = `${pending} failed download${pending === 1 ? '' : 's'}`;
+    }
+    let matchedSelected = 0;
+    if (count > 0) {
+      for (const p of matchedPosts) if (selectedPostIds.has(p.id)) matchedSelected++;
+    }
+    const dlBtn = bar.querySelector('.grok-selbar-download');
+    if (dlBtn) dlBtn.disabled = count === 0 || busy;
+    const tagBtn = bar.querySelector('.grok-selbar-tag');
+    if (tagBtn) tagBtn.disabled = count === 0 || busy;
+    const expBtn = bar.querySelector('.grok-selbar-export');
+    if (expBtn) expBtn.disabled = count === 0 && total === 0;
+    const delBtn = bar.querySelector('.grok-selbar-delete');
+    if (delBtn) {
+      delBtn.disabled = count === 0 || busy || deleteInProgress;
+      delBtn.textContent = count > 0 ? `Delete (${count})` : 'Delete';
+    }
+    const allBtn = bar.querySelector('.grok-selbar-check-all');
+    if (allBtn) allBtn.disabled = busy || total === 0 || matchedSelected === total;
+    const clrBtn = bar.querySelector('.grok-selbar-clear');
+    if (clrBtn) clrBtn.disabled = busy || count === 0;
+    const cancelBtn = bar.querySelector('.grok-selbar-cancel');
+    if (cancelBtn) {
+      cancelBtn.hidden = !busy;
+      cancelBtn.disabled = !busy || bulkDownloadCancelled;
+      cancelBtn.textContent = bulkDownloadCancelled ? 'Cancelling…' : 'Cancel';
+    }
+    const retryBtn = bar.querySelector('.grok-selbar-retry');
+    if (retryBtn) {
+      retryBtn.hidden = pending === 0;
+      retryBtn.disabled = busy || pending === 0;
+      retryBtn.textContent = `Retry ${pending}`;
+    }
   }
 
   function ensureImportJsonButton() {
-    if (document.getElementById('grok-import-json-btn')) return;
     const actions = getActionsRow();
-    if (!actions) return;
-    const input = document.createElement('input');
-    input.id = 'grok-import-json-input';
-    input.type = 'file';
-    input.accept = 'application/json,.json';
-    input.hidden = true;
-    input.addEventListener('change', () => {
-      const file = input.files?.[0];
-      input.value = '';
-      if (file) importDatabaseJson(file);
-    });
-
-    const btn = document.createElement('button');
-    btn.id = 'grok-import-json-btn';
-    btn.className = 'grok-toolbar-btn';
-    btn.type = 'button';
-    btn.textContent = 'Import JSON';
-    btn.title = 'Merge a previously exported index file into the local database';
-    btn.addEventListener('click', () => input.click());
-
-    actions.prepend(input);
-    actions.prepend(btn);
+    let input = document.getElementById('grok-import-json-input');
+    let btn = document.getElementById('grok-import-json-btn');
+    if (!input && actions) {
+      input = document.createElement('input');
+      input.id = 'grok-import-json-input';
+      input.type = 'file';
+      input.accept = 'application/json,.json';
+      input.hidden = true;
+      actions.prepend(input);
+    }
+    if (!btn && actions) {
+      btn = document.createElement('button');
+      btn.id = 'grok-import-json-btn';
+      btn.className = 'grok-toolbar-btn';
+      btn.type = 'button';
+      btn.textContent = 'Import JSON';
+      btn.title = 'Merge a previously exported index file into the local database';
+      actions.prepend(btn);
+    }
+    if (input && !input.dataset.grokImportBound) {
+      input.dataset.grokImportBound = '1';
+      input.addEventListener('change', () => {
+        const file = input.files?.[0];
+        input.value = '';
+        if (file) importDatabaseJson(file);
+      });
+    }
+    if (btn && !btn.dataset.grokImportBound) {
+      btn.dataset.grokImportBound = '1';
+      btn.addEventListener('click', () => document.getElementById('grok-import-json-input')?.click());
+    }
   }
 
   function ensureVerifyButton() {
-    if (document.getElementById('grok-verify-btn')) return;
-    const actions = getActionsRow();
-    if (!actions) return;
-    const btn = document.createElement('button');
-    btn.id = 'grok-verify-btn';
-    btn.className = 'grok-toolbar-btn';
-    btn.type = 'button';
-    btn.textContent = 'Verify';
-    btn.title = 'Walk the whole liked feed and reconcile the index: '
-      + 'removes posts you have unliked and adds posts liked after they were created';
-    btn.addEventListener('click', () => runReconcile({ manual: true }));
-    actions.appendChild(btn);
+    let btn = document.getElementById('grok-verify-btn');
+    if (!btn) {
+      const actions = getActionsRow();
+      if (!actions) return;
+      btn = document.createElement('button');
+      btn.id = 'grok-verify-btn';
+      btn.className = 'grok-toolbar-btn';
+      btn.type = 'button';
+      btn.textContent = 'Verify';
+      btn.title = 'Walk the whole liked feed and reconcile the index: '
+        + 'removes posts you have unliked and adds posts liked after they were created';
+      actions.appendChild(btn);
+    }
+    if (!btn.dataset.grokVerifyBound) {
+      btn.dataset.grokVerifyBound = '1';
+      btn.addEventListener('click', () => runReconcile({ manual: true }));
+    }
   }
 
   function ensureExportJsonButton() {
-    if (document.getElementById('grok-export-json-btn')) return;
-    const actions = getActionsRow();
-    if (!actions) return;
-    const btn = document.createElement('button');
-    btn.id = 'grok-export-json-btn';
-    btn.className = 'grok-toolbar-btn';
-    btn.type = 'button';
-    btn.textContent = 'Export JSON';
-    btn.title = 'Download full indexed database as JSON';
-    btn.addEventListener('click', () => downloadDatabaseJson());
-    actions.prepend(btn);
+    let btn = document.getElementById('grok-export-json-btn');
+    if (!btn) {
+      const actions = getActionsRow();
+      if (!actions) return;
+      btn = document.createElement('button');
+      btn.id = 'grok-export-json-btn';
+      btn.className = 'grok-toolbar-btn';
+      btn.type = 'button';
+      btn.textContent = 'Export JSON';
+      btn.title = 'Download full indexed database as JSON';
+      actions.prepend(btn);
+    }
+    if (!btn.dataset.grokExportJsonBound) {
+      btn.dataset.grokExportJsonBound = '1';
+      btn.addEventListener('click', () => downloadDatabaseJson());
+    }
   }
 
   function ensureExportResultsButton() {
-    if (document.getElementById('grok-export-results-btn')) return;
-    const actions = getActionsRow();
-    if (!actions) return;
-    const btn = document.createElement('button');
-    btn.id = 'grok-export-results-btn';
-    btn.className = 'grok-toolbar-btn';
-    btn.type = 'button';
-    btn.textContent = 'Export results';
-    btn.title = 'Export filtered results or selected subset as JSON or CSV';
-    btn.addEventListener('click', () => showExportSubsetDialog());
-    const exportJsonBtn = document.getElementById('grok-export-json-btn');
-    if (exportJsonBtn && exportJsonBtn.nextSibling) {
-      actions.insertBefore(btn, exportJsonBtn.nextSibling);
-    } else {
-      actions.appendChild(btn);
+    let btn = document.getElementById('grok-export-results-btn');
+    if (!btn) {
+      const actions = getActionsRow();
+      if (!actions) return;
+      btn = document.createElement('button');
+      btn.id = 'grok-export-results-btn';
+      btn.className = 'grok-toolbar-btn';
+      btn.type = 'button';
+      btn.textContent = 'Export results';
+      btn.title = 'Export filtered results or selected subset as JSON or CSV';
+      const exportJsonBtn = document.getElementById('grok-export-json-btn');
+      if (exportJsonBtn && exportJsonBtn.nextSibling) {
+        actions.insertBefore(btn, exportJsonBtn.nextSibling);
+      } else {
+        actions.appendChild(btn);
+      }
+    }
+    if (!btn.dataset.grokExportResultsBound) {
+      btn.dataset.grokExportResultsBound = '1';
+      btn.addEventListener('click', () => showExportSubsetDialog());
     }
     syncExportResultsButton();
   }
@@ -10663,17 +12239,22 @@
   }
 
   function ensureReindexButton() {
-    if (document.getElementById('grok-reindex-btn')) return;
-    const actions = getActionsRow();
-    if (!actions) return;
-    const btn = document.createElement('button');
-    btn.id = 'grok-reindex-btn';
-    btn.className = 'grok-toolbar-btn';
-    btn.type = 'button';
-    btn.textContent = 'Reindex';
-    btn.title = 'Clear cache and reindex from Grok (refreshes child image/video counts)';
-    btn.addEventListener('click', async () => { if (await confirmReindex()) reindexDatabase(); });
-    actions.appendChild(btn);
+    let btn = document.getElementById('grok-reindex-btn');
+    if (!btn) {
+      const actions = getActionsRow();
+      if (!actions) return;
+      btn = document.createElement('button');
+      btn.id = 'grok-reindex-btn';
+      btn.className = 'grok-toolbar-btn';
+      btn.type = 'button';
+      btn.textContent = 'Reindex';
+      btn.title = 'Clear cache and reindex from Grok (refreshes child image/video counts)';
+      actions.appendChild(btn);
+    }
+    if (!btn.dataset.grokReindexBound) {
+      btn.dataset.grokReindexBound = '1';
+      btn.addEventListener('click', async () => { if (await confirmReindex()) reindexDatabase(); });
+    }
   }
 
   /**
@@ -10683,22 +12264,30 @@
    * "delete" next to a list of pictures reads the other way.
    */
   function ensureTagsButton() {
-    if (document.getElementById('grok-tags-btn')) return;
-    const actions = getActionsRow();
-    if (!actions) return;
-    const btn = document.createElement('button');
-    btn.id = 'grok-tags-btn';
-    btn.className = 'grok-toolbar-btn';
-    btn.type = 'button';
-    btn.textContent = 'Tags';
-    btn.title = 'Create, rename and delete Grok tags, and tag the current selection';
-    btn.addEventListener('click', async () => {
-      btn.disabled = true;
-      await loadTags({ force: true });
-      btn.disabled = false;
-      openTagManager();
-    });
-    actions.appendChild(btn);
+    let btn = document.getElementById('grok-tags-btn');
+    if (!btn) {
+      const actions = getActionsRow();
+      if (!actions) return;
+      btn = document.createElement('button');
+      btn.id = 'grok-tags-btn';
+      btn.className = 'grok-toolbar-btn';
+      btn.type = 'button';
+      btn.textContent = 'Tags';
+      btn.title = 'Create, rename and delete Grok tags, and tag the current selection';
+      actions.appendChild(btn);
+    }
+    if (!btn.dataset.grokTagsBound) {
+      btn.dataset.grokTagsBound = '1';
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          await loadTags({ force: true });
+        } finally {
+          btn.disabled = false;
+        }
+        openTagManager();
+      });
+    }
   }
 
   /**
@@ -10773,10 +12362,6 @@
     dlg.querySelectorAll('[data-grok-tag-close]').forEach(el => {
       el.addEventListener('click', e => { e.preventDefault(); closeTagManager(); });
     });
-    document.addEventListener('keydown', e => {
-      const open = document.getElementById('grok-tag-manager');
-      if (open && !open.hidden && e.key === 'Escape') { e.preventDefault(); closeTagManager(); }
-    });
 
     dlg.querySelector('#grok-tag-scope-check')?.addEventListener('change', e => {
       setTagScope(e.target.checked ? TAG_SCOPE_SET : TAG_SCOPE_SINGLE);
@@ -10784,7 +12369,7 @@
       renderLightboxTagRow(getCurrentLightboxPost());
     });
 
-    dlg.querySelector('#grok-tag-create').addEventListener('click', async () => {
+    const submitNewTag = async () => {
       const input = document.getElementById('grok-tag-new-name');
       const res = await createTag(input.value);
       if (!res.ok) {
@@ -10794,6 +12379,13 @@
       input.value = '';
       renderTagManager();
       syncTagFilterOptions();
+    };
+    dlg.querySelector('#grok-tag-create').addEventListener('click', submitNewTag);
+    dlg.querySelector('#grok-tag-new-name')?.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submitNewTag();
+      }
     });
 
     dlg.querySelector('#grok-tag-manager-list').addEventListener('click', async e => {
@@ -10803,10 +12395,24 @@
       const tag = getTagById(id);
       if (!tag) return;
       if (e.target.closest('.grok-tag-rename')) {
-        const name = prompt('Rename tag:', tag.name);
+        const name = await promptTextDialog({
+          title: 'Rename tag',
+          label: 'New name',
+          initialValue: tag.name,
+          okLabel: 'Rename',
+          maxLength: TAG_NAME_MAX,
+          validate: raw => {
+            const clean = normalizeTagName(raw);
+            if (!clean) return 'Please enter a tag name.';
+            if (tagList.some(t => t.id !== id && t.name.toLowerCase() === clean.toLowerCase())) {
+              return `A tag named "${clean}" already exists.`;
+            }
+            return '';
+          },
+        });
         if (!name || normalizeTagName(name) === tag.name) return;
         const res = await renameTag(id, name);
-        if (!res.ok) flashStampStatus('rename failed');
+        if (!res.ok) flashStampStatus(res.reason === 'duplicate' ? 'tag already exists' : 'rename failed');
         renderTagManager();
         syncTagFilterOptions();
       } else if (e.target.closest('.grok-tag-delete')) {
@@ -10821,6 +12427,7 @@
         if (!res.ok) flashStampStatus('could not delete tag');
         renderTagManager();
         syncTagFilterOptions();
+        updateClearButton();
         applyFilter();
       }
     });
@@ -10837,21 +12444,24 @@
       // Tagging a selection is a hand assignment too, so it follows the same scope choice --
       // a selection of four parents under the set scope tags the four sets, not the four rows.
       let done = 0, failed = 0, rows = 0;
-      for (const p of posts) {
-        const res = await applyTagToPost(p, tagId, true);
-        if (res.ok) done++; else failed++;
-        rows += res.applied;
-        setDownloadStatus(`tagging ${done + failed}/${posts.length}…`, true);
+      try {
+        for (const p of posts) {
+          const res = await applyTagToPost(p, tagId, true);
+          if (res.ok) done++; else failed++;
+          rows += res.applied;
+          setDownloadStatus(`tagging ${done + failed}/${posts.length}…`, true);
+        }
+        const name = tag ? tag.name : 'tag';
+        setDownloadStatus(failed
+          ? `tagged ${done}, failed ${failed}`
+          : (getTagScope() === TAG_SCOPE_SET
+            ? `tagged ${rows} image${rows === 1 ? '' : 's'} across ${done} set${done === 1 ? '' : 's'} as "${name}"`
+            : `tagged ${done} as "${name}"`));
+      } finally {
+        btn.disabled = false;
+        renderTagManager();
+        if (filterTagId) applyFilter();
       }
-      btn.disabled = false;
-      const name = tag ? tag.name : 'tag';
-      setDownloadStatus(failed
-        ? `tagged ${done}, failed ${failed}`
-        : (getTagScope() === TAG_SCOPE_SET
-          ? `tagged ${rows} image${rows === 1 ? '' : 's'} across ${done} set${done === 1 ? '' : 's'} as "${name}"`
-          : `tagged ${done} as "${name}"`));
-      renderTagManager();
-      if (filterTagId) applyFilter();
     });
     return dlg;
   }
@@ -10901,8 +12511,11 @@
     }
   }
 
+  let tagManagerReturnFocus = null;
+
   function openTagManager() {
     const dlg = ensureTagManagerDialog();
+    tagManagerReturnFocus = document.activeElement;
     renderTagManager();
     dlg.hidden = false;
     document.getElementById('grok-tag-new-name')?.focus();
@@ -10911,6 +12524,11 @@
   function closeTagManager() {
     const dlg = document.getElementById('grok-tag-manager');
     if (dlg) dlg.hidden = true;
+    const returnTo = tagManagerReturnFocus;
+    tagManagerReturnFocus = null;
+    if (returnTo && returnTo.isConnected) {
+      try { returnTo.focus(); } catch { /* ignore */ }
+    }
   }
 
   /**
@@ -10936,17 +12554,22 @@
   }
 
   function ensurePruneMissingButton() {
-    if (document.getElementById('grok-prune-missing-btn')) return;
-    const actions = getActionsRow();
-    if (!actions) return;
-    const btn = document.createElement('button');
-    btn.id = 'grok-prune-missing-btn';
-    btn.className = 'grok-toolbar-btn';
-    btn.type = 'button';
-    btn.textContent = 'Prune missing';
-    btn.title = 'Scan database for deleted / 404 images and remove them from local index';
-    btn.addEventListener('click', () => runPruneMissingMedia({ manual: true }));
-    actions.appendChild(btn);
+    let btn = document.getElementById('grok-prune-missing-btn');
+    if (!btn) {
+      const actions = getActionsRow();
+      if (!actions) return;
+      btn = document.createElement('button');
+      btn.id = 'grok-prune-missing-btn';
+      btn.className = 'grok-toolbar-btn';
+      btn.type = 'button';
+      btn.textContent = 'Prune missing';
+      btn.title = 'Scan database for deleted / 404 images and remove them from local index';
+      actions.appendChild(btn);
+    }
+    if (!btn.dataset.grokPruneBound) {
+      btn.dataset.grokPruneBound = '1';
+      btn.addEventListener('click', () => runPruneMissingMedia({ manual: true }));
+    }
   }
 
   /**
@@ -10988,6 +12611,8 @@
             <line x1="14.5" y1="14.5" x2="20" y2="20"/>
            </svg>`;
     }
+    if (typeof syncToggleFilterBadge === 'function') syncToggleFilterBadge();
+    if (typeof syncSelectionBar === 'function') syncSelectionBar();
     try {
       localStorage.setItem(SEARCH_BAR_COLLAPSED_KEY, expanded ? '0' : '1');
     } catch { /* ignore */ }
@@ -10999,6 +12624,8 @@
     s.id = 'grok-search-collapse-styles';
     s.textContent = `
       #grok-search-wrap { transition: transform 0.28s ease, opacity 0.22s ease, visibility 0.28s; }
+      #grok-search-wrap[hidden],
+      #grok-search-toggle[hidden] { display: none !important; }
       #grok-search-wrap.collapsed {
         transform: translateX(-50%) translateY(calc(-100% - 24px));
         opacity: 0; visibility: hidden; pointer-events: none;
@@ -11039,6 +12666,11 @@
       @media (max-width: 1040px) {
         #grok-search-toggle.grok-toggle-tr,
         #grok-search-toggle.grok-toggle-tl { top: auto; bottom: 16px; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #grok-search-wrap {
+          transition: none !important;
+        }
       }
     `;
     document.head.appendChild(s);
@@ -11223,9 +12855,10 @@
 
     // Dragging is a mouse gesture, so the same move is on the keyboard as well.
     grip.addEventListener('keydown', e => {
-      if (e.key === 'Escape' || e.key === 'Home') {
+      if (e.key === 'Escape' || e.key === 'Home' || e.key === 'Enter' || e.key === ' ') {
         e.preventDefault();
         resetSearchBarPosition();
+        flashStampStatus('search bar position reset');
         return;
       }
       const step = e.shiftKey ? 40 : 8;
@@ -11241,6 +12874,8 @@
       applySearchBarPosition({ left: rect.left + dx, top: rect.top + dy }, true);
     });
   }
+
+  let barResizeObserver = null;
 
   function ensureSearchBarGrip() {
     const wrap = document.getElementById('grok-search-wrap');
@@ -11264,12 +12899,18 @@
       // The bar's height changes with its own content -- a wrapped filter row, a status line
       // appearing -- and the panel's offset is measured from its bottom edge.
       if (typeof ResizeObserver === 'function') {
-        try { new ResizeObserver(() => updateResultsPanelOffset()).observe(wrap); }
-        catch { /* measured on resize instead */ }
+        try {
+          if (barResizeObserver) barResizeObserver.disconnect();
+          barResizeObserver = new ResizeObserver(() => updateResultsPanelOffset());
+          barResizeObserver.observe(wrap);
+        } catch { /* measured on resize instead */ }
       }
-      window.addEventListener('resize', () => {
-        applySearchBarPosition(readStoredSearchBarPos());
-      });
+      if (!document.body.dataset.grokBarResizeBound) {
+        document.body.dataset.grokBarResizeBound = '1';
+        window.addEventListener('resize', () => {
+          applySearchBarPosition(readStoredSearchBarPos());
+        });
+      }
     }
     updateResultsPanelOffset();
   }
@@ -11317,9 +12958,32 @@
     if (input && !input.getAttribute('aria-label')) {
       input.setAttribute('aria-label', 'Search saved images by prompt');
     }
+    const sortSel = document.getElementById('grok-sort-select');
+    if (sortSel && !sortSel.getAttribute('aria-label')) {
+      sortSel.setAttribute('aria-label', 'Sort order');
+    }
     const importInput = document.getElementById('grok-import-json-input');
     if (importInput && !importInput.getAttribute('aria-label')) {
       importInput.setAttribute('aria-label', 'Choose an exported index file to import');
+    }
+    const firstBtn = document.getElementById('grok-page-first');
+    if (firstBtn && !firstBtn.getAttribute('aria-label')) {
+      firstBtn.setAttribute('aria-label', 'First page');
+    }
+    const lastBtn = document.getElementById('grok-page-last');
+    if (lastBtn && !lastBtn.getAttribute('aria-label')) {
+      lastBtn.setAttribute('aria-label', 'Last page');
+    }
+    const searchIcon = document.getElementById('grok-search-icon');
+    if (searchIcon) searchIcon.setAttribute('aria-hidden', 'true');
+    document.querySelectorAll('.grok-date-sep').forEach(el => el.setAttribute('aria-hidden', 'true'));
+    for (const id of ['grok-stamp-status', 'grok-panel-download-status', 'grok-no-results']) {
+      const liveEl = document.getElementById(id);
+      if (liveEl) {
+        liveEl.setAttribute('role', 'status');
+        liveEl.setAttribute('aria-live', 'polite');
+        liveEl.setAttribute('aria-atomic', 'true');
+      }
     }
   }
 
@@ -11345,6 +13009,10 @@
     ensureSearchBarGrip();
     ensureDownloadResultsButtons();
     ensureDownloadSelectedButtons();
+    ensureSelectionBar();
+    ensureActiveFilterChips();
+    ensureShortcutsButton();
+    ensureToolbarDrawers();
     ensureLoadingIndicator();
     ensureSearchInputListener();
     // Last, not first: it names controls the builders above create, so running it ahead of them
@@ -11366,7 +13034,7 @@
       <div id="grok-results-only-row">
         <label id="grok-results-only-label" class="grok-filter-check-label" title="Hide Grok saved grid; show only paginated search results">
           <input type="checkbox" id="grok-results-only" checked />
-          Results only
+          Full-screen panel
         </label>
         <label class="grok-display-control" title="Images per page (1–300)">
           Per page <span class="grok-display-val" id="grok-page-size-val">44</span>
@@ -11380,24 +13048,24 @@
       </div>
       <div id="grok-search-bar">
         <div class="grok-bar-line grok-bar-line-1 grok-bar-top">
-          <svg id="grok-search-icon" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
+          <svg id="grok-search-icon" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
             <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
           </svg>
           <input id="grok-search-input" type="text" aria-label="Search saved images by prompt" placeholder="Search saved images by prompt…" autocomplete="off" spellcheck="false" />
           <select id="grok-filter-model" class="grok-filter-model-select" title="Filter by generation model" aria-label="Filter by model"></select>
-          <select id="grok-sort-select" title="Sort order">
+          <select id="grok-sort-select" title="Sort order" aria-label="Sort order">
             <option value="newest">Newest</option>
             <option value="oldest">Oldest</option>
           </select>
           <span id="grok-search-count-wrap" class="grok-results-count-wrap">
             <span id="grok-search-count"></span>
-            <span id="grok-stamp-status"></span>
+            <span id="grok-stamp-status" role="status" aria-live="polite" aria-atomic="true"></span>
           </span>
         </div>
         <div class="grok-bar-line grok-bar-line-2" id="grok-bar-date-row">
           <button type="button" id="grok-date-prev" class="grok-date-nav-btn icon-only" title="Previous day" aria-label="Previous day" disabled>${DATE_NAV_PREV_SVG}</button>
           <input id="grok-date-start" class="grok-date-input" type="date" title="From date" aria-label="From date" />
-          <span class="grok-date-sep">–</span>
+          <span class="grok-date-sep" aria-hidden="true">–</span>
           <input id="grok-date-end" class="grok-date-input" type="date" title="To date" aria-label="To date" />
           <button type="button" id="grok-date-next" class="grok-date-nav-btn icon-only" title="Next day" aria-label="Next day" disabled>${DATE_NAV_NEXT_SVG}</button>
           <div id="grok-date-presets" class="grok-date-presets">
@@ -11416,22 +13084,22 @@
         <div class="grok-bar-line grok-bar-line-3 grok-bar-filters" id="grok-bar-filters">
           <label id="grok-filter-video-only-label" class="grok-filter-check-label" title="Show only video posts (hide images)">
             <input type="checkbox" id="grok-filter-video-only" />
-            Video only
+            Videos only
           </label>
-          <label id="grok-filter-with-video-label" class="grok-filter-check-label" title="Show image posts that have video in child results">
+          <label id="grok-filter-with-video-label" class="grok-filter-check-label" title="Show image posts that have video variations">
             <input type="checkbox" id="grok-filter-with-video" />
-            With video
+            Images w/ video
           </label>
-          <label id="grok-filter-children-label" class="grok-filter-check-label" title="Show only items with at least N child posts">
+          <label id="grok-filter-children-label" class="grok-filter-check-label" title="Show only items with at least N variation/child posts">
             <input type="checkbox" id="grok-filter-children" />
-            With child
-            <select id="grok-filter-children-min" class="grok-filter-min-select" title="Minimum child posts (at least)" aria-label="Minimum child posts">
+            Has variations ≥
+            <select id="grok-filter-children-min" class="grok-filter-min-select" title="Minimum variations (at least)" aria-label="Minimum variations">
               <option value="1">1</option><option value="3">3</option><option value="5">5</option><option value="7">7</option><option value="10">10</option>
             </select>
           </label>
-          <label id="grok-filter-hide-childs-label" class="grok-filter-check-label" title="Hide child posts from results (parents only)">
+          <label id="grok-filter-hide-childs-label" class="grok-filter-check-label" title="Hide variation/child posts from results (originals/parents only)">
             <input type="checkbox" id="grok-filter-hide-childs" />
-            Hide childs
+            Originals only
           </label>
           <label id="grok-filter-liked-label" class="grok-filter-check-label" title="Show only posts you have liked">
             <input type="checkbox" id="grok-filter-liked" />
@@ -11454,23 +13122,23 @@
         </div>
       </div>
       <div id="grok-pager">
-        <button class="grok-page-btn icon-only" id="grok-page-first" title="First page">
-          <svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="1" y1="1" x2="11" y2="10"/><polyline points="10,1 4,5.5 10,10"/>
+        <button type="button" class="grok-page-btn icon-only" id="grok-page-first" title="First page" aria-label="First page">
+          <svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <line x1="1" y1="1" x2="1" y2="10"/><polyline points="10,1 4,5.5 10,10"/>
           </svg>
         </button>
-        <button class="grok-page-btn" id="grok-page-prev">
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2"><polyline points="7,1 3,5 7,9"/></svg>
+        <button type="button" class="grok-page-btn" id="grok-page-prev">
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="7,1 3,5 7,9"/></svg>
           Prev
         </button>
         <input type="text" id="grok-page-jump" class="grok-page-jump" inputmode="numeric" maxlength="6" title="Go to page (1–N)" aria-label="Page number" />
         <span id="grok-page-label">/ 1</span>
-        <button class="grok-page-btn" id="grok-page-next">
+        <button type="button" class="grok-page-btn" id="grok-page-next">
           Next
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3,1 7,5 3,9"/></svg>
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="3,1 7,5 3,9"/></svg>
         </button>
-        <button class="grok-page-btn icon-only" id="grok-page-last" title="Last page">
-          <svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" stroke-width="2">
+        <button type="button" class="grok-page-btn icon-only" id="grok-page-last" title="Last page" aria-label="Last page">
+          <svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
             <line x1="10" y1="1" x2="10" y2="10"/><polyline points="1,1 7,5.5 1,10"/>
           </svg>
         </button>
@@ -11483,7 +13151,10 @@
 
     const noResults = document.createElement('div');
     noResults.id = 'grok-no-results';
-    noResults.innerHTML = `<span>🔍</span>No images match your search`;
+    noResults.setAttribute('role', 'status');
+    noResults.setAttribute('aria-live', 'polite');
+    noResults.setAttribute('aria-atomic', 'true');
+    noResults.innerHTML = `<span aria-hidden="true">🔍</span>No images match your search`;
     document.body.appendChild(noResults);
     ensureLoadingIndicator();
     ensureDownloadResultsButtons();
@@ -11537,6 +13208,7 @@
     ensureSearchInputListener();
 
     const onDateChange = () => {
+      if (dateStart === dateStartEl.value && dateEnd === dateEndEl.value) return;
       dateStart = dateStartEl.value;
       dateEnd = dateEndEl.value;
       updateClearButton();
@@ -11548,10 +13220,22 @@
     dateStartEl.addEventListener('input', onDateChange);
     dateEndEl.addEventListener('input', onDateChange);
 
-    if (reindexBtn) reindexBtn.addEventListener('click', async () => { if (await confirmReindex()) reindexDatabase(); });
-    if (pruneMissingBtn) pruneMissingBtn.addEventListener('click', () => runPruneMissingMedia({ manual: true }));
-    if (exportJsonBtn) exportJsonBtn.addEventListener('click', () => downloadDatabaseJson());
-    if (exportResultsBtn) exportResultsBtn.addEventListener('click', () => showExportSubsetDialog());
+    if (reindexBtn && !reindexBtn.dataset.grokReindexBound) {
+      reindexBtn.dataset.grokReindexBound = '1';
+      reindexBtn.addEventListener('click', async () => { if (await confirmReindex()) reindexDatabase(); });
+    }
+    if (pruneMissingBtn && !pruneMissingBtn.dataset.grokPruneBound) {
+      pruneMissingBtn.dataset.grokPruneBound = '1';
+      pruneMissingBtn.addEventListener('click', () => runPruneMissingMedia({ manual: true }));
+    }
+    if (exportJsonBtn && !exportJsonBtn.dataset.grokExportJsonBound) {
+      exportJsonBtn.dataset.grokExportJsonBound = '1';
+      exportJsonBtn.addEventListener('click', () => downloadDatabaseJson());
+    }
+    if (exportResultsBtn && !exportResultsBtn.dataset.grokExportResultsBound) {
+      exportResultsBtn.dataset.grokExportResultsBound = '1';
+      exportResultsBtn.addEventListener('click', () => showExportSubsetDialog());
+    }
 
     clearBtn.addEventListener('click', () => {
       clearTimeout(searchFilterDebounceTimer);
@@ -11570,6 +13254,7 @@
       filterMinChildren = 1;
       filterModel = '';
       filterLikedOnly = false;
+      filterTagId = '';
       const likedEl = document.getElementById('grok-filter-liked');
       if (likedEl) likedEl.checked = false;
       const uploadedEl = document.getElementById('grok-filter-uploaded-only');
@@ -11577,6 +13262,8 @@
       syncMediaMinSelects();
       const modelSel = document.getElementById('grok-filter-model');
       if (modelSel) modelSel.value = '';
+      const tagSel = document.getElementById('grok-filter-tag');
+      if (tagSel) tagSel.value = '';
       try {
         localStorage.setItem(FILTER_VIDEO_ONLY_KEY, '0');
         localStorage.setItem(FILTER_WITH_VIDEO_KEY, '0');
@@ -11586,6 +13273,7 @@
         localStorage.setItem(FILTER_CHILDREN_MIN_KEY, '1');
         localStorage.setItem(FILTER_MODEL_KEY, '');
         localStorage.setItem(FILTER_LIKED_KEY, '0');
+        localStorage.setItem(FILTER_TAG_KEY, '');
       } catch { /* ignore */ }
       currentPage = 0;
       updateClearButton();
@@ -11612,7 +13300,6 @@
       } catch { /* ignore */ }
     };
     resultsOnlyEl.addEventListener('change', onResultsOnlyToggle);
-    resultsOnlyEl.addEventListener('input', onResultsOnlyToggle);
 
     firstBtn.addEventListener('click', () => { currentPage = 0; showResults(); });
     prevBtn.addEventListener('click', () => { currentPage--; showResults(); });
@@ -11641,31 +13328,64 @@
    */
   function bindPagingShortcuts(input) {
     document.addEventListener('keydown', e => {
-      if (e.key === 'Escape' && document.activeElement === input) input.blur();
+      const searchEl = document.getElementById('grok-search-input') || input;
       const active = document.activeElement;
-      const typingInSearch = active === input;
-      const typingInPageJump = active?.id === 'grok-page-jump';
-      const bulkConfirmOpen = (() => {
-        const dlg = document.getElementById('grok-bulk-download-confirm');
-        const exportDlg = document.getElementById('grok-export-format-dialog');
-        return Boolean((dlg && !dlg.hidden) || (exportDlg && !exportDlg.hidden));
-      })();
+      if (e.key === 'Escape' && active && active === searchEl) searchEl.blur();
+      const typingInControl = Boolean(
+        active && (
+          ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName)
+          || active.isContentEditable
+          || active.id === 'grok-search-grip'
+        )
+      );
       if (
         shouldShowSearchResults()
-        && !typingInSearch
-        && !typingInPageJump
+        && !typingInControl
         && !isResultLightboxOpen()
-        && !bulkConfirmOpen
+        && !getTopOpenModalDialog()
       ) {
-        if (e.key === 'ArrowRight') { e.preventDefault(); currentPage++; showResults(); }
-        if (e.key === 'ArrowLeft') { e.preventDefault(); currentPage--; showResults(); }
+        if (e.key === 'ArrowRight') {
+          if (currentPage < getTotalPages() - 1) {
+            e.preventDefault();
+            currentPage++;
+            showResults();
+          }
+        }
+        if (e.key === 'ArrowLeft') {
+          if (currentPage > 0) {
+            e.preventDefault();
+            currentPage--;
+            showResults();
+          }
+        }
       }
     });
   }
 
+  function setSearchUiVisibleForListPage(visible) {
+    const wrap = document.getElementById('grok-search-wrap');
+    const toggle = document.getElementById('grok-search-toggle');
+    if (wrap) wrap.hidden = !visible;
+    if (toggle) toggle.hidden = !visible;
+    if (!visible) {
+      if (isResultLightboxOpen()) closeResultLightbox();
+      hideResultContextMenu();
+      hideAllSearchResults();
+      document.documentElement.classList.remove(
+        'grok-results-only-mode', 'grok-custom-results-mode', 'grok-filtered-inline-mode'
+      );
+      document.getElementById('grok-no-results')?.classList.remove('visible');
+      applyNativeVisibility();
+    }
+  }
+
   let initiated = false;
   function init() {
-    if (!isImagineListPage()) return;
+    if (!isImagineListPage()) {
+      if (initiated) setSearchUiVisibleForListPage(false);
+      return;
+    }
+    setSearchUiVisibleForListPage(true);
     // Published so the running version can be read from the page. Without it, telling a stale
     // Tampermonkey install apart from a bug that survived a fix means guessing from CSS.
     try { document.documentElement.dataset.grokSearchVersion = SCRIPT_VERSION; } catch { /* ignore */ }
@@ -11696,23 +13416,39 @@
     }
   });
 
+  const OWN_UI_SELECTOR = '#grok-search-wrap, #grok-results-panel, #grok-inline-results-viewport, '
+    + '#grok-result-lightbox, #grok-loading-indicator, #grok-no-results, #grok-result-context-menu, '
+    + '#grok-bulk-download-confirm, #grok-export-format-dialog, #grok-tag-manager, #grok-search-toggle';
+
   let lastUrl = location.href;
   let domEnforceTimer = null;
-  new MutationObserver(() => {
+  new MutationObserver(mutations => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
+      if (!isImagineListPage()) {
+        if (initiated) setSearchUiVisibleForListPage(false);
+        return;
+      }
       setTimeout(() => {
         init();
         if (isImagineListPage()) scheduleIncrementalSync('navigation');
       }, 800);
       return;
     }
-    if (isImagineListPage()) {
-      if (!document.getElementById('grok-search-wrap')) {
-        buildSearchBar();
-      } else if (!document.getElementById('grok-search-toggle')) {
-        ensureSearchBarToggle();
-      }
+    if (!isImagineListPage()) return;
+    // Ignore DOM churn inside our own injected UI (status updates, card patches, pager changes)
+    // so sync/backfill status ticks do not repeatedly re-trigger native-visibility scans.
+    const hasExternalMutation = mutations.some(m => {
+      const target = m.target;
+      if (!target || target.nodeType !== 1) return true;
+      return !target.closest(OWN_UI_SELECTOR);
+    });
+    if (!hasExternalMutation) return;
+
+    if (!document.getElementById('grok-search-wrap')) {
+      buildSearchBar();
+    } else if (!document.getElementById('grok-search-toggle')) {
+      ensureSearchBarToggle();
     }
     if (!searchBarExpanded) {
       clearTimeout(domEnforceTimer);
